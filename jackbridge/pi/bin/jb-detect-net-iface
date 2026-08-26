@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Pick the network interface for netJACK2 traffic on the pi-stomp.
+#
+# Wired-only. The pi-stomp will never send 4ch/48k audio over wifi — under
+# real-world conditions it would just produce mystery xruns and the user
+# would blame us instead of physics. If no wired iface is up, we exit
+# non-zero and the systemd unit fails fast.
+#
+# Preference order:
+#   1. $JACKBRIDGE_IFACE override (from /etc/default/jackbridge), if it
+#      exists, has carrier, and is wired. Honored even without an IP yet —
+#      the operator told us, we believe them.
+#   2. Wired iface in direct-cable mode (169.254.0.0/16 link-local address).
+#   3. Any wired iface with carrier=1 and an IPv4 address (shared-LAN mode).
+#
+# Output: bare interface name on stdout, or non-zero exit + stderr message.
+set -euo pipefail
+
+is_wired() {
+    # type 1 = ARPHRD_ETHER; rules out wlan*, can*, tun*, lo, etc.
+    # Presence of a `wireless/` subdir flags wifi NICs that still report
+    # type 1 — covers exotic adapters that don't follow the kernel rules.
+    local i=$1
+    [ -e "/sys/class/net/$i/type" ] || return 1
+    [ "$(cat "/sys/class/net/$i/type")" = "1" ] || return 1
+    [ ! -d "/sys/class/net/$i/wireless" ]
+}
+
+has_carrier() {
+    local i=$1
+    [ -e "/sys/class/net/$i/carrier" ] || return 1
+    [ "$(cat "/sys/class/net/$i/carrier" 2>/dev/null)" = "1" ]
+}
+
+ipv4_of() {
+    ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | head -1
+}
+
+# 1. Honor the override if it's wired + has carrier.
+if [ -n "${JACKBRIDGE_IFACE:-}" ]; then
+    if is_wired "$JACKBRIDGE_IFACE" && has_carrier "$JACKBRIDGE_IFACE"; then
+        echo "$JACKBRIDGE_IFACE"
+        exit 0
+    fi
+    echo "jb-detect-net-iface: \$JACKBRIDGE_IFACE=$JACKBRIDGE_IFACE not wired-with-carrier; falling through to auto-detect." >&2
+fi
+
+direct=""
+wired=""
+for path in /sys/class/net/*; do
+    i=$(basename "$path")
+    [ "$i" = "lo" ] && continue
+    is_wired "$i" || continue
+    has_carrier "$i" || continue
+    addr=$(ipv4_of "$i")
+    case "$addr" in
+        169.254.*)
+            direct=${direct:-$i}
+            ;;
+        ?*)
+            wired=${wired:-$i}
+            ;;
+    esac
+done
+
+if [ -n "$direct" ]; then echo "$direct"; exit 0; fi
+if [ -n "$wired" ]; then echo "$wired"; exit 0; fi
+
+echo "jb-detect-net-iface: no wired interface with carrier+IPv4 found. JackBridge requires ethernet — wifi is not supported." >&2
+exit 1

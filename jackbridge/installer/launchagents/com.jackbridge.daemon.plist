@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jackbridge.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/JackBridge/JackBridged</string>
+    </array>
+
+    <!--
+        Lifecycle is managed by the route daemon (com.jackbridge.route),
+        which calls launchctl enable+bootstrap on this agent when wired
+        ethernet is up, and launchctl bootout+disable when it isn't. See
+        the long comment in com.jackbridge.jackd.plist for why we don't
+        use KeepAlive={PathState=...}.
+
+        KeepAlive=true gives us crash recovery. ThrottleInterval=2s
+        bounds the crash-recovery restart rate (the daemon calls exit(1)
+        on jack_client_open failure, so this matters when jackd is
+        temporarily down).
+    -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Library/Application Support/JackBridge/config.plist</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/tmp/com.jackbridge.daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.jackbridge.daemon.err.log</string>
+</dict>
+</plist>

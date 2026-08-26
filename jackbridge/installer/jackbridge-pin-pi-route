@@ -1,0 +1,50 @@
+#!/bin/sh
+# Capture one netJACK2 slave discovery packet on the wired interface to
+# learn the pi's link-local IP, then pin an interface-scoped host route
+# so all future ARP resolution for that address happens on the wired
+# interface only — preventing the wifi router from proxy-ARPing and
+# poisoning the cache.
+set -u
+
+IFACE="${1:?usage: jackbridge-pin-pi-route <iface> [timeout_seconds]}"
+TIMEOUT="${2:-15}"
+
+TMPFILE=$(mktemp /tmp/jackbridge-pin-pi-route.XXXXXX 2>/dev/null) || exit 1
+trap 'rm -f "$TMPFILE"' EXIT
+
+# tcpdump blocks until it captures one matching packet or is killed.
+# The pi sends UDP to 225.3.19.154:19000 at ~500ms intervals while its
+# netadapter is loaded. We run as root (LaunchDaemon → com.jackbridge.route)
+# so BPF access is available.
+tcpdump -i "$IFACE" -c 1 -n 'udp dst port 19000' 2>/dev/null > "$TMPFILE" &
+TPID=$!
+
+# Timeout guard — no GNU timeout dependency.
+(sleep "$TIMEOUT"; kill "$TPID" 2>/dev/null) &
+KPID=$!
+
+# Wait for either a captured packet or the timeout kill.
+wait "$TPID" 2>/dev/null || true
+kill "$KPID" 2>/dev/null || true
+
+PI_IP=$(awk '{
+    for(i=1;i<=NF;i++) {
+        if(match($i, /^225\.3\.19\.154\.19000:?$/)) {
+            split($(i-2), a, ".")
+            print a[1]"."a[2]"."a[3]"."a[4]
+            exit
+        }
+    }
+}' "$TMPFILE")
+
+if [ -n "$PI_IP" ]; then
+    if /sbin/route add -host "$PI_IP" -interface "$IFACE" 2>/dev/null; then
+        echo "jackbridge-pin-pi-route: pinned unicast route $PI_IP to $IFACE" >&2
+    else
+        echo "jackbridge-pin-pi-route: unicast route $PI_IP already exists on $IFACE" >&2
+    fi
+else
+    echo "jackbridge-pin-pi-route: no netJACK2 discovery from pi on $IFACE in ${TIMEOUT}s" >&2
+    # Non-zero exit so callers can detect the miss and retry.
+    exit 1
+fi

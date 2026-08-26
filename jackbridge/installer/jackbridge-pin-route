@@ -1,0 +1,36 @@
+#!/bin/sh
+# Pin the netJACK2 multicast group (225.3.19.154) to the interface our
+# auto-detector picks. Runs as root via the com.jackbridge.route LaunchDaemon.
+#
+# Idempotent: deletes any prior host route for the group, then re-adds. The
+# kernel uses the resulting route to choose which iface to IP_ADD_MEMBERSHIP
+# on when netmanager (loaded inside the user-session jackd) binds the group.
+#
+# Config: reads /Library/Application Support/JackBridge/config.plist for an
+# optional NetworkInterface override.
+set -eu
+
+SUPPORT="/Library/Application Support/JackBridge"
+CONFIG="$SUPPORT/config.plist"
+DETECT="$SUPPORT/jb-detect-net-iface"
+STATE=/var/run/jackbridge-route.iface
+GROUP=225.3.19.154
+
+OVERRIDE=""
+if [ -f "$CONFIG" ]; then
+    OVERRIDE=$(/usr/libexec/PlistBuddy -c "Print :NetworkInterface" "$CONFIG" 2>/dev/null || true)
+fi
+
+iface=$("$DETECT" "$OVERRIDE") || {
+    echo "jackbridge-pin-route: no usable interface, leaving multicast route alone." >&2
+    exit 1
+}
+
+# Drop any stale route, then add. Ignore the delete's exit code — the route
+# may not exist on first run.
+/sbin/route -n delete -host "$GROUP" >/dev/null 2>&1 || true
+/sbin/route -n add -host "$GROUP" -interface "$iface" >/dev/null
+
+mkdir -p "$(dirname "$STATE")"
+echo "$iface" > "$STATE"
+echo "jackbridge-pin-route: pinned $GROUP to $iface" >&2

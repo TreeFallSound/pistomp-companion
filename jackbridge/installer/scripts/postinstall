@@ -1,0 +1,76 @@
+#!/bin/sh
+# JackBridge postinstall.
+#
+# - Reload coreaudiod so the freshly-installed HAL plugin is picked up.
+# - Bootstrap the system LaunchDaemon that pins the netJACK2 multicast group
+#   to the right wired NIC (without this netmanager joins on the default
+#   route, which is usually Wi-Fi, and the pi is invisible).
+# - Bootstrap the per-user LaunchAgents into the active GUI session so the user
+#   doesn't have to log out / back in.
+#
+# The LaunchAgents themselves carry LimitLoadToSessionType=Aqua, so they will
+# also be auto-loaded by launchd for any subsequent GUI login.
+
+set -e
+
+/usr/bin/killall coreaudiod 2>/dev/null || true
+
+# Seed config.plist from the shipped default only if the user doesn't already
+# have one. Reinstalls and upgrades must preserve hand-edited settings
+# (ClockDeviceUID, NetworkInterface, etc.) — the LaunchAgents WatchPaths this
+# file, so clobbering it on every install also kicks jackd unnecessarily.
+CONFIG_DIR="/Library/Application Support/JackBridge"
+if [ ! -f "$CONFIG_DIR/config.plist" ] && [ -f "$CONFIG_DIR/config.plist.default" ]; then
+    /bin/cp "$CONFIG_DIR/config.plist.default" "$CONFIG_DIR/config.plist"
+    /bin/chmod 0644 "$CONFIG_DIR/config.plist"
+fi
+
+# Bootstrap the netJACK2 multicast-route watcher (system domain, runs as
+# root). The watcher pins the route, then blocks on notifyutil waiting for
+# the next network-state change; KeepAlive=true cycles it on every change.
+# launchd starts it immediately on bootstrap, so the first pin happens here.
+ROUTE_LABEL=com.jackbridge.route
+ROUTE_PLIST=/Library/LaunchDaemons/$ROUTE_LABEL.plist
+if [ -f "$ROUTE_PLIST" ]; then
+    /bin/launchctl bootout "system/$ROUTE_LABEL" 2>/dev/null || true
+    /bin/launchctl enable "system/$ROUTE_LABEL" 2>/dev/null || true
+    /bin/launchctl bootstrap system "$ROUTE_PLIST" || true
+fi
+
+# Expose jackbridge-ctl on $PATH. /usr/local/bin exists by default on macOS;
+# `ln -sf` overwrites any prior symlink (e.g. an upgrade reinstall) without
+# touching an unrelated file with the same name.
+/bin/mkdir -p /usr/local/bin
+/bin/ln -sf "/Library/Application Support/JackBridge/jackbridge-ctl" /usr/local/bin/jackbridge-ctl
+
+loggedInUser=$(/usr/bin/stat -f%Su /dev/console)
+if [ -n "$loggedInUser" ] && [ "$loggedInUser" != "root" ]; then
+    loggedInUID=$(/usr/bin/id -u "$loggedInUser")
+    # Bootout both labels first, *then* wait + SIGKILL stragglers, *then*
+    # bootstrap. Doing bootout-then-bootstrap per-label races: bootout returns
+    # before the process actually exits, so the bootstrap of the same label can
+    # hit "default server already active" and KeepAlive-loops forever (jackd
+    # holds the JACK server socket past SIGTERM if it was wedged from the
+    # killall coreaudiod cascade above). Mirrors jackbridge-ctl's stop logic.
+    for label in com.jackbridge.daemon com.jackbridge.jackd; do
+        /bin/launchctl bootout "gui/$loggedInUID/$label" 2>/dev/null || true
+    done
+    for i in 1 2 3 4 5 6; do
+        if ! /usr/bin/pgrep -x -U "$loggedInUID" JackBridged >/dev/null && \
+           ! /usr/bin/pgrep -f -U "$loggedInUID" "jackd .*coreaudio" >/dev/null; then
+            break
+        fi
+        /bin/sleep 0.5
+    done
+    /usr/bin/pkill -9 -x -U "$loggedInUID" JackBridged 2>/dev/null || true
+    /usr/bin/pkill -9 -f -U "$loggedInUID" "jackd .*coreaudio" 2>/dev/null || true
+
+    for label in com.jackbridge.jackd com.jackbridge.daemon; do
+        plist="/Library/LaunchAgents/$label.plist"
+        # Clear any persisted disabled-state override
+        /bin/launchctl enable "gui/$loggedInUID/$label" 2>/dev/null || true
+        /bin/launchctl bootstrap "gui/$loggedInUID" "$plist" || true
+    done
+fi
+
+exit 0

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Reverse jackbridge-pin-route. Runs as root via ExecStopPost=+.
+# Always exits 0 — we don't want a stale route to keep the unit in failed
+# state.
+set -u
+
+STATE=/run/jackbridge.iface
+GROUP=225.3.19.154/32
+
+if [ -r "$STATE" ]; then
+    iface=$(cat "$STATE")
+    ip route del "$GROUP" dev "$iface" 2>/dev/null || true
+    rm -f "$STATE"
+fi
+exit 0

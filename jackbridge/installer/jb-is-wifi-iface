@@ -1,0 +1,23 @@
+#!/bin/sh
+# jb-is-wifi-iface — shell function library, sourced (not executed).
+#
+# Defines `is_wifi_iface <bsd-name>` → 0 if the interface is classified as
+# Wi-Fi by `networksetup -listallhardwareports`, 1 otherwise. Sourced by
+# jb-detect-net-iface and jackbridge-route-watcher so the wifi heuristic
+# lives in one place.
+#
+# The list of wifi BSD names is captured once at source time, since
+# networksetup is not a cheap call and the answer can't change between
+# back-to-back probes within the same script run.
+
+_wifi_ifs=$(
+    /usr/sbin/networksetup -listallhardwareports 2>/dev/null | awk '
+        /^Hardware Port:/ { wifi = ($0 ~ /Wi-Fi/) }
+        /^Device:/ { if (wifi) print $2 }
+    '
+)
+
+is_wifi_iface() {
+    for w in $_wifi_ifs; do [ "$w" = "$1" ] && return 0; done
+    return 1
+}

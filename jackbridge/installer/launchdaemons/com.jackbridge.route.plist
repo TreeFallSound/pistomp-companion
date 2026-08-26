@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jackbridge.route</string>
+
+    <!-- Long-running watcher: pins the netJACK2 multicast route, then blocks
+         on notifyutil waiting for the next SystemConfiguration network-change
+         notification. When one arrives, the wrapper exits, launchd respawns
+         it under KeepAlive, and the new invocation re-pins. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/JackBridge/jackbridge-route-watcher</string>
+    </array>
+
+    <!-- KeepAlive=true is what makes the watcher loop: each network-change
+         notification causes the wrapper to exit cleanly, launchd restarts it,
+         and the first thing the new instance does is re-pin the route.
+         RunAtLoad is redundant with KeepAlive=true (launchd starts it
+         immediately at bootstrap regardless), so we omit it. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Re-pin when the operator edits the NetworkInterface override in
+         config.plist. WatchPaths kicks the job, which exits the existing
+         notifyutil wait and lets the new instance pick up the new value. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/Library/Application Support/JackBridge/config.plist</string>
+    </array>
+
+    <!-- Throttle restarts so a flapping cable can't burn CPU. KeepAlive will
+         still restart us, just at most every 5s. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/com.jackbridge.route.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/com.jackbridge.route.log</string>
+</dict>
+</plist>

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<installer-gui-script minSpecVersion="2">
+    <title>PiStomp Companion</title>
+    <organization>treefallsound</organization>
+    <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="13.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <installation-check script="installation_check()"/>
+    <script><![CDATA[
+function installation_check() {
+    var minVersion = '1.9.22';
+    var jackd = '/usr/local/bin/jackd';
+
+    if (!system.files.fileExistsAtPath(jackd)) {
+        my.result.title = 'JACK2 is required';
+        my.result.message = 'JackBridge requires JACK2 ' + minVersion + ' or newer. ' +
+            'Install the official JACK2 .pkg from ' +
+            'https://github.com/jackaudio/jack2-releases/releases ' +
+            'and then run this installer again.';
+        my.result.type = 'Fatal';
+        return false;
+    }
+
+    var out = system.run(jackd, '--version') || '';
+    var m = out.match(/jackdmp version ([0-9]+)\.([0-9]+)\.([0-9]+)/);
+    if (m) {
+        var have = [parseInt(m[1],10), parseInt(m[2],10), parseInt(m[3],10)];
+        var need = minVersion.split('.').map(function(n){return parseInt(n,10);});
+        for (var i = 0; i < 3; i++) {
+            if (have[i] > need[i]) break;
+            if (have[i] < need[i]) {
+                my.result.title = 'JACK2 is too old';
+                my.result.message = 'Found jackd ' + have.join('.') +
+                    ' at ' + jackd + '. JackBridge requires ' + minVersion + ' or newer. ' +
+                    'Reinstall JACK2 from ' +
+                    'https://github.com/jackaudio/jack2-releases/releases.';
+                my.result.type = 'Fatal';
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+    ]]></script>
+    <domains enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.jackbridge.pkg"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.jackbridge.pkg" visible="false">
+        <pkg-ref id="com.jackbridge.pkg"/>
+    </choice>
+    <pkg-ref id="com.jackbridge.pkg" version="@VERSION@" onConclusion="none">PiStompCompanion-component.pkg</pkg-ref>
+</installer-gui-script>

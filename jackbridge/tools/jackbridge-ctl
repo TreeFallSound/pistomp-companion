@@ -1,0 +1,96 @@
+#!/bin/sh
+# jackbridge-ctl — user-facing start/stop/status for the JackBridge daemons.
+#
+# Wraps `launchctl` against /Library/LaunchAgents/com.jackbridge.{jackd,daemon}.
+# Both agents move together (stopping only one leaves either the audio device
+# orphaned or the daemon crash-looping).
+#
+# Usage:
+#   jackbridge-ctl start
+#   jackbridge-ctl stop
+#   jackbridge-ctl restart
+#   jackbridge-ctl status
+#   jackbridge-ctl logs            # tail -f the agent log files
+#
+# Runs as the logged-in user (no sudo needed). LaunchAgent disabled-state
+# persists across reboots via /var/db/com.apple.xpc.launchd/disabled.<uid>.plist
+# so `stop` survives a restart and `start` re-enables.
+
+set -e
+
+LAGENTS="/Library/LaunchAgents"
+LABELS="com.jackbridge.jackd com.jackbridge.daemon"
+UID_NUM=$(/usr/bin/id -u)
+DOMAIN="gui/$UID_NUM"
+LOG_DIR="/tmp"
+
+usage() {
+    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+}
+
+cmd_start() {
+    for label in $LABELS; do
+        /bin/launchctl enable "$DOMAIN/$label" 2>/dev/null || true
+    done
+    # Bootstrap jackd first so the daemon's first connect attempt finds it.
+    for label in $LABELS; do
+        plist="$LAGENTS/$label.plist"
+        if [ ! -f "$plist" ]; then
+            echo "error: $plist not found — is JackBridge installed?" >&2
+            exit 1
+        fi
+        /bin/launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null || true
+    done
+    echo "started: $LABELS"
+}
+
+cmd_stop() {
+    # Daemon first so it doesn't crash-loop while jackd is going away.
+    for label in com.jackbridge.daemon com.jackbridge.jackd; do
+        /bin/launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+        /bin/launchctl disable "$DOMAIN/$label" 2>/dev/null || true
+    done
+    # bootout returns before the process is actually reaped; wait up to ~3s for
+    # both to exit, then SIGKILL anything left so `restart` reliably hands a
+    # clean shm region + clean JACK socket to the next start. Without this,
+    # stragglers can hold the JACK server socket and the new jackd silently
+    # attaches to the wrong server.
+    for i in 1 2 3 4 5 6; do
+        if ! /usr/bin/pgrep -x -U "$UID_NUM" JackBridged >/dev/null && \
+           ! /usr/bin/pgrep -f -U "$UID_NUM" "jackd .*coreaudio" >/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+    /usr/bin/pkill -9 -x -U "$UID_NUM" JackBridged 2>/dev/null || true
+    /usr/bin/pkill -9 -f -U "$UID_NUM" "jackd .*coreaudio" 2>/dev/null || true
+    echo "stopped: $LABELS"
+}
+
+cmd_status() {
+    for label in $LABELS; do
+        line=$(/bin/launchctl print "$DOMAIN/$label" 2>/dev/null | awk '/^\tstate = / {print $3; exit}')
+        if [ -z "$line" ]; then
+            line="not loaded"
+        fi
+        printf "%-30s %s\n" "$label" "$line"
+    done
+}
+
+cmd_logs() {
+    files="$LOG_DIR/com.jackbridge.jackd.err.log $LOG_DIR/com.jackbridge.jackd.out.log \
+           $LOG_DIR/com.jackbridge.daemon.err.log $LOG_DIR/com.jackbridge.daemon.out.log"
+    # tail -F follows files that don't exist yet — handy if the daemon hasn't
+    # been started since boot.
+    exec /usr/bin/tail -F $files
+}
+
+case "${1:-}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_stop; cmd_start ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs ;;
+    *)       usage ;;
+esac

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Brings up netadapter as a client of the stock pi-stomp jackd, wires the
+# 4-in/2-out graph for the JackBridge Mac driver, and execs the xrun watcher
+# as the service's long-running foreground process.
+set -euo pipefail
+
+XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
+WATCHER=/usr/local/libexec/jackbridge/jackbridge-xrun-watcher
+
+# Fresh file on every service start (contract documented in
+# ../pi-stomp/JACKBRIDGE_RECORDING.md).
+: > "$XRUN_FILE"
+
+# Pin the netJACK2 multicast group (225.3.19.154) to the JackBridge
+# interface. Without this, the slave's sendto() and the master's
+# IP_ADD_MEMBERSHIP both consult the unicast default route (wlan0 on
+# the pi, en0 on the Mac), so the master's join lands on the wrong
+# interface and the slave's discovery packet never reaches it. The
+# fork's commit b3bfc408/719d833a adds the JACK_NETJACK_MULTICAST_IF
+# env var; on Linux it's IP_MULTICAST_IF with ip_mreqn.imr_ifindex on
+# the slave socket, on macOS it's IP_BOUND_IF.
+#
+# The auto-detect lives in jackbridge-pin-route (the systemd unit's
+# ExecStartPre=+) — that script picks direct-cable 169.254.x first,
+# then any wired iface with carrier+IPv4, and writes the result to
+# /run/jackbridge.iface. We read it here so the setsockopt pin and
+# the kernel route stay on the same iface. Hardcoding eth0 is wrong on
+# any pi with more than one wired NIC (Pi 5 + USB-C dongle, dual-port
+# USB hubs, etc.); reading the ExecStartPre's state is the single
+# source of truth.
+#
+# Fallback to $JACKBRIDGE_IFACE (if the operator pre-set it via
+# /etc/default/jackbridge) and then eth0 only if the state file is
+# missing — which means jackbridge-pin-route failed and the unit
+# shouldn't have started anyway.
+STATE=/run/jackbridge.iface
+if [ -r "$STATE" ]; then
+    IFACE=$(cat "$STATE")
+elif [ -n "${JACKBRIDGE_IFACE:-}" ]; then
+    IFACE="$JACKBRIDGE_IFACE"
+else
+    IFACE=eth0
+fi
+export JACK_NETJACK_MULTICAST_IF="${JACK_NETJACK_MULTICAST_IF:-$IFACE}"
+
+# Unload any stale netadapter instances left from a previous run. The
+# ExecStop= handler (jackbridge-pi-down) is best-effort — if it failed
+# silently, the next jack_load would get a -01 suffix and the wiring
+# below would silently no-op, breaking the link. Clean up here so load
+# always starts fresh.
+while read -r client; do
+    [ -n "$client" ] || continue
+    jack_unload "$client" 2>/dev/null || true
+done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/null | \
+         awk '/^netadapter(-[0-9]+)?:/ { sub(/:.*/, ""); print }' | sort -u)
+
+# Wait for the Mac's netmanager to detect the socket error from the
+# just-unloaded netadapter and clean up the stale JackNetMaster entry.
+# Without this delay, the Mac's netmanager still holds the old slave
+# name (e.g. "pistomp") when the new SLAVE_AVAILABLE arrives, so
+# jack_client_open fails and JACK appends "-01" — creating a duplicate
+# slave that fights the original for the same network stream and
+# produces WriteResample / ringbuffer failure errors.
+sleep 3
+
+# netadapter port labels are slave-local (see pi-stomp.md:77):
+#   playback_* = TO master  (audio we send to the Mac)  → -P
+#   capture_*  = FROM master (audio we receive from the Mac) → -C
+# We want 4 channels pi→Mac (HW caps + mod-host wet) and 2 channels Mac→pi.
+jack_load netadapter -i "-C 2 -P 4 -q 0 -g 512"
+
+# Beat for port registration to settle before we connect.
+sleep 0.5
+
+# 1/2: raw hardware capture → first stereo pair on the Mac (In1/In2).
+jack_connect system:capture_1 netadapter:playback_1 || true
+jack_connect system:capture_2 netadapter:playback_2 || true
+
+# 3/4: post-mod-host wet feed → second stereo pair (ModOut1/ModOut2). Port
+# naming varies across mod-host configurations; first-match wins. The grep
+# checks `jack_lsp -p` output ("port\n\tproperties: output,") so we only
+# accept source ports — guards against accidentally picking an input port
+# with a similar name and feeding jack_connect a sink-to-sink pair.
+wire_wet() {
+    local dst=$1; shift
+    local sources
+    sources=$(jack_lsp -p 2>/dev/null | awk '/^[^ \t]/{p=$0} /properties:.*output/{print p}')
+    for src in "$@"; do
+        if grep -qxF "$src" <<< "$sources"; then
+            jack_connect "$src" "$dst" || true
+            return
+        fi
+    done
+    echo "jackbridge-pi-up: no mod-host wet source found for $dst" >&2
+}
+wire_wet netadapter:playback_3 mod-monitor:out_1 mod-host:monitor-out_1
+wire_wet netadapter:playback_4 mod-monitor:out_2 mod-host:monitor-out_2
+
+# Mac return → summed into system:playback alongside mod-host's existing wiring.
+jack_connect netadapter:capture_1 system:playback_1 || true
+jack_connect netadapter:capture_2 system:playback_2 || true
+
+exec "$WATCHER" "$XRUN_FILE"

@@ -1,0 +1,53 @@
+#!/bin/sh
+# Pick the network interface for netJACK2 traffic on the Mac.
+#
+# Preference order:
+#   1. $JACKBRIDGE_IFACE / first arg override (operator knows better).
+#   2. Direct-cable mode: any active iface with a 169.254.0.0/16 address.
+#   3. Any active wired iface with an IPv4 address.
+#   4. Any active wifi iface with an IPv4 address. (Almost certainly won't
+#      carry 4ch/48k without xruns, but we don't stop you.)
+#
+# "Active" means `ifconfig <i>` reports `status: active`. Output: bare iface
+# name on stdout, or non-zero exit + stderr message.
+set -eu
+
+# Sourced helper exposes is_wifi_iface. Lives next to us in $SUPPORT.
+SUPPORT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SUPPORT_DIR/jb-is-wifi-iface"
+
+override="${1:-${JACKBRIDGE_IFACE:-}}"
+if [ -n "$override" ]; then
+    if /sbin/ifconfig "$override" >/dev/null 2>&1; then
+        echo "$override"
+        exit 0
+    fi
+    echo "jb-detect-net-iface: override iface '$override' not present; falling through." >&2
+fi
+
+# Walk active ifaces, pick the first match in each category.
+direct=""; wired=""; wifi=""
+for i in $(/sbin/ifconfig -lu); do
+    /sbin/ifconfig "$i" 2>/dev/null | grep -q "status: active" || continue
+    ip=$(/sbin/ifconfig "$i" inet 2>/dev/null | awk '/^[[:space:]]*inet /{print $2; exit}')
+    [ -n "$ip" ] || continue
+    case "$ip" in
+        169.254.*)
+            [ -z "$direct" ] && direct=$i
+            ;;
+        *)
+            if is_wifi_iface "$i"; then
+                [ -z "$wifi" ] && wifi=$i
+            else
+                [ -z "$wired" ] && wired=$i
+            fi
+            ;;
+    esac
+done
+
+if [ -n "$direct" ]; then echo "$direct"; exit 0; fi
+if [ -n "$wired" ];  then echo "$wired";  exit 0; fi
+if [ -n "$wifi" ];   then echo "$wifi";   exit 0; fi
+
+echo "jb-detect-net-iface: no active IPv4 interface found." >&2
+exit 1

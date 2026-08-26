@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Tails `journalctl -u jack` for netadapter ringbuffer xrun events and
+maintains a bounded per-minute count file at argv[1].
+
+File format: 15 lines, oldest first, each "<epoch_sec_of_minute> <count>".
+Consumer (pi-stomp modalapi/ethernet/manager.py read_xrun_buckets) sums the
+count column over the slice whose epoch is within 60/300/900s of now.
+
+Why per-minute buckets and not per-event timestamps: a previous version
+appended one line per xrun and rewrote-on-rename per event. Under load that
+pegged a core, starved jackd, and amplified the xrun rate it was measuring.
+Per-minute buckets bound the work to one int increment per event and at most
+one file write per second regardless of xrun rate.
+"""
+
+import os
+import re
+import select
+import subprocess
+import sys
+import tempfile
+import time
+
+N_BUCKETS = 15  # 15 one-minute buckets = 15-minute window
+
+PATTERN = re.compile(r"JackRingBuffer::(Read|Write)\b.*\b(producer|consumer) too slow")
+
+
+def write_file(path: str, buckets: list[int], cur_min: int) -> None:
+    """Atomic rewrite: 15 lines, oldest minute first."""
+    dirpath = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=".xruns-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for i in range(N_BUCKETS):
+                m = cur_min - (N_BUCKETS - 1) + i
+                f.write(f"{m * 60} {buckets[m % N_BUCKETS]}\n")
+        os.rename(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: jackbridge-xrun-watcher <path-to-xrun-file>", file=sys.stderr)
+        return 2
+    path = sys.argv[1]
+
+    proc = subprocess.Popen(
+        ["journalctl", "-u", "jack", "-f", "-o", "cat", "-n", "0"],
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    buckets = [0] * N_BUCKETS
+    cur_min = int(time.time()) // 60
+    dirty = True
+    last_flush = 0.0
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            now = time.time()
+            now_min = int(now) // 60
+
+            # Advance the window; zero out any minute buckets we've crossed.
+            if now_min != cur_min:
+                for m in range(cur_min + 1, now_min + 1):
+                    buckets[m % N_BUCKETS] = 0
+                cur_min = now_min
+                dirty = True
+
+            if ready:
+                line = proc.stdout.readline()
+                if not line:
+                    break  # journalctl exited
+                if PATTERN.search(line):
+                    buckets[cur_min % N_BUCKETS] += 1
+                    dirty = True
+
+            # Flush at most once per second. Bounds filesystem work no matter
+            # how fast xruns arrive — the bug this script's previous version
+            # caused was unbounded per-event writes.
+            if dirty and now - last_flush >= 1.0:
+                write_file(path, buckets, cur_min)
+                dirty = False
+                last_flush = now
+    finally:
+        proc.terminate()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

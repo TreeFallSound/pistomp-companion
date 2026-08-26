@@ -1,0 +1,112 @@
+# Tag-driven release. Push a `vX.Y.Z` tag and this builds, signs,
+# notarizes, and attaches the .pkg to a GitHub Release.
+#
+# Required secrets:
+#   APPLE_DEVELOPER_ID_CERT_P12   base64-encoded .p12 containing both the
+#                                 Developer ID Application and Developer ID
+#                                 Installer certs + their private keys
+#   APPLE_DEVELOPER_ID_CERT_PASS  passphrase for the .p12
+#   APPLE_SIGN_APP_IDENTITY       e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_SIGN_INSTALLER_IDENTITY e.g. "Developer ID Installer: Name (TEAMID)"
+#   APPLE_NOTARY_APPLE_ID         Apple ID email
+#   APPLE_NOTARY_TEAM_ID          10-char team identifier
+#   APPLE_NOTARY_PASSWORD         app-specific password from appleid.apple.com
+#
+# The keychain is created fresh per run and torn down afterwards so secrets
+# don't linger on the (ephemeral) runner.
+
+name: PiStomp Companion release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JACK2
+        run: |
+          brew update
+          brew install jack
+          echo "JACK_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificates
+        env:
+          CERT_P12:   ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
+          CERT_PASS:  ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASS }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASS="$(uuidgen)"
+          echo "KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "::add-mask::$KEYCHAIN_PASS"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$CERT_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -P "$CERT_PASS" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN"
+          rm -f "$CERT_PATH"
+
+          # Allow codesign/productbuild to use the imported keys without
+          # interactive prompts.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          # Add the build keychain to the search list, login first, so
+          # xcodebuild's child processes still find system anchors.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+
+      - name: Store notarytool credentials
+        env:
+          APPLE_ID:    ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          TEAM_ID:     ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APP_PASS:    ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials jackbridge-notary \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASS" \
+            --keychain "$KEYCHAIN_PATH"
+
+      - name: Build, sign, notarize, staple
+        env:
+          SIGN_APP_IDENTITY:       ${{ secrets.APPLE_SIGN_APP_IDENTITY }}
+          SIGN_INSTALLER_IDENTITY: ${{ secrets.APPLE_SIGN_INSTALLER_IDENTITY }}
+          NOTARY_PROFILE: jackbridge-notary
+        run: |
+          ./jackbridge/installer/build-pkg.sh "${{ steps.version.outputs.version }}"
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" && -f "$KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: jackbridge/installer/build/PiStompCompanion-${{ steps.version.outputs.version }}.pkg
+          generate_release_notes: true

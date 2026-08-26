@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Best-effort teardown. The watcher is reaped by systemd's normal SIGTERM
+# delivery; here we only need to detach netadapter from the stock jackd so
+# mod-host stops paying the encode/decode cost.
+#
+# Unload every netadapter client, not just "netadapter". Past service
+# restarts can leave uniquely-named variants (netadapter-01, netadapter-02,
+# ...) registered with jackd when this script fired before the upstream
+# slave had fully detached from the previous run. Leaving them loaded makes
+# the next master connect to a stale slave and multiplies the audio-thread
+# load (every extra slave is a full 4-in/2-out JACK client driven by the
+# single audio thread, which is what caused the massive-xrun symptom we
+# saw when 5 stale instances piled up across testing).
+#
+# jack_lsp -l format is one "<client>:<port>" line followed by indented
+# per-port metadata. Filter for our client name pattern, drop the :port
+# suffix, and sort -u so we unload each client exactly once.
+while read -r client; do
+    [ -n "$client" ] || continue
+    jack_unload "$client" 2>/dev/null || true
+done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/null | \
+         awk '/^netadapter(-[0-9]+)?:/ { sub(/:.*/, ""); print }' | sort -u)

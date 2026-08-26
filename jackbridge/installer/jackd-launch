@@ -1,0 +1,142 @@
+#!/bin/sh
+# jackd-launch — start jackd with the JackBridge clock topology, then load
+# netmanager once the server is up.
+#
+# Clock device selection:
+#   1. config.plist ClockDeviceUID, if set.
+#   2. Otherwise, jb-detect-builtin auto-detects the Mac's built-in output.
+#   3. If neither yields a UID, refuse to start (loud log, non-zero exit;
+#      LaunchAgent KeepAlive backs off).
+#
+# Single-clock-domain is load-bearing — see docs/architecture.md. `-P 75` is
+# load-bearing — see docs/spike-b-clock-stability.md.
+
+set -e
+
+# jack_lsp / jack_load / any jack_* CLI tool default to JackNullOption, which
+# auto-spawns a default-config jackd against whatever CoreAudio considers the
+# system default output (often a USB interface at 44.1k/256). That stray jackd
+# beats the real one to the "default" server slot, triggers a microphone
+# permission prompt for any device with input streams, and produces wrong
+# sample rate / buffer. Suppress it process-tree-wide.
+export JACK_NO_START_SERVER=1
+
+SUPPORT="/Library/Application Support/JackBridge"
+CONFIG="$SUPPORT/config.plist"
+DETECT="$SUPPORT/jb-detect-builtin"
+JACKD="/usr/local/bin/jackd"
+JACK_LOAD="/usr/local/bin/jack_load"
+
+JACK_MIN_VERSION="1.9.22"
+
+if [ ! -x "$JACKD" ]; then
+    echo "jackd not found at $JACKD — install JACK2 ${JACK_MIN_VERSION}+ from jackaudio.org" >&2
+    exit 1
+fi
+
+ver=$("$JACKD" --version 2>&1 | head -1 | awk '{print $3}')
+if [ -n "$ver" ] && ! printf '%s\n%s\n' "$JACK_MIN_VERSION" "$ver" | sort -V -C; then
+    echo "jackd $ver too old (need ${JACK_MIN_VERSION}+). Reinstall JACK2 from jackaudio.org" >&2
+    exit 1
+fi
+
+# Read ClockDeviceUID and PeriodFrames from config.plist; empty/missing both
+# return empty. ClockDeviceUID falls through to auto-detect; PeriodFrames
+# falls back to 64 (must match the Pi-side jackd period — see comment by the
+# jackd invocation below).
+CLOCK_UID=""
+PERIOD_FRAMES=""
+if [ -f "$CONFIG" ]; then
+    CLOCK_UID=$(/usr/libexec/PlistBuddy -c "Print :ClockDeviceUID" "$CONFIG" 2>/dev/null || true)
+    PERIOD_FRAMES=$(/usr/libexec/PlistBuddy -c "Print :PeriodFrames" "$CONFIG" 2>/dev/null || true)
+fi
+PERIOD_FRAMES="${PERIOD_FRAMES:-64}"
+
+if [ -z "$CLOCK_UID" ]; then
+    if [ ! -x "$DETECT" ]; then
+        echo "ClockDeviceUID unset in $CONFIG and $DETECT missing — cannot determine jackd backend device." >&2
+        exit 1
+    fi
+    CLOCK_UID=$("$DETECT") || {
+        echo "jb-detect-builtin failed to find a built-in audio device. Set ClockDeviceUID in $CONFIG explicitly." >&2
+        exit 1
+    }
+fi
+
+echo "jackd-launch: using ClockDeviceUID=$CLOCK_UID PeriodFrames=$PERIOD_FRAMES" >&2
+
+# Wait for the route daemon (com.jackbridge.route LaunchDaemon) to pin the
+# netJACK2 multicast group to a real interface before starting jackd.
+# netmanager calls IP_ADD_MEMBERSHIP at load time — if no route exists for
+# 225.3.19.154 yet, the join silently fails and every Init() attempt returns
+# "Network is unreachable" for the lifetime of that jackd process.
+# /var/run is cleared on each boot, so a missing state file always means the
+# daemon hasn't run yet (not a stale file from a previous boot).
+ROUTE_STATE=/var/run/jackbridge-route.iface
+for i in $(seq 1 20); do
+    [ -f "$ROUTE_STATE" ] && break
+    sleep 0.5
+done
+if [ ! -f "$ROUTE_STATE" ]; then
+    echo "jackd-launch: multicast route not pinned after 10 s — netmanager may fail to join the group" >&2
+else
+    # Source of truth for the wired iface: jackbridge-pin-route writes it
+    # to /var/run/jackbridge-route.iface on every transition. Use the same
+    # value as the IP_BOUND_IF setsockopt pin on netmanager's socket, so
+    # the join and the kernel's route table stay in agreement.
+    WIRED_IFACE=$(cat "$ROUTE_STATE")
+    export JACK_NETJACK_MULTICAST_IF="$WIRED_IFACE"
+    echo "jackd-launch: multicast route pinned to $WIRED_IFACE" >&2
+fi
+
+# `-P <uid>` (playback-only) rather than `-d ~:<uid>` (duplex): the typical
+# built-in output device has no input streams, so duplex silently falls back
+# to "default in + default out" — a different-clock-domain pair that fails
+# aggregate creation, and (worse) opens the default microphone, triggering
+# repeated TCC prompts on every KeepAlive restart. JackBridge's actual audio
+# I/O flows through shm + netJACK2, so the clock device only needs playback.
+# -p <PERIOD_FRAMES> must match the Pi-side jackd period (pi-stomp's stock
+# /etc/jackdrc uses `-p 64`). netJACK2's adaptive resampler chokes on cycle 1
+# with off-by-one `WriteResample error` when periods differ, then thrashes.
+# Sourced from config.plist `PeriodFrames` (default 64).
+"$JACKD" -R -P 75 -d coreaudio -P "$CLOCK_UID" -r 48000 -p "$PERIOD_FRAMES" &
+JACKD_PID=$!
+# Publish jackd's PID for diagnostics; cleaned up via trap below.
+JACKD_PID_FILE=/tmp/jackbridge-jackd.pid
+echo "$JACKD_PID" > "$JACKD_PID_FILE"
+# On any exit — clean shutdown, set -e failure, or SIGTERM from launchd's
+# bootout when the route watcher stops us — kill jackd too. jackd is a
+# background child of this script; without an explicit kill, the script
+# exits and jackd is orphaned under launchd, holding the JACK server
+# socket and stale netmanager multicast group membership.
+trap 'kill "$JACKD_PID" 2>/dev/null || true; rm -f "$JACKD_PID_FILE"' EXIT INT TERM
+
+# Wait for jackd to be ready, then load netmanager. Both probe and load can
+# fail transiently while coreaudiod is mid-restart cascade after a clock
+# device change — retry the load itself, not just the probe, because the
+# old readiness loop would exhaust its budget against a half-up server and
+# we'd silently lose the internal client (no slave ports => no auto-wire =>
+# no audio).
+jackd_ready=0
+for i in $(seq 1 30); do
+    if /usr/local/bin/jack_lsp >/dev/null 2>&1; then
+        jackd_ready=1
+        break
+    fi
+    sleep 0.5
+done
+
+if [ "$jackd_ready" = "1" ] && [ -x "$JACK_LOAD" ]; then
+    for i in 1 2 3 4 5; do
+        if "$JACK_LOAD" netmanager >/dev/null 2>&1; then
+            echo "jackd-launch: netmanager loaded" >&2
+            break
+        fi
+        echo "jackd-launch: jack_load netmanager attempt $i failed, retrying" >&2
+        sleep 1
+    done
+elif [ "$jackd_ready" != "1" ]; then
+    echo "jackd-launch: jackd not ready after 15s — netmanager not loaded" >&2
+fi
+
+wait "$JACKD_PID"

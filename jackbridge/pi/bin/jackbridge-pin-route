@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Pin the netJACK2 multicast group to the JackBridge interface, before the
+# service's main ExecStart wires netadapter into jackd. Runs as root via the
+# unit's `ExecStartPre=+` prefix.
+#
+# Writes the chosen iface to /run/jackbridge.iface so the matching unpin
+# script can undo exactly what we did, regardless of carrier state changes
+# between start and stop.
+set -euo pipefail
+
+LIBEXEC=$(dirname "$0")
+STATE=/run/jackbridge.iface
+GROUP=225.3.19.154/32
+
+if [ -r /etc/default/jackbridge ]; then
+    # shellcheck disable=SC1091
+    . /etc/default/jackbridge
+fi
+
+iface=$("$LIBEXEC/jb-detect-net-iface")
+ip route replace "$GROUP" dev "$iface"
+echo "$iface" > "$STATE"
+echo "jackbridge-pin-route: pinned $GROUP to $iface" >&2

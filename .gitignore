@@ -1,0 +1,10 @@
+jackbridge/driver/build/
+jackbridge/installer/build/
+jackbridge/tools/stress_atomic
+jackbridge/tools/stress_atomic.dSYM/
+cscope.*
+xcuserdata
+dist/
+build/
+jackbridge/tools/rmshm
+jackbridge/tools/chkshm

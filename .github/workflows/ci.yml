@@ -1,0 +1,55 @@
+# PR-time smoke build. Confirms the Companion app, driver, and daemon
+# compile cleanly on a stock macOS runner.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JACK2
+        run: |
+          brew update
+          brew install jack
+          echo "JACK_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Select Xcode
+        # Pin to a recent stable Xcode rather than whatever the runner image
+        # ships by default — keeps SDK behavior reproducible.
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build Companion app (Release)
+        run: |
+          xcodebuild \
+            -project app/PiStompCompanion.xcodeproj \
+            -target PiStompCompanion \
+            -configuration Release \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Build driver (Release, arm64)
+        run: |
+          xcodebuild \
+            -project jackbridge/driver/JackBridgePlugIn.xcodeproj \
+            -target JackBridgePlugIn \
+            -configuration Release \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            "JACK_PREFIX=$JACK_PREFIX" \
+            build
+
+      - name: Build daemon (Release, arm64)
+        run: |
+          xcodebuild \
+            -project jackbridge/driver/JackBridgePlugIn.xcodeproj \
+            -target JackBridged \
+            -configuration Release \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            "JACK_PREFIX=$JACK_PREFIX" \
+            build
