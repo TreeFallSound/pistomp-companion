@@ -42,6 +42,12 @@ fi
 # touching an unrelated file with the same name.
 /bin/mkdir -p /usr/local/bin
 /bin/ln -sf "/Library/Application Support/JackBridge/jackbridge-ctl" /usr/local/bin/jackbridge-ctl
+OWNER_HELPER="$CONFIG_DIR/jackbridge-jackd"
+STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
+owned_jackd_pids() {
+    [ -x "$OWNER_HELPER" ] || return 0
+    "$OWNER_HELPER" owned-pids "$loggedInUID" 2>/dev/null || true
+}
 
 loggedInUser=$(/usr/bin/stat -f%Su /dev/console)
 if [ -n "$loggedInUser" ] && [ "$loggedInUser" != "root" ]; then
@@ -55,15 +61,20 @@ if [ -n "$loggedInUser" ] && [ "$loggedInUser" != "root" ]; then
     for label in com.jackbridge.daemon com.jackbridge.jackd; do
         /bin/launchctl bootout "gui/$loggedInUID/$label" 2>/dev/null || true
     done
+    # Only terminate JACK servers carrying JackBridge's environment mark.
+    # A different program may use the same `default` server name.
     for i in 1 2 3 4 5 6; do
         if ! /usr/bin/pgrep -x -U "$loggedInUID" JackBridged >/dev/null && \
-           ! /usr/bin/pgrep -f -U "$loggedInUID" "jackd .*coreaudio" >/dev/null; then
+           [ -z "$(owned_jackd_pids)" ]; then
             break
         fi
         /bin/sleep 0.5
     done
     /usr/bin/pkill -9 -x -U "$loggedInUID" JackBridged 2>/dev/null || true
-    /usr/bin/pkill -9 -f -U "$loggedInUID" "jackd .*coreaudio" 2>/dev/null || true
+    for pid in $(owned_jackd_pids); do
+        /bin/kill -9 "$pid" 2>/dev/null || true
+    done
+    /bin/rm -f "$STATUS_FILE"
 
     for label in com.jackbridge.jackd com.jackbridge.daemon; do
         plist="/Library/LaunchAgents/$label.plist"

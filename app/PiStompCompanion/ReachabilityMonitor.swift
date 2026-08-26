@@ -16,11 +16,13 @@ final class ReachabilityMonitor {
         var via: String?
     }
 
-    private(set) var lastResult = Result()
-    var onUpdate: (() -> Void)?
+    /// Called on the monitor's own queue with an immutable result, not on
+    /// main: `StatusMonitor` owns the merge and hops to its own queue.
+    var onUpdate: ((Result) -> Void)?
 
     private let queue = DispatchQueue(label: "com.jackbridge.companion.reachability", qos: .utility)
     private var timer: DispatchSourceTimer?
+    private var pathMonitor: NWPathMonitor?
     private var inflight = false
 
     static var cachedIP: String? {
@@ -30,6 +32,13 @@ final class ReachabilityMonitor {
 
     func start(interval: TimeInterval = 15.0) {
         stop()
+        let path = NWPathMonitor()
+        path.pathUpdateHandler = { [weak self] _ in
+            self?.probe()
+        }
+        path.start(queue: queue)
+        pathMonitor = path
+
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 1, repeating: interval)
         t.setEventHandler { [weak self] in self?.probe() }
@@ -38,6 +47,8 @@ final class ReachabilityMonitor {
     }
 
     func stop() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
         timer?.cancel()
         timer = nil
     }
@@ -65,12 +76,11 @@ final class ReachabilityMonitor {
         r.reachable = reachable
         r.resolvedAddress = address
         r.via = via
-        lastResult = r
         if reachable, let address, let ip = ipAddress(from: address) {
             Self.cachedIP = ip
         }
         inflight = false
-        DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
+        onUpdate?(r)
     }
 
     private func ipAddress(from s: String) -> String? {
@@ -99,14 +109,7 @@ func freeTryHost(_ host: String, port: UInt16 = 22, timeout: TimeInterval,
     conn.stateUpdateHandler = { state in
         switch state {
         case .ready:
-            var addr: String?
-            if case .hostPort(let h, _)? = conn.currentPath?.remoteEndpoint,
-               case .ipv4(let a) = h {
-                addr = "\(a)"
-            } else if let ep = conn.currentPath?.remoteEndpoint {
-                addr = String(describing: ep).components(separatedBy: ":").first
-            }
-            finish(true, addr)
+            finish(true, endpointHost(conn.currentPath?.remoteEndpoint))
         case .failed, .cancelled:
             finish(false, nil)
         default:
@@ -115,6 +118,22 @@ func freeTryHost(_ host: String, port: UInt16 = 22, timeout: TimeInterval,
     }
     queue.asyncAfter(deadline: .now() + timeout) { finish(false, nil) }
     conn.start(queue: queue)
+}
+
+/// Extract the host without dropping an IPv6 address after its first colon.
+/// Keep IPv6 unbracketed here; URLComponents adds brackets for HTTP URLs.
+private func endpointHost(_ endpoint: NWEndpoint?) -> String? {
+    guard let endpoint, case .hostPort(let host, _) = endpoint else { return nil }
+    switch host {
+    case .ipv4(let address):
+        return String(describing: address).components(separatedBy: "%").first
+    case .ipv6(let address):
+        return String(describing: address)
+    case .name(let name, _):
+        return name
+    @unknown default:
+        return nil
+    }
 }
 
 /// Synchronous TCP probe for the diagnostics dump (runs on a utility queue).

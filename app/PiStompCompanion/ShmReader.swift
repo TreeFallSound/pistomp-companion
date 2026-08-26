@@ -52,19 +52,36 @@ final class ShmReader {
     static let regionsSize = 0x30000   // JACK_SHMSIZE = 0x10000*2 + 0x10000
     static let regionSize = 0x20000    // REGSMAP_SIZE
 
+    /// Region name. Parameterized only so tests can exercise attach /
+    /// remap / vanish against a scratch region without touching the live
+    /// one — production always uses the default.
+    let name: String
+    init(name: String = "/JackBridge") { self.name = name }
+
     private var fd: Int32 = -1
     private var base: UnsafeMutableRawPointer?
     private(set) var attached = false
 
     deinit { detach() }
 
-    /// Attach (or re-attach) to the shm region. Throws on any failure;
-    /// safe to call repeatedly — a stale mapping (region recreated with a
-    /// new inode) is re-established.
+    /// Resolve `/JackBridge` and map it, replacing any previous mapping.
+    ///
+    /// Called every poll, not once: on XNU a mapping outlives the name it
+    /// came from. `shm_unlink` + recreate — which is what a package upgrade,
+    /// a `jb-rmshm`, or a protocol bump does — leaves the old mapping fully
+    /// readable and frozen at its last values, so a Companion that mapped
+    /// once would keep reporting plausible numbers from an orphan forever.
+    ///
+    /// There is no cheaper check: `fstat` on a POSIX shm object under XNU
+    /// reports `st_dev == 0` and `st_ino == 0` (measured, not assumed), so
+    /// there is no object identity to compare against. `st_size` is the only
+    /// meaningful field, and it does not change across a recreate. Hence
+    /// re-open + re-map — a few microseconds at 5 Hz, in a menu-bar app that
+    /// already forks `jack_lsp` every two seconds.
     func attach() throws {
         // shm_open is variadic (unavailable in Swift) — the C shim in
         // ShmShim.c opens it read-only for us.
-        let fd = jb_shm_open_ro("/JackBridge")
+        let fd = jb_shm_open_ro(name)
         if fd < 0 { throw ShmError.openFailed(errno) }
 
         var st = stat()
@@ -83,6 +100,8 @@ final class ShmReader {
             throw ShmError.mapFailed(errno)
         }
 
+        // Swap only after the new mapping is in hand: a failed remap must
+        // leave the previous one intact rather than blinding the UI.
         detach()
         self.fd = fd
         self.base = map

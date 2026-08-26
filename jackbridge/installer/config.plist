@@ -30,6 +30,20 @@
     <key>SampleRate</key>
     <integer>48000</integer>
 
+    <!-- Install prefix of the JACK2 the package was built against. Stamped
+         by build-pkg.sh from its $JACK_PREFIX (default /usr/local; arm64
+         Homebrew builds get /opt/homebrew), so jackd-launch, the route
+         helpers, and the Companion app all drive the same JACK2 rather than
+         each probing and possibly finding a different one.
+
+         Change this only if you moved JACK2 after installing — the daemon
+         links libjack from the build-time prefix, so a mismatch means the
+         CLI tools and the daemon disagree about which server is running.
+         A non-absolute value (an unstamped template) is ignored and the
+         readers fall back to probing /usr/local then /opt/homebrew. -->
+    <key>JackPrefix</key>
+    <string>@JACK_PREFIX@</string>
+
     <!-- Reported end-to-end latency is split in the HAL across two
          CoreAudio properties: kAudioDevicePropertyLatency = 722
          (BASE_LATENCY_FRAMES from docs/LATENCY-MODEL.md at the

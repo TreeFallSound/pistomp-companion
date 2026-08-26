@@ -4,12 +4,16 @@ import Foundation
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private let monitor = StatusMonitor()
+    /// Last state published by the monitor. Main-queue only — the monitor's
+    /// own copy is owned by its state queue and is never read from here.
+    private var lastState = StatusMonitor.State()
     private var statusItem: StatusItemController!
     private var statusLineItem: NSMenuItem!
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
-
+    private var diagnosticsAlert: NSAlert?
+    private static let piHost = "pistomp.local"
     private static let support = "/Library/Application Support/JackBridge"
     private static let ctl = "\(support)/jackbridge-ctl"
 
@@ -25,9 +29,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - rendering
 
     private func render(_ state: StatusMonitor.State) {
+        let previousJackCondition = lastState.jackCondition
+        lastState = state
         statusLineItem.title = state.detailLine
         moduiItem.action = state.piReachable ? #selector(openModUI(_:)) : nil
         sshItem.action = state.piReachable ? #selector(openSSH(_:)) : nil
+
+        if state.jackCondition == .ourServer && previousJackCondition != .ourServer {
+            confirmExistingJackServer()
+        }
 
         let badge: StatusItemController.Badge
         switch state.health {
@@ -43,6 +53,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             badge = .none
         }
         statusItem.update(badge: badge, reachable: state.piReachable)
+    }
+
+    private func confirmExistingJackServer() {
+        let alert = NSAlert()
+        alert.messageText = "JackBridge cannot start"
+        alert.informativeText = "An existing JACK server belongs to JackBridge, but its launcher is no longer running. Quit that server and start JackBridge again?"
+        alert.addButton(withTitle: "Quit Other Server")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            // Keep the stop/start sequence in jackbridge-ctl so this path and
+            // Restart JackBridge share the same ownership guard.
+            runCtl("restart")
+        }
     }
 
     // MARK: - menu
@@ -90,34 +113,83 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func stopStack(_ s: Any?) { runCtl("stop") }
     @objc private func restartStack(_ s: Any?) { runCtl("restart") }
 
+    /// `jackbridge-ctl restart` boots two agents out and back in; it takes a
+    /// few seconds on a good day and can wedge on a jackd that won't die, so
+    /// it runs off-main and bounded rather than fire-and-forget.
     private func runCtl(_ sub: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: Self.ctl)
-        p.arguments = [sub]
-        p.standardOutput = Pipe(); p.standardError = Pipe()
-        do { try p.run() } catch { NSLog("jackbridge-ctl \(sub) failed: \(error)") }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = ProcessRunner.run(Self.ctl, args: [sub], timeout: 30)
+            if let launchError = r.launchError {
+                NSLog("jackbridge-ctl \(sub) failed to launch: \(launchError)")
+            } else if r.timedOut {
+                NSLog("jackbridge-ctl \(sub) timed out; killed")
+            } else if r.status != 0 {
+                NSLog("jackbridge-ctl \(sub) exit \(r.status.map(String.init) ?? "?"): \(r.combined)")
+            }
+        }
     }
 
     @objc private func openModUI(_ s: Any?) {
-        guard let addr = monitor.state.resolvedAddress else { return }
-        NSWorkspace.shared.open(URL(string: "http://\(addr)/")!)
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = Self.piHost
+        components.path = "/"
+        guard let url = components.url else {
+            NSLog("Cannot open MOD-UI URL for %@", Self.piHost)
+            return
+        }
+        if !NSWorkspace.shared.open(url) {
+            NSLog("Cannot open MOD-UI URL %@", url.absoluteString)
+        }
     }
 
     @objc private func openSSH(_ s: Any?) {
-        guard let addr = monitor.state.resolvedAddress else { return }
-        // Goes to the user's registered ssh:// handler (Terminal by default)
-        // with no TCC prompt. Resolved address, not the hostname.
-        NSWorkspace.shared.open(URL(string: "ssh://pistomp@\(addr)")!)
+        // Always use the documented management hostname and explicitly launch
+        // Terminal. An ssh:// URL is owned by whichever app registered that
+        // scheme (often an IDE), and a transient endpoint may include an
+        // interface scope that is not a valid URL host.
+        let host = Self.piHost
+        let script = """
+        #!/bin/sh
+        /usr/bin/ssh pistomp@\(host)
+        status=$?
+        /bin/rm -f -- "$0"
+        exit $status
+        """
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiStompCompanion-ssh-\(UUID().uuidString).command")
+        do {
+            try script.write(to: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path.path)
+        } catch {
+            NSLog("Cannot prepare SSH Terminal command: \(error.localizedDescription)")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ProcessRunner.run("/usr/bin/open", args: ["-a", "Terminal", path.path], timeout: 5)
+            if result.launchError != nil || result.status != 0 {
+                try? FileManager.default.removeItem(at: path)
+                NSLog("Cannot open SSH in Terminal: \(result.combined)")
+            }
+        }
     }
 
     @objc private func runDiagnostics(_ s: Any?) {
-        let st = monitor.state
-        NetworkDiagnostics.run(shmSnapshot: st.snapshot, shmAttached: st.shmAttached,
-                               shmError: st.shmError, piWired: st.piWired,
-                               reachability: ReachabilityMonitor.Result(
-                                   reachable: st.piReachable,
-                                   resolvedAddress: st.resolvedAddress,
-                                   via: st.resolvedAddress != nil ? "probe" : nil))
+        guard diagnosticsAlert == nil else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Collecting network diagnostics…"
+        alert.informativeText = "Checking the Pi, network routes, and JACK. This can take up to 30 seconds."
+        alert.window.isReleasedWhenClosed = false
+        diagnosticsAlert = alert
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.center()
+        alert.window.orderFrontRegardless()
+        NetworkDiagnostics.run(state: lastState) { [weak self] in
+            self?.diagnosticsAlert?.window.close()
+            self?.diagnosticsAlert = nil
+        }
     }
 
     @objc private func openLogs(_ s: Any?) {

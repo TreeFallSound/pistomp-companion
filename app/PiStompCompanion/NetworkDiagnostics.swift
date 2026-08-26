@@ -7,26 +7,43 @@ enum NetworkDiagnostics {
 
     static let logDir = NSString(string: "~/Library/Logs/JackBridge").expandingTildeInPath
 
-    static func run(shmSnapshot: ShmSnapshot, shmAttached: Bool, shmError: String?,
-                    piWired: Bool, reachability: ReachabilityMonitor.Result) {
+    /// Runs off-main and calls completion on the main queue after the report
+    /// has been written and opened.
+    static func run(state: StatusMonitor.State, completion: @escaping () -> Void = {}) {
         let queue = DispatchQueue(label: "com.jackbridge.companion.diagnostics", qos: .userInitiated)
         queue.async {
-            let text = collect(shmSnapshot: shmSnapshot, shmAttached: shmAttached,
-                                shmError: shmError, piWired: piWired, reachability: reachability)
-            writeAndOpen(text)
+            writeAndOpen(collect(state: state), completion: completion)
+        }
+    }
+    private static func writeAndOpen(_ text: String, completion: @escaping () -> Void) {
+        do {
+            try FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            let stamp = Date().jbStrftime("%Y%m%d-%H%M%S")
+            let path = "\(logDir)/network-diagnostics-\(stamp).log"
+            try text.write(toFile: path, atomically: true, encoding: .utf8)
+            DispatchQueue.main.async {
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                completion()
+            }
+        } catch {
+            NSLog("JackBridge diagnostics write failed: \(error.localizedDescription)")
+            DispatchQueue.main.async(execute: completion)
         }
     }
 
     // MARK: - collection
 
-    private static func collect(shmSnapshot: Shm, shmAttached: Bool, shmError: String?,
-                                piWired: Bool, reachability: ReachabilityMonitor.Result) -> String {
+    private static func collect(state: StatusMonitor.State) -> String {
         var s = ""
         let stamp = ISO8601DateFormatter().string(from: Date())
         s += "JackBridge Network Diagnostics — \(stamp)\n"
-        s += "pi reachable: \(reachability.reachable) (via \(reachability.via ?? "-"), addr \(reachability.resolvedAddress ?? "-"))\n"
-        s += "JACK graph pi ports wired: \(piWired)\n\n"
-        s += shmSection(snap: shmSnapshot, attached: shmAttached, error: shmError)
+        s += "status: \(state.detailLine)\n"
+        s += "pi reachable: \(state.piReachable) (via \(state.reachedVia ?? "-"), addr \(state.resolvedAddress ?? "-"))\n"
+        s += "JACK graph pi ports wired: \(state.piWired)"
+        s += state.jackGraphError.map { " (\($0))" } ?? ""
+        s += "\n"
+        s += "JACK prefix: \(JackTools.prefix) (\(JackTools.prefixOrigin))\n\n"
+        s += shmSection(snap: state.snapshot, attached: state.shmAttached, error: state.shmError)
         s += commandSection()
         s += jackSection()
         s += sentinelSection()
@@ -108,11 +125,12 @@ enum NetworkDiagnostics {
 
     private static func jackSection() -> String {
         var s = "== JACK graph ==\n"
-        let (out, st) = JackGraphMonitor.runJackLsp(connect: false)
-        s += "-- jack_lsp (exit \(st)) --\n\(out)\n"
-        let (cout, cst) = JackGraphMonitor.runJackLsp(connect: true)
-        s += "-- jack_lsp -c (exit \(cst)) --\n\(cout)\n\n"
-        return s
+        s += "jack_lsp: \(JackTools.jackLsp)\n"
+        s += "\n-- jack_lsp --\n"
+        s += JackGraphMonitor.runJackLsp(connect: false).report(includeExit: true)
+        s += "\n-- jack_lsp -c --\n"
+        s += JackGraphMonitor.runJackLsp(connect: true).report(includeExit: true)
+        return s + "\n"
     }
 
     private static func sentinelSection() -> String {
@@ -147,42 +165,15 @@ enum NetworkDiagnostics {
 
     // MARK: - process helpers
 
+    /// Every probe is bounded by ProcessRunner: SIGTERM at the budget,
+    /// SIGKILL a second later, partial output kept either way. A wedged
+    /// `ping` or a jackd-blocked `jack_lsp` costs the dump its budget and
+    /// nothing more.
     static func runCommand(_ path: String, args: [String], timeout: TimeInterval,
                            includeExit: Bool) -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let out = Pipe(), err = Pipe()
-        p.standardOutput = out; p.standardError = err
-        do {
-            try p.run()
-        } catch {
-            return "exec failed: \(error.localizedDescription)\n"
-        }
-        // Watchdog: SIGKILL after the budget. A hung probe must not hang the dump.
-        let killer = DispatchWorkItem { if p.isRunning { p.interrupt() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
-        p.waitUntilExit()
-        killer.cancel()
-        let o = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let exitLine = includeExit ? "[exit \(p.terminationStatus)]\n" : ""
-        return exitLine + o + (e.isEmpty ? "" : e)
+        ProcessRunner.run(path, args: args, timeout: timeout).report(includeExit: includeExit)
     }
 
-    private static func writeAndOpen(_ text: String) {
-        do {
-            try FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-            let stamp = Date().jbStrftime("%Y%m%d-%H%M%S")
-            let path = "\(logDir)/network-diagnostics-\(stamp).log"
-            try text.write(toFile: path, atomically: true, encoding: .utf8)
-            DispatchQueue.main.async {
-                NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            }
-        } catch {
-            NSLog("JackBridge diagnostics write failed: \(error.localizedDescription)")
-        }
-    }
 }
 
 extension Date {

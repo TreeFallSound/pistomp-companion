@@ -113,6 +113,47 @@ interface when Wi-Fi and the direct cable are both active. The route watcher
 pins the multicast and host routes to the wired interface. macOS `ping -I`
 does not provide that binding; use the route watcher instead.
 
+## Companion app
+
+### A POSIX shm mapping outlives the name it came from
+On XNU, `shm_unlink` + recreate leaves the old mapping fully readable and
+frozen at its last values — no fault, no error, just plausible-looking stale
+numbers forever. That is what a package upgrade, a `jb-rmshm`, or a protocol
+bump does to a Companion that mapped once at launch. There is no cheap
+identity check either: `fstat` on a POSIX shm object reports `st_dev == 0`
+and `st_ino == 0` (measured, not assumed), leaving `st_size` as the only
+meaningful field, and that doesn't change across a recreate. So
+`ShmReader.attach()` re-resolves and remaps the name on **every** 5 Hz poll,
+and `StatusMonitor` additionally treats a *decrease* in `daemonAlive` or
+`halInputReadHead` as a discontinuity — both counters are monotonic while
+one region lives, so a drop means the region or the daemon behind it was
+replaced and the previous heartbeat baseline is meaningless.
+
+### `StatusMonitor.State` is owned by one queue and published by copy
+The shm poll, the attach retry, the `jack_lsp` poll, and the reachability
+probe all funnel through `StatusMonitor`'s serial `stateQueue`; the UI never
+reads the monitor. `onUpdate` hands the main queue an immutable copy of the
+struct and `AppDelegate` renders only from that. Anything that reaches into
+the monitor from the main thread reintroduces the race this replaced.
+
+### Every Companion subprocess is bounded
+`ProcessRunner.run` is the only way the app spawns anything. It drains both
+pipes through `readabilityHandler` (a blocking `readDataToEndOfFile` before
+`waitUntilExit` deadlocks on any child that fills the 64 KiB pipe buffer),
+escalates SIGTERM → SIGKILL at the budget, and bounds the wait for
+end-of-output too — a backgrounded grandchild inherits the pipe and holds it
+open past the child's death. Worst case is `timeout + 3*grace`.
+
+### One JACK prefix, stamped at build time
+`build-pkg.sh` writes its `$JACK_PREFIX` into `config.plist` as `JackPrefix`,
+and both runtime readers — `jackbridge/installer/jack-prefix.sh` (sourced by
+`jackd-launch`) and `app/PiStompCompanion/JackTools.swift` — resolve it the
+same way: `$JACKBRIDGE_JACK_PREFIX`, then `JackPrefix`, then a probe of
+`/usr/local` and `/opt/homebrew`, then `/usr/local`. Nothing hardcodes
+`/usr/local/bin/jack_lsp` any more. The daemon links `libjack` from the
+build-time prefix, so a CLI tool from a different prefix is version skew
+against the running server.
+
 ## Naming
 
 The repository is **PiStomp Companion**. JackBridge is the engine and the

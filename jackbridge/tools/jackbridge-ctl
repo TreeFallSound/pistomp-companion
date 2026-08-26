@@ -23,7 +23,32 @@ LABELS="com.jackbridge.jackd com.jackbridge.daemon"
 UID_NUM=$(/usr/bin/id -u)
 DOMAIN="gui/$UID_NUM"
 LOG_DIR="/tmp"
+SUPPORT="/Library/Application Support/JackBridge"
+OWNER_HELPER="$SUPPORT/jackbridge-jackd"
+STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
+PREFIX_HELPER="$SUPPORT/jack-prefix.sh"
+if [ -r "$PREFIX_HELPER" ]; then
+    . "$PREFIX_HELPER"
+else
+    JACK_LSP="/usr/local/bin/jack_lsp"
+fi
 
+owned_jackd_pids() {
+    [ -x "$OWNER_HELPER" ] || return 0
+    "$OWNER_HELPER" owned-pids "$UID_NUM" 2>/dev/null || true
+}
+
+refresh_jack_status() {
+    [ -x "$OWNER_HELPER" ] || return 0
+    case $("$OWNER_HELPER" state "$JACK_LSP" "$UID_NUM" 2>/dev/null || printf '%s' none) in
+        foreign)
+            tmp="${STATUS_FILE}.$$"
+            printf '%s\n' foreign > "$tmp"
+            /bin/mv -f "$tmp" "$STATUS_FILE"
+            ;;
+        *) /bin/rm -f "$STATUS_FILE" ;;
+    esac
+}
 usage() {
     sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
@@ -51,20 +76,21 @@ cmd_stop() {
         /bin/launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
         /bin/launchctl disable "$DOMAIN/$label" 2>/dev/null || true
     done
-    # bootout returns before the process is actually reaped; wait up to ~3s for
-    # both to exit, then SIGKILL anything left so `restart` reliably hands a
-    # clean shm region + clean JACK socket to the next start. Without this,
-    # stragglers can hold the JACK server socket and the new jackd silently
-    # attaches to the wrong server.
+    # bootout returns before the process is actually reaped. Only kill
+    # jackd processes carrying JackBridge's environment mark; a JACK server
+    # owned by another program must survive `stop` and `restart`.
     for i in 1 2 3 4 5 6; do
         if ! /usr/bin/pgrep -x -U "$UID_NUM" JackBridged >/dev/null && \
-           ! /usr/bin/pgrep -f -U "$UID_NUM" "jackd .*coreaudio" >/dev/null; then
+           [ -z "$(owned_jackd_pids)" ]; then
             break
         fi
         sleep 0.5
     done
     /usr/bin/pkill -9 -x -U "$UID_NUM" JackBridged 2>/dev/null || true
-    /usr/bin/pkill -9 -f -U "$UID_NUM" "jackd .*coreaudio" 2>/dev/null || true
+    for pid in $(owned_jackd_pids); do
+        /bin/kill -9 "$pid" 2>/dev/null || true
+    done
+    refresh_jack_status
     echo "stopped: $LABELS"
 }
 

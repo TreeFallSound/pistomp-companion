@@ -5,16 +5,20 @@ import Foundation
 /// Ports live in JACK's graph, not in shm, so this shells out at 0.5 Hz.
 /// `JACK_NO_START_SERVER=1` is mandatory: without it jack_lsp auto-spawns a
 /// stray default jackd and can trip a TCC microphone prompt (same reason
-/// `jackbridge/installer/jackd-launch` exports it).
+/// `jackbridge/installer/jackd-launch` exports it) — `JackTools.environment`
+/// carries it, and `JackTools.jackLsp` is the one agreed-on tool path.
 final class JackGraphMonitor {
-    /// True when the JACK graph contains `from_slave` / `pistomp` ports.
-    private(set) var piWired = false
-    private(set) var lastError: String?
+    struct Result {
+        /// True when the JACK graph contains `from_slave` / `pistomp` ports.
+        var piWired = false
+        var error: String?
+    }
+
+    /// Called on the monitor's own queue, not on main.
+    var onUpdate: ((Result) -> Void)?
 
     private let queue = DispatchQueue(label: "com.jackbridge.companion.jackgraph", qos: .utility)
     private var timer: DispatchSourceTimer?
-
-    var onUpdate: (() -> Void)?
 
     func start(interval: TimeInterval = 2.0) {
         stop()
@@ -30,66 +34,34 @@ final class JackGraphMonitor {
         timer = nil
     }
 
-    /// Runs jack_lsp synchronously on the caller's queue. 5 s wall clock —
-    /// if jackd's socket is wedged we report not-wired rather than hang.
-    func poll() {
-        piWired = false
-        lastError = nil
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/local/bin/jack_lsp")
-        var env = ProcessInfo.processInfo.environment
-        env["JACK_NO_START_SERVER"] = "1"
-        p.environment = env
-        p.standardOutput = Pipe()
-        p.standardError = Pipe()
-
-        let sem = DispatchSemaphore(value: 0)
-        queue.asyncAfter(deadline: .now() + 5) { sem.signal() } // watchdog
-        do {
-            try p.run()
-        } catch {
-            lastError = "jack_lsp not found: \(error.localizedDescription)"
-            DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
-            return
-        }
-        DispatchQueue.global(qos: .utility).async {
-            p.waitUntilExit()
-            sem.signal()
-        }
-        _ = sem.wait(timeout: .now() + 6)
-        if p.isRunning { p.terminate() }
-
-        if p.terminationStatus == 0, let out = (p.standardOutput as? Pipe) {
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            let text = String(data: data, encoding: .utf8) ?? ""
-            piWired = text.split(separator: "\n").contains {
-                $0.contains("from_slave") || $0.contains("pistomp")
-            }
-        } else if p.terminationStatus != 0 {
-            lastError = "jack_lsp exit \(p.terminationStatus)"
-        }
-        DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
+    /// Runs jack_lsp synchronously on the monitor's queue. Bounded at 5 s —
+    /// if jackd's socket is wedged we report not-wired rather than hang, and
+    /// the poll interval keeps the next attempt coming.
+    private func poll() {
+        onUpdate?(Self.probe())
     }
 
-    /// Synchronous one-shot for the diagnostics dump. Returns (output, status).
-    static func runJackLsp(connect: Bool) -> (String, Int32) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/local/bin/jack_lsp")
-        var env = ProcessInfo.processInfo.environment
-        env["JACK_NO_START_SERVER"] = "1"
-        p.environment = env
-        if connect { p.arguments = ["-c"] }
-        let out = Pipe(); let err = Pipe()
-        p.standardOutput = out; p.standardError = err
-        do {
-            try p.run()
-            p.waitUntilExit()
-        } catch {
-            return ("exec failed: \(error.localizedDescription)", -1)
+    /// One bounded `jack_lsp` run, reduced to the wired/not-wired answer.
+    static func probe(timeout: TimeInterval = 5) -> Result {
+        let r = ProcessRunner.run(JackTools.jackLsp, env: JackTools.environment, timeout: timeout)
+        if let launchError = r.launchError {
+            return Result(error: "jack_lsp not runnable at \(JackTools.jackLsp): \(launchError)")
         }
-        let o = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return (o + e, p.terminationStatus)
+        if r.timedOut {
+            return Result(error: "jack_lsp timed out after \(Int(timeout))s")
+        }
+        guard r.status == 0 else {
+            return Result(error: "jack_lsp exit \(r.status.map(String.init) ?? "?")")
+        }
+        let wired = r.stdout.split(separator: "\n").contains {
+            $0.contains("from_slave") || $0.contains("pistomp")
+        }
+        return Result(piWired: wired)
+    }
+
+    /// Bounded one-shot for the diagnostics dump.
+    static func runJackLsp(connect: Bool, timeout: TimeInterval = 5) -> ProcessRunner.Result {
+        ProcessRunner.run(JackTools.jackLsp, args: connect ? ["-c"] : [],
+                          env: JackTools.environment, timeout: timeout)
     }
 }

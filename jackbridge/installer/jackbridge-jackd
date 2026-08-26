@@ -1,0 +1,70 @@
+#!/bin/sh
+# jackbridge-jackd — identify JackBridge-owned JACK server processes.
+#
+# JACK has one unqualified server name ("default"), so process name alone is
+# not ownership. jackd-launch exports JACKBRIDGE_INSTANCE into our jackd;
+# macOS exposes that environment to same-user ps -Eww callers.
+
+set -u
+
+uid_for_user() {
+    if [ "${1:-}" ]; then
+        printf '%s\n' "$1"
+    else
+        /usr/bin/id -u
+    fi
+}
+
+jackd_pids() {
+    wanted_uid=$(uid_for_user "${1:-}")
+    /bin/ps -axo pid=,uid=,comm= 2>/dev/null | \
+        /usr/bin/awk -v uid="$wanted_uid" \
+            '$2 == uid && ($3 == "jackd" || $3 ~ /\/jackd$/) { print $1 }'
+}
+
+instance_for_pid() {
+    # -Eww includes the process environment. Split on all whitespace because
+    # ps may print the environment and command in one long record.
+    /bin/ps -Eww -p "$1" 2>/dev/null | \
+        /usr/bin/tr '[:space:]' '\n' | \
+        /usr/bin/sed -n '/^JACKBRIDGE_INSTANCE=/ { s/^JACKBRIDGE_INSTANCE=//; p; q; }'
+}
+
+owned_pids() {
+    for pid in $(jackd_pids "${1:-}"); do
+        mark=$(instance_for_pid "$pid")
+        [ -n "$mark" ] && printf '%s\n' "$pid"
+    done
+    return 0
+}
+
+server_state() {
+    lsp=${1:-}
+    # JACK_NO_START_SERVER is mandatory here: probing must never create the
+    # server whose presence this command is trying to classify.
+    if [ -z "$lsp" ] || [ ! -x "$lsp" ] || \
+       ! JACK_NO_START_SERVER=1 "$lsp" >/dev/null 2>&1; then
+        printf '%s\n' none
+        return 0
+    fi
+    if [ -n "$(owned_pids "${2:-}")" ]; then
+        printf '%s\n' owned
+    else
+        # A responding server with no ownership mark is foreign. Treat an
+        # unrecognised server process as foreign too; never stop it.
+        printf '%s\n' foreign
+    fi
+}
+
+case "${1:-}" in
+    owned-pids)
+        owned_pids "${2:-}"
+        ;;
+    state)
+        server_state "${2:-}" "${3:-}"
+        ;;
+    *)
+        echo "usage: $0 owned-pids [uid] | state <jack_lsp> [uid]" >&2
+        exit 2
+        ;;
+esac

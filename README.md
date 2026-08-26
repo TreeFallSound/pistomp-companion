@@ -65,8 +65,9 @@ macOS often prioritizes the Ethernet cable over Wi-Fi. Since the Pi has no inter
 *   **Fix:** System Settings > Network > ... (three dots) > **Set Service Order...** > Drag **Wi-Fi** above your Ethernet (sometimes "10/100/1000") device.
 
 ### 2. Services aren't starting (or I see the wrong ports)
-*   **Conflicts:** If you have **MOD Desktop**, **Jamulus**, or **SONABUS** running, they might have started their own "default" JACK server. JackBridge will accidentally connect to theirs instead of its own managed one.
-    *   **Fix:** Quit those apps, then run `jackbridge-ctl restart`.
+*   **Conflicts:** MOD Desktop, Jamulus, or SONABUS may already own the `default` JACK server. JackBridge will not stop or load `netmanager` into another program's server. The menu shows **A different program uses JACK** while it waits.
+    *   Stop the other program. JackBridge starts automatically; `jackbridge-ctl restart` also rechecks immediately.
+*   **Stale JackBridge server:** If the launcher stopped but its JACK server remained, the menu shows **JackBridge waits for JACK**. Choose **Quit Other Server** to let JackBridge safely stop its own marked server and restart.
 *   **Check the logs:** `jackbridge-ctl logs`
 
 ### 3. Pi ports don't appear in `jack_lsp`

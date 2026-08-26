@@ -100,7 +100,14 @@ install -m 0755 "$INSTALLER/jb-is-wifi-iface"         "$STAGING/Library/Applicat
 install -m 0755 "$INSTALLER/jackbridge-pin-route"     "$STAGING/Library/Application Support/JackBridge/jackbridge-pin-route"
 install -m 0755 "$INSTALLER/jackbridge-route-watcher" "$STAGING/Library/Application Support/JackBridge/jackbridge-route-watcher"
 install -m 0755 "$JACKBRIDGE/tools/jackbridge-ctl" "$STAGING/Library/Application Support/JackBridge/jackbridge-ctl"
-install -m 0644 "$INSTALLER/config.plist" "$STAGING/Library/Application Support/JackBridge/config.plist.default"
+install -m 0755 "$INSTALLER/jackbridge-jackd"       "$STAGING/Library/Application Support/JackBridge/jackbridge-jackd"
+install -m 0755 "$INSTALLER/jack-prefix.sh"        "$STAGING/Library/Application Support/JackBridge/jack-prefix.sh"
+# Stamp the prefix this package was built against into the shipped defaults.
+# Runtime readers (jackd-launch via jack-prefix.sh, the Companion via
+# JackTools.swift) take it from there, so the built and the driven JACK2 are
+# the same one by construction.
+sed -e "s|@JACK_PREFIX@|$JACK_PREFIX|g" "$INSTALLER/config.plist" > "$BUILD/config.plist"
+install -m 0644 "$BUILD/config.plist" "$STAGING/Library/Application Support/JackBridge/config.plist.default"
 install -m 0644 "$INSTALLER/launchagents/com.jackbridge.daemon.plist" "$STAGING/Library/LaunchAgents/"
 install -m 0644 "$INSTALLER/launchagents/com.jackbridge.jackd.plist"  "$STAGING/Library/LaunchAgents/"
 install -m 0644 "$INSTALLER/launchdaemons/com.jackbridge.route.plist" "$STAGING/Library/LaunchDaemons/"

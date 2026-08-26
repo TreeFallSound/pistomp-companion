@@ -24,13 +24,73 @@ export JACK_NO_START_SERVER=1
 SUPPORT="/Library/Application Support/JackBridge"
 CONFIG="$SUPPORT/config.plist"
 DETECT="$SUPPORT/jb-detect-builtin"
-JACKD="/usr/local/bin/jackd"
-JACK_LOAD="/usr/local/bin/jack_load"
-
+# JACK_PREFIX / JACKD / JACK_LOAD / JACK_LSP all come from the one resolver
+# so the Companion app, this wrapper, and the build agree on which JACK2 the
+# package is driving. See jack-prefix.sh for the precedence.
+PREFIX_HELPER="$SUPPORT/jack-prefix.sh"
+if [ -r "$PREFIX_HELPER" ]; then
+    . "$PREFIX_HELPER"
+else
+    echo "jackd-launch: $PREFIX_HELPER missing — falling back to /usr/local" >&2
+    JACK_PREFIX="/usr/local"
+    JACKD="$JACK_PREFIX/bin/jackd"
+    JACK_LOAD="$JACK_PREFIX/bin/jack_load"
+    JACK_LSP="$JACK_PREFIX/bin/jack_lsp"
+fi
 JACK_MIN_VERSION="1.9.22"
+# A fresh marker is inherited by jackd and is visible to same-user `ps -Eww`.
+# It distinguishes our server from another program's server without changing
+# the JACK server name (`default`).
+JACKBRIDGE_INSTANCE=$(/usr/bin/uuidgen 2>/dev/null || printf '%s-%s' "$(/bin/date +%s)" "$$")
+export JACKBRIDGE_INSTANCE
+OWNER_HELPER="$SUPPORT/jackbridge-jackd"
+STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
+
+write_status() {
+    tmp="${STATUS_FILE}.$$"
+    printf '%s\n' "$1" > "$tmp"
+    /bin/mv -f "$tmp" "$STATUS_FILE"
+}
+
+clear_status() {
+    /bin/rm -f "$STATUS_FILE"
+}
+
+if [ ! -x "$OWNER_HELPER" ]; then
+    echo "jackd-launch: $OWNER_HELPER missing — cannot classify an existing JACK server" >&2
+    exit 1
+fi
+
+# Do not start jackd while another default server owns the JACK socket. Keep
+# this process alive and recheck at a bounded rate; launchd then does not
+# crash-loop, and the Companion can show the condition in its menu.
+while :; do
+    server_state=$("$OWNER_HELPER" state "$JACK_LSP" 2>/dev/null || printf '%s' none)
+    case "$server_state" in
+        none)
+            clear_status
+            break
+            ;;
+        owned)
+            write_status owned
+            echo "jackd-launch: an existing JackBridge JACK server is waiting for confirmation" >&2
+            sleep 10
+            ;;
+        foreign)
+            write_status foreign
+            echo "jackd-launch: a different program uses JACK; waiting" >&2
+            sleep 10
+            ;;
+        *)
+            write_status foreign
+            echo "jackd-launch: cannot classify the JACK server; waiting" >&2
+            sleep 10
+            ;;
+    esac
+done
 
 if [ ! -x "$JACKD" ]; then
-    echo "jackd not found at $JACKD — install JACK2 ${JACK_MIN_VERSION}+ from jackaudio.org" >&2
+    echo "jackd not found at $JACKD (prefix $JACK_PREFIX) — install JACK2 ${JACK_MIN_VERSION}+ from jackaudio.org" >&2
     exit 1
 fi
 
@@ -119,7 +179,7 @@ trap 'kill "$JACKD_PID" 2>/dev/null || true; rm -f "$JACKD_PID_FILE"' EXIT INT T
 # no audio).
 jackd_ready=0
 for i in $(seq 1 30); do
-    if /usr/local/bin/jack_lsp >/dev/null 2>&1; then
+    if "$JACK_LSP" >/dev/null 2>&1; then
         jackd_ready=1
         break
     fi
