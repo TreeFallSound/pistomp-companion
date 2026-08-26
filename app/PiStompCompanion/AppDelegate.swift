@@ -13,7 +13,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var sshItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
     private var diagnosticsAlert: NSAlert?
-    private static let piHost = "pistomp.local"
     private static let support = "/Library/Application Support/JackBridge"
     private static let ctl = "\(support)/jackbridge-ctl"
 
@@ -132,10 +131,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openModUI(_ s: Any?) {
         var components = URLComponents()
         components.scheme = "http"
-        components.host = Self.piHost
+        let host = JackTools.piHostname
+        components.host = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
         components.path = "/"
         guard let url = components.url else {
-            NSLog("Cannot open MOD-UI URL for %@", Self.piHost)
+            NSLog("Cannot open MOD-UI URL for %@", JackTools.piHostname)
             return
         }
         if !NSWorkspace.shared.open(url) {
@@ -148,7 +148,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Terminal. An ssh:// URL is owned by whichever app registered that
         // scheme (often an IDE), and a transient endpoint may include an
         // interface scope that is not a valid URL host.
-        let host = Self.piHost
+        let host = JackTools.piHostname
         let script = """
         #!/bin/sh
         /usr/bin/ssh pistomp@\(host)

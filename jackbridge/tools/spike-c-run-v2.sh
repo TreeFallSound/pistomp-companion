@@ -4,7 +4,9 @@
 # latency with jack_iodelay across a period × netjack2-cycles matrix.
 set -u
 
-PI=pistomp@pistomp.local
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PI_HOSTNAME=${PI_HOSTNAME:-$(sh "$SCRIPT_DIR/pi-hostname.sh")}
+PI=${PI:-pistomp@$PI_HOSTNAME}
 SR=48000
 # Using device name directly since it's default and unambiguous in this setup
 MAC_DEV='AppleUSBAudioEngine:Yamaha Corporation:Steinberg UR22C:120000:1,2'

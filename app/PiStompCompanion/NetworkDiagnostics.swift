@@ -108,14 +108,15 @@ enum NetworkDiagnostics {
         s += "\n-- arp -an --\n"
         s += runCommand("/usr/sbin/arp", args: ["-an"], timeout: 5, includeExit: true)
 
+        let hostname = JackTools.piHostname
         s += "\n== name resolution ==\n"
-        s += "\n-- dns-sd -Q pistomp.local (5s cap) --\n"
-        s += runCommand("/usr/bin/dns-sd", args: ["-Q", "pistomp.local", "A"], timeout: 5, includeExit: false)
-        s += "\n-- ping -c 3 -t 3 pistomp.local --\n"
-        s += runCommand("/sbin/ping", args: ["-c", "3", "-t", "3", "pistomp.local"], timeout: 6, includeExit: true)
+        s += "\n-- dns-sd -Q \(hostname) (5s cap) --\n"
+        s += runCommand("/usr/bin/dns-sd", args: ["-Q", hostname, "A"], timeout: 5, includeExit: false)
+        s += "\n-- ping -c 3 -t 3 \(hostname) --\n"
+        s += runCommand("/sbin/ping", args: ["-c", "3", "-t", "3", hostname], timeout: 6, includeExit: true)
 
         s += "\n== TCP probes (3s cap) ==\n"
-        for host in ["pistomp.local"] + (ReachabilityMonitor.cachedIP != nil ? [ReachabilityMonitor.cachedIP!] : []) {
+        for host in [hostname] + (ReachabilityMonitor.cachedIP != nil ? [ReachabilityMonitor.cachedIP!] : []) {
             for port in [UInt16(22), 80] {
                 s += "  \(host):\(port) → \(tcpProbeSync(host, port: port))\n"
             }

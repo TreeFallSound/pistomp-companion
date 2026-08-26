@@ -44,6 +44,12 @@
     <key>JackPrefix</key>
     <string>@JACK_PREFIX@</string>
 
+    <!-- Hostname used by the Companion for Pi reachability, MOD-UI, SSH,
+         and diagnostics. Change this when the Pi uses a different mDNS or
+         DNS name. Missing or invalid values fall back to pistomp.local. -->
+    <key>PiHostname</key>
+    <string>pistomp.local</string>
+
     <!-- Reported end-to-end latency is split in the HAL across two
          CoreAudio properties: kAudioDevicePropertyLatency = 722
          (BASE_LATENCY_FRAMES from docs/LATENCY-MODEL.md at the

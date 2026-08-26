@@ -1,9 +1,9 @@
 import Foundation
 import Network
 
-/// Dumb-by-design reachability: TCP-connect to sshd (port 22) with a 1.5 s
-/// timeout, first on `pistomp.local` (NWConnection does the mDNS
-/// resolution), then on the last-known-good IP persisted in UserDefaults.
+/// Dumb-by-design reachability: TCP-connect to the configured Pi hostname
+/// (default `pistomp.local`) with a 1.5 s timeout, then to the last-known-good
+/// IP persisted in UserDefaults.
 ///
 /// One honest fact — reachable or not — and which address answered. No
 /// ranking, no interface preference, no keepalive theory.
@@ -12,7 +12,7 @@ final class ReachabilityMonitor {
         var reachable = false
         /// The address that answered (hostname or IP string).
         var resolvedAddress: String?
-        /// Which name worked: "pistomp.local" or "cached-ip".
+        /// Which name worked: the configured hostname or "cached-ip".
         var via: String?
     }
 
@@ -57,11 +57,12 @@ final class ReachabilityMonitor {
         guard !inflight else { return }
         inflight = true
 
-        freeTryHost("pistomp.local", timeout: 1.5, queue: queue) { [weak self] ok, addr in
+        let hostname = JackTools.piHostname
+        freeTryHost(hostname, timeout: 1.5, queue: queue) { [weak self] ok, addr in
             guard let self else { return }
             if ok {
-                self.finish(reachable: true, address: addr ?? "pistomp.local", via: "pistomp.local")
-            } else if let ip = Self.cachedIP, ip != "pistomp.local" {
+                self.finish(reachable: true, address: addr ?? hostname, via: hostname)
+            } else if let ip = Self.cachedIP, ip != hostname {
                 freeTryHost(ip, timeout: 1.5, queue: self.queue) { ok2, addr2 in
                     self.finish(reachable: ok2, address: ok2 ? (addr2 ?? ip) : nil, via: ok2 ? "cached-ip" : nil)
                 }

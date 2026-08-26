@@ -7,7 +7,8 @@
 set -euo pipefail
 
 DURATION=${1:-30}
-PI_HOST=${PI_HOST:-pistomp@pistomp.local}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PI_HOST=${PI_HOST:-pistomp@$(sh "$SCRIPT_DIR/pi-hostname.sh")}
 PI_IFACE=${PI_IFACE:-end0}
 MAC_IFACE=${MAC_IFACE:-en7}
 PI_IP=${PI_IP:-169.254.161.200}

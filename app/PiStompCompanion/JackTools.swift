@@ -22,6 +22,25 @@ enum JackTools {
     static let defaultPrefix = "/usr/local"
     static let candidatePrefixes = ["/usr/local", "/opt/homebrew"]
     static let configPath = "/Library/Application Support/JackBridge/config.plist"
+    static let defaultPiHostname = "pistomp.local"
+    /// Read at use time so editing config.plist takes effect without relaunching
+    /// the Companion; the LaunchAgents independently restart via WatchPaths.
+    static var piHostname: String { configuredPiHostname() ?? defaultPiHostname }
+    private static func configuredPiHostname() -> String? {
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil) as? [String: Any],
+              let value = plist["PiHostname"] as? String else {
+            return nil
+        }
+        let host = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_:%"))
+        guard !host.isEmpty, host.count <= 253,
+              host.rangeOfCharacter(from: allowed.inverted) == nil else {
+            return nil
+        }
+        return host
+    }
 
     /// Resolved once per launch: the prefix can only change via a reinstall,
     /// which restarts the app's world anyway.

@@ -126,6 +126,7 @@ For the pi side: install pistomp-arch with JackBridge enabled, plug Ethernet fro
 - `ClockDeviceUID` — CoreAudio UID for jackd's backend device. Empty = auto-detect built-in output.
 - `PeriodFrames` — The dominant latency knob; 64 or 128 is recommended.
 - `NetworkInterface` — Name of the NIC to use. Empty = auto-detect (prefers 169.254.x).
+- `PiHostname` — hostname used for Pi reachability, MOD-UI, SSH, and diagnostics. Defaults to `pistomp.local`.
 
 ## Architecture & Building
 

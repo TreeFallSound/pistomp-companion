@@ -68,7 +68,7 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
         # arp entry across cable unplug/replug events (e.g. the pi's
         # 169.254.125.193 still cached on en0 wifi after the cable moved to
         # en7) which silently breaks the master/slave handshake — the new
-        # jackd resolves pistomp.local, the kernel returns the stale MAC,
+        # jackd resolves the configured Pi hostname, the kernel returns the stale MAC,
         # and packets never reach the pi. macOS does not auto-flush per-iface
         # arp on link-state change, so we do it ourselves on every wired
         # transition (not just iface changes — the most common case is
