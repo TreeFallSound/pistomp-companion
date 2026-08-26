@@ -108,7 +108,7 @@ jack_lsp | grep pistomp
   install will fail on x86_64. The xcodeproj *can* produce universal,
   but the jack2 fork's `build-macos-pkg.sh` doesn't yet `lipo` an
   x86_64 build, so the resulting libjack is single-arch and
-  `installer/build-pkg.sh` is forced to `ARCHS=arm64` to link. Intel
+  `jackbridge/installer/build-pkg.sh` is forced to `ARCHS=arm64` to link. Intel
   is not a planned target — see the project policy in `CLAUDE.md`.
 - **Unsigned + unnotarized**: the build skips signing unless
   `SIGN_APP_IDENTITY` / `SIGN_INSTALLER_IDENTITY` / `NOTARY_PROFILE` are

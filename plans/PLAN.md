@@ -28,7 +28,7 @@ inline. The daemon and `jackd-launch` together read three keys
 (`ClockDeviceUID`, `PeriodFrames`, `NetworkInterface`). The other six
 documented keys are dead:
 
-- **3.4.1** — `shared/jb_config.{hpp,cpp}` reader shim. Single source of
+- **3.4.1** — `jackbridge/shared/jb_config.{hpp,cpp}` reader shim. Single source of
   truth for parsing. C++ side via `CFPreferencesCopyAppValue` /
   `CFPropertyListCreateWithData`; shell side via `PlistBuddy` with
   `2>/dev/null || true` fallbacks. Missing file = all defaults. Missing
