@@ -24,7 +24,7 @@ BUILD="$INSTALLER/build"
 STAGING="$BUILD/staging"
 SCRIPTS="$INSTALLER/scripts"
 
-PKG_ID="com.jackbridge.pkg"
+PKG_ID="com.treefallsound.companion"
 PKG_OUT="$BUILD/PiStompCompanion-$VERSION.pkg"
 JACK_MIN_VERSION="1.9.22"
 
@@ -111,25 +111,80 @@ install -m 0755 "$INSTALLER/jack-prefix.sh"        "$STAGING/Library/Application
 # the same one by construction.
 sed -e "s|@JACK_PREFIX@|$JACK_PREFIX|g" "$INSTALLER/config.plist" > "$BUILD/config.plist"
 install -m 0644 "$BUILD/config.plist" "$STAGING/Library/Application Support/JackBridge/config.plist.default"
-install -m 0644 "$INSTALLER/launchagents/com.jackbridge.daemon.plist" "$STAGING/Library/LaunchAgents/"
-install -m 0644 "$INSTALLER/launchagents/com.jackbridge.jackd.plist"  "$STAGING/Library/LaunchAgents/"
-install -m 0644 "$INSTALLER/launchdaemons/com.jackbridge.route.plist" "$STAGING/Library/LaunchDaemons/"
+install -m 0644 "$INSTALLER/launchagents/com.treefallsound.companion.daemon.plist" "$STAGING/Library/LaunchAgents/"
+install -m 0644 "$INSTALLER/launchagents/com.treefallsound.companion.jackd.plist"  "$STAGING/Library/LaunchAgents/"
+install -m 0644 "$INSTALLER/launchdaemons/com.treefallsound.companion.route.plist" "$STAGING/Library/LaunchDaemons/"
 mkdir -p "$STAGING/Applications"
 cp -R "$APP_BUILD_DIR/PiStompCompanion.app" "$STAGING/Applications/"
+
+# Keep the GUI at /Applications. Without an explicit component plist,
+# pkgbuild defaults the app bundle to relocatable, and PackageKit then asks
+# LaunchServices where com.treefallsound.companion already lives. Every stale
+# build-tree copy is a candidate, so an install silently lands the app on top
+# of one of those instead of /Applications. Observed in install.log:
+#   Applications/PiStompCompanion.app relocated to
+#   Users/cam/dev/pistomp-companion/jackbridge/installer/build/staging/...
+COMPONENT_PLIST="$BUILD/components.plist"
+cat > "$COMPONENT_PLIST" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<array>
+    <dict>
+        <key>RootRelativeBundlePath</key>
+        <string>Applications/PiStompCompanion.app</string>
+        <key>BundleIsRelocatable</key>
+        <false/>
+        <key>BundleHasStrictIdentifier</key>
+        <true/>
+        <key>BundleIsVersionChecked</key>
+        <true/>
+        <key>BundleOverwriteAction</key>
+        <string>upgrade</string>
+    </dict>
+</array>
+</plist>
+PLIST
 
 echo "==> pkgbuild (component)"
 COMPONENT_PKG="$BUILD/PiStompCompanion-component.pkg"
 pkgbuild \
     --root "$STAGING" \
+    --component-plist "$COMPONENT_PLIST" \
     --identifier "$PKG_ID" \
     --version "$VERSION" \
     --install-location / \
     --scripts "$SCRIPTS" \
     "$COMPONENT_PKG"
 
+# Fail loud: a relocatable payload installs to the wrong path with no error.
+# The signal is the <relocate> element in PackageInfo, NOT the pkg-info
+# relocatable="false" attribute -- that attribute reads false either way.
+#   opted out (what we want): <relocate/>
+#   relocation on:            <relocate><bundle id="..."/></relocate>
+rm -rf "$BUILD/verify-component"
+pkgutil --expand-full "$COMPONENT_PKG" "$BUILD/verify-component" >/dev/null
+if grep -q '<relocate>' "$BUILD/verify-component/PackageInfo"; then
+    echo "error: component pkg opts in to bundle relocation." >&2
+    echo "       PackageKit would install PiStompCompanion.app over whatever stale" >&2
+    echo "       copy of $PKG_ID LaunchServices happens to know about," >&2
+    echo "       instead of /Applications. Check the --component-plist above." >&2
+    rm -rf "$BUILD/verify-component"
+    exit 1
+fi
+rm -rf "$BUILD/verify-component"
+
 echo "==> productbuild (distribution)"
 DIST_XML="$BUILD/distribution.xml"
-sed -e "s/@VERSION@/$VERSION/g" "$INSTALLER/distribution.xml.in" > "$DIST_XML"
+sed -e "s/@VERSION@/$VERSION/g" \
+    -e "s|@JACK_PREFIX@|$JACK_PREFIX|g" "$INSTALLER/distribution.xml.in" > "$DIST_XML"
+
+# Fail loud: an unsubstituted token becomes a literal path in the
+# installation-check, which then fatals on every machine.
+if grep -q "@[A-Z_]*@" "$DIST_XML"; then
+    echo "error: unsubstituted token in distribution.xml:" >&2
+    grep -o "@[A-Z_]*@" "$DIST_XML" | sort -u >&2
+    exit 1
+fi
 
 PRODUCTBUILD_ARGS=(--distribution "$DIST_XML" --package-path "$BUILD")
 if [[ -n "${SIGN_INSTALLER_IDENTITY:-}" ]]; then

@@ -14,8 +14,8 @@ The package installs:
 - `JackBridged`, helpers, `jackbridge-ctl`, config, and launch services.
 - The route LaunchDaemon and per-user LaunchAgents.
 
-JACK2 remains a separately installed prerequisite for the first release. Keep
-`com.jackbridge.pkg` as the package identifier so upgrades remain compatible.
+JACK2 remains a separately installed prerequisite for the first release. Use
+`com.treefallsound.companion` as the package identifier.
 
 ## Release work
 

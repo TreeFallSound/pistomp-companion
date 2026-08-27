@@ -10,16 +10,28 @@
     </volume-check>
     <installation-check script="installation_check()"/>
     <script><![CDATA[
+// @JACK_PREFIX@ is substituted by build-pkg.sh from $JACK_PREFIX, the same
+// value stamped into config.plist as JackPrefix. Hardcoding /usr/local here
+// made a JACK_PREFIX=/opt/homebrew build refuse to install on a machine that
+// had JACK2 -- see the "One JACK prefix, stamped at build time" rule.
+//
+// Note this can only check presence and version: the sastraxi/jack2 fork
+// reports the same 'jackdmp version 1.9.22' as stock upstream, so a user who
+// installed stock JACK2 passes this check and then hits a silent netJACK2
+// discovery timeout for want of the multicast pin.
 function installation_check() {
     var minVersion = '1.9.22';
-    var jackd = '/usr/local/bin/jackd';
+    var jackPrefix = '@JACK_PREFIX@';
+    var jackd = jackPrefix + '/bin/jackd';
+    var releases = 'https://github.com/treefallsound/pistomp-companion/releases';
 
     if (!system.files.fileExistsAtPath(jackd)) {
         my.result.title = 'JACK2 is required';
-        my.result.message = 'JackBridge requires JACK2 ' + minVersion + ' or newer. ' +
-            'Install the official JACK2 .pkg from ' +
-            'https://github.com/jackaudio/jack2-releases/releases ' +
-            'and then run this installer again.';
+        my.result.message = 'PiStomp Companion requires JACK2 ' + minVersion + ' or newer ' +
+            'at ' + jackPrefix + '. Install the jack2-<version>.pkg from ' + releases +
+            ' and then run this installer again. Note this must be the forked build ' +
+            'published there -- stock JACK2 lacks the netJACK2 multicast-interface ' +
+            'pin, and discovery will time out without it.';
         my.result.type = 'Fatal';
         return false;
     }
@@ -34,9 +46,8 @@ function installation_check() {
             if (have[i] < need[i]) {
                 my.result.title = 'JACK2 is too old';
                 my.result.message = 'Found jackd ' + have.join('.') +
-                    ' at ' + jackd + '. JackBridge requires ' + minVersion + ' or newer. ' +
-                    'Reinstall JACK2 from ' +
-                    'https://github.com/jackaudio/jack2-releases/releases.';
+                    ' at ' + jackd + '. PiStomp Companion requires ' + minVersion +
+                    ' or newer. Reinstall the jack2-<version>.pkg from ' + releases + '.';
                 my.result.type = 'Fatal';
                 return false;
             }
@@ -49,12 +60,12 @@ function installation_check() {
     <domains enable_localSystem="true"/>
     <choices-outline>
         <line choice="default">
-            <line choice="com.jackbridge.pkg"/>
+            <line choice="com.treefallsound.companion"/>
         </line>
     </choices-outline>
     <choice id="default"/>
-    <choice id="com.jackbridge.pkg" visible="false">
-        <pkg-ref id="com.jackbridge.pkg"/>
+    <choice id="com.treefallsound.companion" visible="false">
+        <pkg-ref id="com.treefallsound.companion"/>
     </choice>
-    <pkg-ref id="com.jackbridge.pkg" version="@VERSION@" onConclusion="none">PiStompCompanion-component.pkg</pkg-ref>
+    <pkg-ref id="com.treefallsound.companion" version="@VERSION@" onConclusion="none">PiStompCompanion-component.pkg</pkg-ref>
 </installer-gui-script>

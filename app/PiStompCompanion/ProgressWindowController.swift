@@ -47,7 +47,7 @@ final class ProgressWindowController: NSWindowController {
         statusField.lineBreakMode = .byTruncatingTail
         statusField.setContentCompressionResistancePriority(.required, for: .horizontal)
         // Widest plausible label; replaced as probes land.
-        statusField.stringValue = "com.jackbridge.daemon.err.log (14 of 14)"
+        statusField.stringValue = "com.treefallsound.companion.daemon.err.log (14 of 14)"
 
         bar.style = .bar
         bar.isIndeterminate = true

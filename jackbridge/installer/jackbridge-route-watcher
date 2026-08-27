@@ -52,27 +52,46 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
         # route is persistent across ARP flushes and survives until explicitly
         # removed or the interface goes down.
         # tcpdump uses BPF which is root-only (we're a LaunchDaemon).
+        #
+        # tcpdump runs ONCE and streams (-l for line buffering), rather than
+        # -c 1 inside a respawn loop. With the pi connected, netJACK2
+        # discovery multicast arrives continuously, so a -c 1 loop captures
+        # and exits immediately — measured at ~10 fork/exec of tcpdump per
+        # second, forever, each re-adding a route that already existed and
+        # writing a duplicate log line (~500 KB/min into an unrotated log).
+        # On a host whose whole job is low-latency audio, that churn comes
+        # straight out of the jitter budget.
+        #
+        # We also only act when the address actually changes: the route add
+        # is idempotent, so re-adding a known IP is pure noise.
         (
+            last_ip=
             while :; do
-                tcpdump -i "$new_iface" -c 1 -n 'udp dst port 19000' 2>/dev/null | \
+                tcpdump -i "$new_iface" -n -l 'udp dst port 19000' 2>/dev/null | \
                 awk '{
                     for(i=1;i<=NF;i++)
                         if(match($i,/^225\.3\.19\.154\.19000:?$/)) {
                             split($(i-2),a,".")
                             print a[1]"."a[2]"."a[3]"."a[4]
-                            exit
+                            fflush()
+                            next
                         }
                 }' | while read pi_ip; do
-                    if [ -n "$pi_ip" ]; then
-                        # Add an interface-scoped host route. This restricts
-                        # ARP resolution to the wired interface — the wifi
-                        # router never sees the request and can't proxy-ARP
-                        # a reply. The route is idempotent; if it already
-                        # exists, the add is a no-op.
-                        /sbin/route -n add -host "$pi_ip" -interface "$new_iface" >/dev/null 2>&1 || true
-                        echo "jackbridge-route-watcher: pinned $pi_ip to $new_iface" >&2
-                    fi
+                    [ -n "$pi_ip" ] || continue
+                    [ "$pi_ip" = "$last_ip" ] && continue
+                    # Add an interface-scoped host route. This restricts
+                    # ARP resolution to the wired interface — the wifi
+                    # router never sees the request and can't proxy-ARP
+                    # a reply. The route is idempotent; if it already
+                    # exists, the add is a no-op.
+                    /sbin/route -n add -host "$pi_ip" -interface "$new_iface" >/dev/null 2>&1 || true
+                    echo "jackbridge-route-watcher: pinned $pi_ip to $new_iface" >&2
+                    last_ip=$pi_ip
                 done
+                # Only reached if tcpdump exits (interface down, BPF error).
+                # A network change restarts the whole watcher via launchd;
+                # this sleep just keeps a hard failure from hot-looping.
+                /bin/sleep 2
             done
         ) &
 else

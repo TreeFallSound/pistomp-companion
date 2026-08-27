@@ -302,8 +302,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openLogs(_ s: Any?) {
-        for n in ["com.jackbridge.jackd.err.log", "com.jackbridge.jackd.out.log",
-                  "com.jackbridge.daemon.err.log", "com.jackbridge.daemon.out.log"] {
+        for n in ["com.treefallsound.companion.jackd.err.log", "com.treefallsound.companion.jackd.out.log",
+                  "com.treefallsound.companion.daemon.err.log", "com.treefallsound.companion.daemon.out.log"] {
             NSWorkspace.shared.open(URL(fileURLWithPath: "/tmp/\(n)"))
         }
     }

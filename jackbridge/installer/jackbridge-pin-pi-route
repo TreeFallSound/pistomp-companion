@@ -14,7 +14,7 @@ trap 'rm -f "$TMPFILE"' EXIT
 
 # tcpdump blocks until it captures one matching packet or is killed.
 # The pi sends UDP to 225.3.19.154:19000 at ~500ms intervals while its
-# netadapter is loaded. We run as root (LaunchDaemon → com.jackbridge.route)
+# netadapter is loaded. We run as root (LaunchDaemon → com.treefallsound.companion.route)
 # so BPF access is available.
 tcpdump -i "$IFACE" -c 1 -n 'udp dst port 19000' 2>/dev/null > "$TMPFILE" &
 TPID=$!

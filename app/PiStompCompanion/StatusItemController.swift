@@ -1,13 +1,19 @@
 import AppKit
 import Foundation
 
-/// Menu-bar status item: template icon at 0.35/1.0 alpha, badge dot
-/// composited lower-right. `live` — not raw reachability — drives the dim:
-/// once the stack is wired the pi is demonstrably there, whether or not the
-/// mDNS/TCP probe (which rides wifi, not the audio link) answered this cycle.
-/// Once a colored badge is composited the image is
-/// NOT a template, so badge colors must read on light and dark menu bars —
-/// the system colors below adapt to appearance.
+/// Menu-bar status item: template icon at 0.35/1.0 alpha, badge dot drawn
+/// lower-right. `live` — not raw reachability — drives the dim: once the
+/// stack is wired the pi is demonstrably there, whether or not the mDNS/TCP
+/// probe (which rides wifi, not the audio link) answered this cycle.
+///
+/// The badge is a sibling *view* on the status button rather than pixels
+/// composited into the image, because a colored badge would force
+/// `isTemplate = false` and AppKit would then stop tinting the icon — leaving
+/// it a black stroke on a dark menu bar, and un-inverted under the open-menu
+/// highlight. Keeping the image a pure template leaves all of that to AppKit;
+/// `BadgeView` draws in its own `draw(_:)`, so its system colors resolve
+/// against the live effective appearance and refresh on a dark/light flip
+/// with no work from us.
 final class StatusItemController {
     let statusItem: NSStatusItem
 
@@ -19,43 +25,74 @@ final class StatusItemController {
         case red           // protocol mismatch / daemon failing
     }
 
+    /// Point size the template icon is drawn at, inside the (wider) button.
+    fileprivate static let iconSide = 18.0
+
+    private let badgeView = BadgeView()
+
     init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = Self.render(badge: .none, live: false)
+        if let button = statusItem.button {
+            badgeView.frame = button.bounds
+            badgeView.autoresizingMask = [.width, .height]
+            button.addSubview(badgeView)
+        }
+        update(badge: .none, live: false)
     }
 
     func update(badge: Badge, live: Bool) {
-        statusItem.button?.image = Self.render(badge: badge, live: live)
+        statusItem.button?.image = Self.icon(live: live)
+        badgeView.badge = badge
     }
 
-    static func render(badge: Badge, live: Bool) -> NSImage {
+    /// The base artwork, dimmed when not live. Stays a template so AppKit
+    /// owns its color in every appearance and every button state.
+    static func icon(live: Bool) -> NSImage {
         guard let base = NSImage(named: "MenuBarIcon")?.copy() as? NSImage else {
             return NSImage()
         }
-        let side = 18.0
-        if badge == .none {
-            // Pure template path: let AppKit tint. Dim by re-drawing the
-            // template at reduced alpha — NSImage has no alpha property.
-            let out = NSImage(size: NSSize(width: side, height: side))
-            out.lockFocus()
-            NSGraphicsContext.current?.cgContext.setAlpha(live ? 1.0 : 0.35)
-            base.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
-            out.unlockFocus()
-            out.isTemplate = true
-            return out
+        guard !live else {
+            base.isTemplate = true
+            return base
         }
-        let out = NSImage(size: NSSize(width: side, height: side))
+        // Dim by re-drawing at reduced alpha — NSImage has no alpha property.
+        let out = NSImage(size: NSSize(width: iconSide, height: iconSide))
         out.lockFocus()
-        let full = NSRect(x: 0, y: 0, width: side, height: side)
-        NSGraphicsContext.current?.cgContext.setAlpha(live ? 1.0 : 0.35)
-        base.draw(in: full)
-        NSGraphicsContext.current?.cgContext.setAlpha(1.0)
+        NSGraphicsContext.current?.cgContext.setAlpha(0.35)
+        base.draw(in: NSRect(x: 0, y: 0, width: iconSide, height: iconSide))
+        out.unlockFocus()
+        out.isTemplate = true
+        return out
+    }
+}
 
-        // Badge dot, lower-right, ~5 pt diameter with a hairline rim so it
-        // reads against the (dark or light) bar behind it.
+/// Transparent overlay on the status button that paints just the badge dot.
+private final class BadgeView: NSView {
+    var badge: StatusItemController.Badge = .none {
+        didSet { needsDisplay = true }
+    }
+
+    override var isOpaque: Bool { false }
+
+    /// Clicks belong to the button underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard badge != .none else { return }
+
+        // Anchor to the icon, not the button: the button is wider than the
+        // 18 pt artwork, which sits centered in it.
+        let side = StatusItemController.iconSide
+        let icon = NSRect(x: (bounds.width - side) / 2,
+                          y: (bounds.height - side) / 2,
+                          width: side, height: side)
+
+        // ~5 pt diameter, lower-right, with a hairline rim so it reads
+        // against the (dark or light) bar behind it.
         let d = 5.0
         let inset = 1.0
-        let rect = NSRect(x: side - d - inset, y: inset, width: d, height: d)
+        let rect = NSRect(x: icon.maxX - d - inset, y: icon.minY + inset,
+                          width: d, height: d)
         switch badge {
         case .none:
             break
@@ -68,12 +105,9 @@ final class StatusItemController {
         case .red:
             drawDot(rect, fill: .systemRed)
         }
-        out.unlockFocus()
-        out.isTemplate = false
-        return out
     }
 
-    private static func drawDot(_ rect: NSRect, fill: NSColor?, stroke: NSColor? = nil) {
+    private func drawDot(_ rect: NSRect, fill: NSColor?, stroke: NSColor? = nil) {
         if let fill {
             fill.setFill()
             rect.insetBy(dx: -0.5, dy: -0.5).fill()

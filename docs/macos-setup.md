@@ -17,8 +17,8 @@ The user-facing runtime setup. What gets installed where, what processes run, ho
 ```
 /Library/Audio/Plug-Ins/HAL/JackBridgePlugIn.driver    HAL bundle (system-wide)
 /Library/Application Support/JackBridge/JackBridged    Daemon binary
-/Library/LaunchAgents/com.jackbridge.daemon.plist      Daemon LaunchAgent
-/Library/LaunchAgents/com.jackbridge.jackd.plist       jackd launcher
+/Library/LaunchAgents/com.treefallsound.companion.daemon.plist  Daemon LaunchAgent
+/Library/LaunchAgents/com.treefallsound.companion.jackd.plist   jackd launcher
 /Library/Application Support/JackBridge/jackd-launch   jackd wrapper script
 ~/Library/Logs/JackBridge/                              Unified-log mirror (debug)
 ```
@@ -96,10 +96,10 @@ user's GUI session.
 
 Raw `launchctl` equivalent (for reference / scripting):
 ```bash
-launchctl disable gui/$(id -u)/com.jackbridge.daemon
-launchctl disable gui/$(id -u)/com.jackbridge.jackd
-launchctl bootout  gui/$(id -u)/com.jackbridge.daemon
-launchctl bootout  gui/$(id -u)/com.jackbridge.jackd
+launchctl disable gui/$(id -u)/com.treefallsound.companion.daemon
+launchctl disable gui/$(id -u)/com.treefallsound.companion.jackd
+launchctl bootout  gui/$(id -u)/com.treefallsound.companion.daemon
+launchctl bootout  gui/$(id -u)/com.treefallsound.companion.jackd
 # … and the inverse with `enable` + `bootstrap`.
 ```
 
@@ -109,10 +109,10 @@ The daemon validates jackd's CoreAudio backend on startup (see `plans/PLAN.md` h
 - No `system:playback_1` port, or no aliases on it → jackd's backend isn't `coreaudio`. Refuse.
 - Alias contains `"JackBridge"` → jackd is clocked off JackBridge itself, which creates a CoreAudio feedback loop. Refuse.
 
-On either failure the daemon logs to `com.jackbridge` / category `jack` via `os_log` and exits non-zero. `KeepAlive=true` means launchd respawns after its built-in 10s throttle — the daemon will loop until you fix the cause. Watch the loop with:
+On either failure the daemon logs to `com.treefallsound.companion` / category `jack` via `os_log` and exits non-zero. `KeepAlive=true` means launchd respawns after its built-in 10s throttle — the daemon will loop until you fix the cause. Watch the loop with:
 
 ```bash
-log stream --predicate 'subsystem == "com.jackbridge" && category == "jack"'
+log stream --predicate 'subsystem == "com.treefallsound.companion" && category == "jack"'
 # or:
 jackbridge-ctl logs
 ```
@@ -134,7 +134,7 @@ codesign --force --options runtime --sign "Developer ID Application: <Team>" \
 codesign --force --options runtime --sign "Developer ID Application: <Team>" \
     --deep JackBridgePlugIn.driver
 
-pkgbuild --root staging --identifier com.jackbridge.pkg --version 0.1.0 \
+pkgbuild --root staging --identifier com.treefallsound.companion --version 0.1.0 \
     --install-location / --scripts scripts JackBridge.pkg
 productbuild --sign "Developer ID Installer: <Team>" \
     --package JackBridge.pkg JackBridge-signed.pkg

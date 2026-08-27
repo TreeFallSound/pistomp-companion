@@ -20,7 +20,7 @@ final class ReachabilityMonitor {
     /// main: `StatusMonitor` owns the merge and hops to its own queue.
     var onUpdate: ((Result) -> Void)?
 
-    private let queue = DispatchQueue(label: "com.jackbridge.companion.reachability", qos: .utility)
+    private let queue = DispatchQueue(label: "com.treefallsound.companion.reachability", qos: .utility)
     private var timer: DispatchSourceTimer?
     private var pathMonitor: NWPathMonitor?
     private var inflight = false
@@ -140,7 +140,7 @@ private func endpointHost(_ endpoint: NWEndpoint?) -> String? {
 /// Synchronous TCP probe for the diagnostics dump (runs on a utility queue).
 func tcpProbeSync(_ host: String, port: UInt16, timeout: TimeInterval = 3.0) -> String {
     let sem = DispatchSemaphore(value: 0)
-    let q = DispatchQueue(label: "com.jackbridge.companion.probe")
+    let q = DispatchQueue(label: "com.treefallsound.companion.probe")
     var outcome = "timeout"
     q.async {
         freeTryHost(host, port: port, timeout: timeout, queue: q) { ok, addr in

@@ -184,7 +184,7 @@ Ethernet).
 Fix: force the route watcher to re-pin the interface.
 
 ```sh
-sudo launchctl kickstart -k system/com.jackbridge.route
+sudo launchctl kickstart -k system/com.treefallsound.companion.route
 ```
 
 ### 4. The audio is silent but the ports are visible

@@ -1,7 +1,7 @@
 #!/bin/sh
 # jackbridge-ctl — user-facing start/stop/status for the JackBridge daemons.
 #
-# Wraps `launchctl` against /Library/LaunchAgents/com.jackbridge.{jackd,daemon}.
+# Wraps `launchctl` against /Library/LaunchAgents/com.treefallsound.companion.{jackd,daemon}.
 # Both agents move together (stopping only one leaves either the audio device
 # orphaned or the daemon crash-looping).
 #
@@ -19,7 +19,7 @@
 set -e
 
 LAGENTS="/Library/LaunchAgents"
-LABELS="com.jackbridge.jackd com.jackbridge.daemon"
+LABELS="com.treefallsound.companion.jackd com.treefallsound.companion.daemon"
 UID_NUM=$(/usr/bin/id -u)
 DOMAIN="gui/$UID_NUM"
 LOG_DIR="/tmp"
@@ -102,7 +102,7 @@ cmd_stop() {
         return 0
     fi
     # Daemon first so it doesn't crash-loop while jackd is going away.
-    for label in com.jackbridge.daemon com.jackbridge.jackd; do
+    for label in com.treefallsound.companion.daemon com.treefallsound.companion.jackd; do
         /bin/launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
         /bin/launchctl disable "$DOMAIN/$label" 2>/dev/null || true
     done
@@ -135,8 +135,8 @@ cmd_status() {
 }
 
 cmd_logs() {
-    files="$LOG_DIR/com.jackbridge.jackd.err.log $LOG_DIR/com.jackbridge.jackd.out.log \
-           $LOG_DIR/com.jackbridge.daemon.err.log $LOG_DIR/com.jackbridge.daemon.out.log"
+    files="$LOG_DIR/com.treefallsound.companion.jackd.err.log $LOG_DIR/com.treefallsound.companion.jackd.out.log \
+           $LOG_DIR/com.treefallsound.companion.daemon.err.log $LOG_DIR/com.treefallsound.companion.daemon.out.log"
     # tail -F follows files that don't exist yet — handy if the daemon hasn't
     # been started since boot.
     exec /usr/bin/tail -F $files

@@ -50,7 +50,7 @@ final class StatusMonitor {
 
     /// `stateQueue`-owned. Serial, so a poll and a callback can never
     /// interleave their writes.
-    private let stateQueue = DispatchQueue(label: "com.jackbridge.companion.state", qos: .utility)
+    private let stateQueue = DispatchQueue(label: "com.treefallsound.companion.state", qos: .utility)
     private var state = State()
 
     // Heartbeat bookkeeping: deltas across successive 200 ms polls. The

@@ -30,9 +30,9 @@ A settings window that writes only a home file will not update the route service
 |---|---|
 | `app/PiStompCompanion/AppDelegate.swift:201-205` | The app opens the system plist. |
 | `jackbridge/installer/config.plist:6-11` | A plist change restarts the JackBridge agents. |
-| `jackbridge/installer/launchagents/com.jackbridge.jackd.plist:40-44` | The JACK LaunchAgent watches the system plist. |
-| `jackbridge/installer/launchagents/com.jackbridge.daemon.plist:33-36` | The daemon LaunchAgent watches the system plist. |
-| `jackbridge/installer/launchdaemons/com.jackbridge.route.plist:25-31` | The root route service watches the system plist. |
+| `jackbridge/installer/launchagents/com.treefallsound.companion.jackd.plist:34-38` | The JACK LaunchAgent watches the system plist. |
+| `jackbridge/installer/launchagents/com.treefallsound.companion.daemon.plist:29-32` | The daemon LaunchAgent watches the system plist. |
+| `jackbridge/installer/launchdaemons/com.treefallsound.companion.route.plist:25-31` | The root route service watches the system plist. |
 | `jackbridge/installer/jackd-launch:103-162` | The wrapper reads the clock UID and period, then starts JACK. |
 | `/usr/local/bin/jackd -d coreaudio --help` | The CoreAudio backend accepts `--rate`, `--period`, `--playback`, and related startup options. |
 | `jackbridge/daemon/jackClient.cpp:81-93` | The daemon reads the active JACK rate and buffer size at startup. |

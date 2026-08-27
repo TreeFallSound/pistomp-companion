@@ -19,17 +19,11 @@ if [ -z "$PKG" ]; then
 fi
 
 SUPPORT="/Library/Application Support/JackBridge"
-DAEMON_PLIST="/Library/LaunchAgents/com.jackbridge.daemon.plist"
-JACKD_PLIST="/Library/LaunchAgents/com.jackbridge.jackd.plist"
-UID_TARGET="gui/$(id -u)"
 
 echo "==> installing $(basename "$PKG")"
 sudo installer -pkg "$PKG" -target /
 
-echo "==> stopping LaunchAgents"
-# bootout fails noisily when the agent isn't loaded; tolerate it.
-launchctl bootout "$UID_TARGET" "$DAEMON_PLIST" 2>/dev/null || true
-launchctl bootout "$UID_TARGET" "$JACKD_PLIST"  2>/dev/null || true
+echo "==> installer leaves GUI LaunchAgents stopped"
 
 echo "==> bouncing coreaudiod (releases HAL's shm mapping)"
 sudo killall coreaudiod 2>/dev/null || true
@@ -48,10 +42,6 @@ for name in (b"/JackBridge", b"/jackrouter", b"/jackrouter2"):
 PY
 fi
 
-echo "==> bootstrapping jackd (must precede daemon — daemon refuses to auto-spawn)"
-launchctl bootstrap "$UID_TARGET" "$JACKD_PLIST"
-
-echo "==> bootstrapping daemon"
-launchctl bootstrap "$UID_TARGET" "$DAEMON_PLIST"
+echo "==> leaving LaunchAgents stopped; launch the Companion to start JACK"
 
 echo "==> done"

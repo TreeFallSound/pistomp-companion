@@ -544,7 +544,7 @@
 				);
 				INFOPLIST_FILE = "$(SRCROOT)/JackBridge/Plug-In/SA_PlugIn-Info.plist";
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
-				PRODUCT_BUNDLE_IDENTIFIER = "jp.ne.ivory.linux-dtm.JackBridge";
+                PRODUCT_BUNDLE_IDENTIFIER = "com.treefallsound.companion.driver";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				WRAPPER_EXTENSION = driver;
 			};
@@ -561,7 +561,7 @@
 				);
 				INFOPLIST_FILE = "$(SRCROOT)/JackBridge/Plug-In/SA_PlugIn-Info.plist";
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
-				PRODUCT_BUNDLE_IDENTIFIER = "jp.ne.ivory.linux-dtm.JackBridge";
+                PRODUCT_BUNDLE_IDENTIFIER = "com.treefallsound.companion.driver";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				WRAPPER_EXTENSION = driver;
 			};
@@ -578,7 +578,7 @@
 				);
 				INFOPLIST_FILE = "$(SRCROOT)/JackBridge/Plug-In/SA_PlugIn-Info.plist";
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
-				PRODUCT_BUNDLE_IDENTIFIER = "jp.ne.ivory.linux-dtm.JackBridge";
+                PRODUCT_BUNDLE_IDENTIFIER = "com.treefallsound.companion.driver";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				WRAPPER_EXTENSION = driver;
 			};
@@ -598,7 +598,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(JACK_PREFIX)/lib";
 				INSTALL_PATH = "/Library/Application Support/JackBridge";
-				PRODUCT_BUNDLE_IDENTIFIER = com.jackbridge.daemon;
+                PRODUCT_BUNDLE_IDENTIFIER = com.treefallsound.companion.daemon;
 				PRODUCT_NAME = JackBridged;
 			};
 			name = Release;
@@ -617,7 +617,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(JACK_PREFIX)/lib";
 				INSTALL_PATH = "/Library/Application Support/JackBridge";
-				PRODUCT_BUNDLE_IDENTIFIER = com.jackbridge.daemon;
+                PRODUCT_BUNDLE_IDENTIFIER = com.treefallsound.companion.daemon;
 				PRODUCT_NAME = JackBridged;
 			};
 			name = Debug;
@@ -636,7 +636,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(JACK_PREFIX)/lib";
 				INSTALL_PATH = "/Library/Application Support/JackBridge";
-				PRODUCT_BUNDLE_IDENTIFIER = com.jackbridge.daemon;
+                PRODUCT_BUNDLE_IDENTIFIER = com.treefallsound.companion.daemon;
 				PRODUCT_NAME = JackBridged;
 			};
 			name = "Debug-Opt";
@@ -645,7 +645,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				INSTALL_PATH = "/Library/Application Support/JackBridge";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jackbridge.jb-detect-builtin";
+                PRODUCT_BUNDLE_IDENTIFIER = "com.treefallsound.companion.jb-detect-builtin";
 				PRODUCT_NAME = "jb-detect-builtin";
 			};
 			name = Release;
@@ -654,7 +654,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				INSTALL_PATH = "/Library/Application Support/JackBridge";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jackbridge.jb-detect-builtin";
+                PRODUCT_BUNDLE_IDENTIFIER = "com.treefallsound.companion.jb-detect-builtin";
 				PRODUCT_NAME = "jb-detect-builtin";
 			};
 			name = Debug;
@@ -663,7 +663,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				INSTALL_PATH = "/Library/Application Support/JackBridge";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jackbridge.jb-detect-builtin";
+                PRODUCT_BUNDLE_IDENTIFIER = "com.treefallsound.companion.jb-detect-builtin";
 				PRODUCT_NAME = "jb-detect-builtin";
 			};
 			name = "Debug-Opt";

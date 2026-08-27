@@ -34,6 +34,7 @@ legacy JackRouter identity from active product surfaces.
 
 ## Compatibility rule
 
-Do not rename installed bundle identifiers, launchd labels, shm names, or the
-`com.jackbridge.pkg` package identifier solely for branding. Those are upgrade
-and runtime compatibility surfaces.
+The first public package used the `com.jackbridge.*` namespace. The new package
+must migrate those launchd labels and forget `com.jackbridge.pkg` during
+installation. No new runtime component may retain the old namespace; these
+identifiers are compatibility surfaces, not branding.

@@ -88,5 +88,5 @@ ssh pistomp@pistomp.local 'pkill jack_metro; killall jackd; sudo systemctl start
 ## Follow-ups
 
 - **Get the Mac onto wired Ethernet, retest, run for 1 hour, analyze for drift.** Until done, Config B is not formally validated.
-- **Add the RT priority requirement to `docs/macos-setup.md`** and bake it into the Phase 1.5 LaunchAgent (`com.jackbridge.jackd.plist`).
+- **Add the RT priority requirement to `docs/macos-setup.md`** and bake it into the Phase 1.5 LaunchAgent (`com.treefallsound.companion.jackd.plist`).
 - Pi-stomp's stock `jack.service` already runs `jackd` as user `jack` with `LimitRTPRIO=infinity` and `JACK_PROMISCUOUS_SERVER=jack`. To use Pi-stomp's own jackd as the slave (rather than stopping it), we'd need to either (a) run the spike's clients as a member of the `jack` group with the right env, or (b) script the spike against a stopped pi-stomp. (b) is what was done here.

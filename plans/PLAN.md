@@ -50,7 +50,7 @@ documented keys are dead:
   active GUI session; remove LaunchAgents, HAL bundle, support dir, and
   `/usr/local/bin/jackbridge-ctl` symlink; run `jackbridge/tools/rmshm` to
   unlink the POSIX shm; `killall coreaudiod`; `pkgutil --forget
-  com.jackbridge.pkg`; clear `launchctl disable` state for both labels.
+  com.treefallsound.companion`; clear `launchctl disable` state for both labels.
 - Ship a double-clickable `Uninstall.command` inside the `.pkg` payload
   (or alongside the README) wrapping the same logic with `sudo` via
   `osascript`.

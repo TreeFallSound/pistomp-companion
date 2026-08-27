@@ -17,7 +17,7 @@ Evidence:
 3. **`kAudioDevicePropertySafetyOffset` doesn't help.** Tested at 192,
    1024, and 4096 frames: identical click rate. (See "the SafetyOffset
    experiment" below.)
-4. **xrun client identity.** `/tmp/com.jackbridge.jackd.err.log` shows
+4. **xrun client identity.** `/tmp/com.treefallsound.companion.jackd.err.log` shows
    every xrun is `client = pistomp was not finished, state = Running`
    immediately followed by `client = JackBridge #1 was not finished,
    state = Triggered`. Our daemon never even starts the failed cycle
@@ -240,7 +240,7 @@ One-line change in `jackbridge/pi/bin/jackbridge-pi-up` (`jack_load netadapter -
   + cross-side reconciliation. Needs `sudo` on both ends. No deps beyond
   `python3` and `tcpdump`.
 - HAL jitter log (5 s windows): `log stream --predicate 'subsystem ==
-  "com.jackbridge"' | grep jitter`.
+  "com.treefallsound.companion"' | grep jitter.
 - Pi xrun categories:
   - `JackRingBuffer.*too slow` — netadapter slip ring failures.
   - `JackEngine::XRun: client = X was not finished` — graph xruns.

@@ -637,7 +637,7 @@ private:
     // the only thing worth reading.
     //
     // Tail with:
-    //   log stream --predicate 'subsystem == "com.jackbridge" && category == "shm"'
+    //   log stream --predicate 'subsystem == "com.treefallsound.companion" && category == "shm"'
     void check_progress() {
         uint64_t halReadHead = 0;
         uint64_t s1, s2;

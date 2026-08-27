@@ -17,7 +17,7 @@ final class JackGraphMonitor {
     /// Called on the monitor's own queue, not on main.
     var onUpdate: ((Result) -> Void)?
 
-    private let queue = DispatchQueue(label: "com.jackbridge.companion.jackgraph", qos: .utility)
+    private let queue = DispatchQueue(label: "com.treefallsound.companion.jackgraph", qos: .utility)
     private var timer: DispatchSourceTimer?
 
     func start(interval: TimeInterval = 2.0) {

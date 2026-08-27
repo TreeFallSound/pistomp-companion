@@ -31,8 +31,8 @@ fi
 
 echo
 echo "==> bootout LaunchAgents (uid=$LA_UID) and kill stragglers"
-launchctl bootout "gui/$LA_UID/com.jackbridge.daemon" 2>/dev/null || true
-launchctl bootout "gui/$LA_UID/com.jackbridge.jackd"  2>/dev/null || true
+launchctl bootout "gui/$LA_UID/com.treefallsound.companion.daemon" 2>/dev/null || true
+launchctl bootout "gui/$LA_UID/com.treefallsound.companion.jackd"  2>/dev/null || true
 # bootout SIGTERMs the wrapper, not the background jackd child. Kill
 # jackd explicitly so the next install step doesn't fail on
 # "text file busy" for libjackserver.so.
@@ -73,10 +73,7 @@ sudo cp "$REPO_ROOT/jackbridge/installer/jackd-launch" \
 sudo chmod +x "$SUPPORT/jackd-launch"
 
 echo
-echo "==> bootstrap LaunchAgents"
-launchctl bootstrap "gui/$LA_UID" /Library/LaunchAgents/com.jackbridge.jackd.plist
-sleep 4   # let jackd come up; netmanager's IP_BOUND_IF pin fires inside jack_load
-launchctl bootstrap "gui/$LA_UID" /Library/LaunchAgents/com.jackbridge.daemon.plist
+echo "==> leave LaunchAgents disabled; launch the Companion to start JACK"
 
 echo
 echo "==> verify"

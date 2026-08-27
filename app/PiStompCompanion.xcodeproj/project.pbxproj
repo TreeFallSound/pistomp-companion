@@ -203,7 +203,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jackbridge.PiStompCompanion;
+                PRODUCT_BUNDLE_IDENTIFIER = com.treefallsound.companion;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = PiStompCompanion/Bridging-Header.h;
@@ -231,7 +231,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jackbridge.PiStompCompanion;
+                PRODUCT_BUNDLE_IDENTIFIER = com.treefallsound.companion;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = PiStompCompanion/Bridging-Header.h;

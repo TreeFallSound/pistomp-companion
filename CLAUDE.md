@@ -120,10 +120,10 @@ Full list with file/line citations: `docs/idiosyncrasies.md`.
 
 ## Logging
 
-Both JackBridge targets route through `jackbridge/shared/jb_log.hpp` → `os_log`, subsystem `com.jackbridge`, categories `daemon` / `driver` / `shm` / `jack`. Tail with:
+Both JackBridge targets route through `jackbridge/shared/jb_log.hpp` → `os_log`, subsystem `com.treefallsound.companion`, categories `daemon` / `driver` / `shm` / `jack`. Tail with:
 
 ```sh
-log stream --predicate 'subsystem == "com.jackbridge"'
+log stream --predicate 'subsystem == "com.treefallsound.companion"'
 ```
 
 Format-string literals only; use `%{public}s` when caller-supplied strings need to be visible.

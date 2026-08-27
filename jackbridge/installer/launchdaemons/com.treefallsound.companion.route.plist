@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.jackbridge.route</string>
+    <string>com.treefallsound.companion.route</string>
 
     <!-- Long-running watcher: pins the netJACK2 multicast route, then blocks
          on notifyutil waiting for the next SystemConfiguration network-change
@@ -39,8 +39,8 @@
     <integer>5</integer>
 
     <key>StandardOutPath</key>
-    <string>/var/log/com.jackbridge.route.log</string>
+    <string>/var/log/com.treefallsound.companion.route.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/com.jackbridge.route.log</string>
+    <string>/var/log/com.treefallsound.companion.route.log</string>
 </dict>
 </plist>

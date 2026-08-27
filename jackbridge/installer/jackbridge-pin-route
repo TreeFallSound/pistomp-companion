@@ -1,6 +1,6 @@
 #!/bin/sh
 # Pin the netJACK2 multicast group (225.3.19.154) to the interface our
-# auto-detector picks. Runs as root via the com.jackbridge.route LaunchDaemon.
+# auto-detector picks. Runs as root via the com.treefallsound.companion.route LaunchDaemon.
 #
 # Idempotent: deletes any prior host route for the group, then re-adds. The
 # kernel uses the resulting route to choose which iface to IP_ADD_MEMBERSHIP

@@ -3,18 +3,17 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.jackbridge.jackd</string>
+    <string>com.treefallsound.companion.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/Application Support/JackBridge/jackd-launch</string>
+        <string>/Library/Application Support/JackBridge/JackBridged</string>
     </array>
 
     <!--
         The Companion GUI owns this agent. Disabled=true prevents launchd
-        from starting it at login or when the route watcher changes state;
-        jackbridge-ctl start explicitly enables and bootstraps it.
-        KeepAlive then provides crash recovery only while the GUI-owned job
-        is enabled. The route watcher only maintains network routing.
+        from starting it at login; jackbridge-ctl start explicitly enables
+        and bootstraps it. KeepAlive provides crash recovery only while the
+        GUI-owned job is enabled.
     -->
     <key>Disabled</key>
     <true/>
@@ -27,22 +26,18 @@
     <string>Aqua</string>
     <key>ProcessType</key>
     <string>Interactive</string>
-    <key>StandardOutPath</key>
-    <string>/tmp/com.jackbridge.jackd.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/com.jackbridge.jackd.err.log</string>
-    <!-- Restart jackd when the user's home configuration changes. -->
     <key>WatchPaths</key>
     <array>
         <string>@HOME_CONFIG@</string>
     </array>
-
     <key>EnvironmentVariables</key>
     <dict>
         <key>JACKBRIDGE_CONFIG_PATH</key>
         <string>@CONFIG_PATH@</string>
-        <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/com.treefallsound.companion.daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.treefallsound.companion.daemon.err.log</string>
 </dict>
 </plist>

@@ -13,7 +13,7 @@ enum NetworkDiagnostics {
     static func run(state: StatusMonitor.State,
                     onProgress: @escaping (Int, Int, String) -> Void = { _, _, _ in },
                     completion: @escaping () -> Void = {}) {
-        let queue = DispatchQueue(label: "com.jackbridge.companion.diagnostics", qos: .userInitiated)
+        let queue = DispatchQueue(label: "com.treefallsound.companion.diagnostics", qos: .userInitiated)
         queue.async {
             writeAndOpen(collect(state: state, onProgress: onProgress), completion: completion)
         }
@@ -72,8 +72,8 @@ enum NetworkDiagnostics {
                 JackGraphMonitor.runJackLsp(connect: true).report(includeExit: true)
             },
         ]
-        let logTailProbes: [Probe] = ["com.jackbridge.jackd.err.log", "com.jackbridge.jackd.out.log",
-                                      "com.jackbridge.daemon.err.log", "com.jackbridge.daemon.out.log"]
+        let logTailProbes: [Probe] = ["com.treefallsound.companion.jackd.err.log", "com.treefallsound.companion.jackd.out.log",
+                                      "com.treefallsound.companion.daemon.err.log", "com.treefallsound.companion.daemon.out.log"]
             .map { name in
                 Probe(id: name, label: name) { logTail(path: "/tmp/\(name)") }
             }

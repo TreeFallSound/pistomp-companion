@@ -1,10 +1,11 @@
 #ifndef __JB_LOG_HPP__
 #define __JB_LOG_HPP__
 
-// os_log shim. Subsystem "com.jackbridge"; categories split so the HAL plugin
-// (which logs to the same subsystem) and operators can grep cleanly:
-//   log show --predicate 'subsystem == "com.jackbridge"'
-//   log show --predicate 'subsystem == "com.jackbridge" && category == "jack"'
+// os_log shim. Subsystem "com.treefallsound.companion"; categories split so
+// the HAL plugin (which logs to the same subsystem) and operators can grep
+// cleanly:
+//   log show --predicate 'subsystem == "com.treefallsound.companion"'
+//   log show --predicate 'subsystem == "com.treefallsound.companion" && category == "jack"'
 //
 // Stick to format-string literals — os_log redacts dynamic strings as <private>
 // by default. Use %{public}s when you really mean it.
@@ -12,22 +13,22 @@
 #include <os/log.h>
 
 inline os_log_t jb_log_daemon() {
-    static os_log_t l = os_log_create("com.jackbridge", "daemon");
+    static os_log_t l = os_log_create("com.treefallsound.companion", "daemon");
     return l;
 }
 
 inline os_log_t jb_log_driver() {
-    static os_log_t l = os_log_create("com.jackbridge", "driver");
+    static os_log_t l = os_log_create("com.treefallsound.companion", "driver");
     return l;
 }
 
 inline os_log_t jb_log_shm() {
-    static os_log_t l = os_log_create("com.jackbridge", "shm");
+    static os_log_t l = os_log_create("com.treefallsound.companion", "shm");
     return l;
 }
 
 inline os_log_t jb_log_jack() {
-    static os_log_t l = os_log_create("com.jackbridge", "jack");
+    static os_log_t l = os_log_create("com.treefallsound.companion", "jack");
     return l;
 }
 

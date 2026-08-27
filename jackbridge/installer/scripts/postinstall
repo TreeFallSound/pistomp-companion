@@ -1,12 +1,16 @@
 #!/bin/sh
-# JackBridge postinstall: install the HAL, seed the active user's home
-# configuration, and leave JACK stopped until the Companion GUI starts it.
+# JackBridge postinstall: install the HAL, migrate old identities, and leave
+# JACK stopped until the Companion GUI starts it.
 set -e
 
 /usr/bin/killall coreaudiod 2>/dev/null || true
 
 SUPPORT="/Library/Application Support/JackBridge"
 DEFAULT="$SUPPORT/config.plist.default"
+LEGACY_PKG_ID=com.jackbridge.pkg
+LEGACY_ROUTE_LABEL=com.jackbridge.route
+LEGACY_AGENT_LABELS="com.jackbridge.daemon com.jackbridge.jackd"
+LEGACY_AGENT_PLISTS="/Library/LaunchAgents/com.jackbridge.daemon.plist /Library/LaunchAgents/com.jackbridge.jackd.plist"
 loggedInUser=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
 homeConfig=""
 loggedInUID=""
@@ -27,14 +31,11 @@ if [ -n "$loggedInUser" ] && [ "$loggedInUser" != root ]; then
     fi
 fi
 
-# Launchd watches the resolved home path, never a tilde or unresolved token.
-# If installation occurs at the login window, /var/empty intentionally keeps
-# the agents dormant; the route watcher resolves the active user dynamically.
 watchPath=${homeConfig:-/var/empty/jackbridge-config.plist}
 for plist in \
-    /Library/LaunchAgents/com.jackbridge.daemon.plist \
-    /Library/LaunchAgents/com.jackbridge.jackd.plist \
-    /Library/LaunchDaemons/com.jackbridge.route.plist; do
+    /Library/LaunchAgents/com.treefallsound.companion.daemon.plist \
+    /Library/LaunchAgents/com.treefallsound.companion.jackd.plist \
+    /Library/LaunchDaemons/com.treefallsound.companion.route.plist; do
     if [ -f "$plist" ]; then
         tmp="$plist.$$"
         /usr/bin/sed -e "s|@HOME_CONFIG@|$watchPath|g" \
@@ -45,7 +46,12 @@ for plist in \
     fi
 done
 
-ROUTE_LABEL=com.jackbridge.route
+# Remove the previous system namespace before loading the new route watcher.
+/bin/launchctl bootout "system/$LEGACY_ROUTE_LABEL" 2>/dev/null || true
+/bin/launchctl disable "system/$LEGACY_ROUTE_LABEL" 2>/dev/null || true
+/bin/rm -f "/Library/LaunchDaemons/$LEGACY_ROUTE_LABEL.plist"
+
+ROUTE_LABEL=com.treefallsound.companion.route
 ROUTE_PLIST=/Library/LaunchDaemons/$ROUTE_LABEL.plist
 if [ -f "$ROUTE_PLIST" ]; then
     /bin/launchctl bootout "system/$ROUTE_LABEL" 2>/dev/null || true
@@ -63,7 +69,8 @@ owned_jackd_pids() {
 }
 
 if [ -n "$loggedInUID" ]; then
-    for label in com.jackbridge.daemon com.jackbridge.jackd; do
+    # Boot out both namespaces and leave the replacement agents disabled.
+    for label in $LEGACY_AGENT_LABELS com.treefallsound.companion.daemon com.treefallsound.companion.jackd; do
         /bin/launchctl bootout "gui/$loggedInUID/$label" 2>/dev/null || true
         /bin/launchctl disable "gui/$loggedInUID/$label" 2>/dev/null || true
     done
@@ -74,6 +81,9 @@ if [ -n "$loggedInUID" ]; then
     done
     /usr/bin/pkill -9 -x -U "$loggedInUID" JackBridged 2>/dev/null || true
     for pid in $(owned_jackd_pids); do /bin/kill -9 "$pid" 2>/dev/null || true; done
-    /bin/rm -f "$STATUS_FILE"
+    /bin/rm -f "$STATUS_FILE" /tmp/com.jackbridge.*.log /var/log/com.jackbridge.route.log
+    for plist in $LEGACY_AGENT_PLISTS; do /bin/rm -f "$plist"; done
 fi
+
+/usr/sbin/pkgutil --forget "$LEGACY_PKG_ID" >/dev/null 2>&1 || true
 exit 0

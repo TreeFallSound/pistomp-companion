@@ -24,11 +24,11 @@ for arg in "$@"; do
     esac
 done
 
-echo "== kickstart com.jackbridge.daemon (${DOMAIN}) =="
-launchctl kickstart -k "${DOMAIN}/com.jackbridge.daemon"
+echo "== kickstart com.treefallsound.companion.daemon (${DOMAIN}) =="
+launchctl kickstart -k "${DOMAIN}/com.treefallsound.companion.daemon"
 
-echo "== kickstart com.jackbridge.jackd (${DOMAIN}) =="
-launchctl kickstart -k "${DOMAIN}/com.jackbridge.jackd"
+echo "== kickstart com.treefallsound.companion.jackd (${DOMAIN}) =="
+launchctl kickstart -k "${DOMAIN}/com.treefallsound.companion.jackd"
 
 if [[ "$bounce_hal" -eq 1 ]]; then
     echo "== killall coreaudiod (HAL reload) =="
@@ -37,4 +37,4 @@ fi
 
 echo
 echo "give it ~2s, then tail with:"
-echo "  log stream --predicate 'subsystem == \"com.jackbridge\"' --info"
+echo "  log stream --predicate 'subsystem == \"com.treefallsound.companion\"' --info"
