@@ -10,19 +10,14 @@
     </array>
 
     <!--
-        Lifecycle is managed by the route daemon (com.jackbridge.route),
-        which calls launchctl enable+bootstrap on this agent when wired
-        ethernet is up, and launchctl bootout+disable when it isn't.
-        PathState was the obvious-looking alternative but it only governs
-        whether launchd restarts on exit — it does not actively SIGTERM a
-        running job when the file disappears, so jackd would silently keep
-        running on a now-wifi route.
-
-        KeepAlive=true gives us crash recovery (e.g. SIGKILL from `kill -9`).
-        RunAtLoad intentionally absent: the postinstall bootstraps this
-        agent, not RunAtLoad. ThrottleInterval=2s bounds the crash-recovery
-        restart rate.
+        The Companion GUI owns this agent. Disabled=true prevents launchd
+        from starting it at login or when the route watcher changes state;
+        jackbridge-ctl start explicitly enables and bootstraps it.
+        KeepAlive then provides crash recovery only while the GUI-owned job
+        is enabled. The route watcher only maintains network routing.
     -->
+    <key>Disabled</key>
+    <true/>
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>

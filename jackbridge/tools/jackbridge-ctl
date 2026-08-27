@@ -49,6 +49,25 @@ refresh_jack_status() {
         *) /bin/rm -f "$STATUS_FILE" ;;
     esac
 }
+agent_loaded() {
+    /bin/launchctl print "$DOMAIN/$1" >/dev/null 2>&1
+}
+
+bootstrap_agent() {
+    label="$1"
+    plist="$LAGENTS/$label.plist"
+    if agent_loaded "$label"; then
+        return 0
+    fi
+    /bin/launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null || {
+        # A route watcher can bootstrap the same agent concurrently. Accept
+        # that race only when the agent is actually present afterwards.
+        agent_loaded "$label" || {
+            echo "error: could not bootstrap $label" >&2
+            return 1
+        }
+    }
+}
 usage() {
     sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
@@ -65,12 +84,23 @@ cmd_start() {
             echo "error: $plist not found — is JackBridge installed?" >&2
             exit 1
         fi
-        /bin/launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null || true
+        bootstrap_agent "$label"
     done
     echo "started: $LABELS"
 }
 
 cmd_stop() {
+    started=0
+    for label in $LABELS; do
+        if agent_loaded "$label"; then started=1; fi
+    done
+    if [ "$started" -eq 0 ] && \
+       ! /usr/bin/pgrep -x -U "$UID_NUM" JackBridged >/dev/null && \
+       [ -z "$(owned_jackd_pids)" ]; then
+        refresh_jack_status
+        echo "already stopped: $LABELS"
+        return 0
+    fi
     # Daemon first so it doesn't crash-loop while jackd is going away.
     for label in com.jackbridge.daemon com.jackbridge.jackd; do
         /bin/launchctl bootout "$DOMAIN/$label" 2>/dev/null || true

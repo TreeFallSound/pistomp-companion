@@ -10,17 +10,13 @@
     </array>
 
     <!--
-        Lifecycle is managed by the route daemon (com.jackbridge.route),
-        which calls launchctl enable+bootstrap on this agent when wired
-        ethernet is up, and launchctl bootout+disable when it isn't. See
-        the long comment in com.jackbridge.jackd.plist for why we don't
-        use KeepAlive={PathState=...}.
-
-        KeepAlive=true gives us crash recovery. ThrottleInterval=2s
-        bounds the crash-recovery restart rate (the daemon calls exit(1)
-        on jack_client_open failure, so this matters when jackd is
-        temporarily down).
+        The Companion GUI owns this agent. Disabled=true prevents launchd
+        from starting it at login; jackbridge-ctl start explicitly enables
+        and bootstraps it. KeepAlive provides crash recovery only while the
+        GUI-owned job is enabled.
     -->
+    <key>Disabled</key>
+    <true/>
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>

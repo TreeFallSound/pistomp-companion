@@ -59,10 +59,26 @@ open build/Build/Products/Debug/PiStompCompanion.app
 The app is a menu bar app. It has no Dock icon and it opens no window. Look
 for the pi-Stomp icon in the menu bar.
 
-The app reads the shared memory region of the JackBridge stack. It does not
-start the stack. The driver, the daemon, and JACK come from the release
-packages. If you did not install them, the app shows the offline state. Use
-`jackbridge-ctl status` to check the stack.
+### The Rebuild Loop
+
+While you work on the app, `app-restart.sh` does the whole cycle in one step.
+It stops the running copy, rebuilds, and starts the new one:
+
+```sh
+./app-restart.sh              # Debug
+./app-restart.sh Release      # any xcodebuild configuration
+./app-restart.sh --no-launch  # stop and rebuild, do not start
+```
+
+The new copy runs detached. It belongs to launchd, not to your shell, so it
+keeps running after you close the Terminal window. The script prints nothing
+from the build unless the build fails. If it fails, you get the whole log and
+no running app — never the previous binary pretending to be the new one.
+
+The Companion owns the JackBridge service lifecycle. Opening the app starts
+the stack; quitting the app stops it. The driver, daemon, and JACK binaries
+come from the release packages. If you did not install them, the app shows the
+offline state. Use `jackbridge-ctl status` to inspect the stack.
 
 ## Install the Packages
 
@@ -82,7 +98,8 @@ has two packages. Install them in this order:
    builds need.
 
 You can run the same package again. The postinstall preserves a hand-edited
-`config.plist` and only re-bootstraps the LaunchAgents.
+`config.plist`, refreshes the route watcher, and leaves JACK stopped until the
+Companion GUI starts it.
 
 ## Use the App
 

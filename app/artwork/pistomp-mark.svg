@@ -1,0 +1,24 @@
+<!-- pi-Stomp mark: boot + pie, redrawn for small sizes.
+     Source of truth for both MenuBarIcon and AppIcon — regenerate the PNGs
+     with app/artwork/render-icons.sh after editing.
+
+     Sized for an 18pt menu-bar item, where the icon renders 36px. Strokes are
+     ~8% of the square (≈2.5px at 36) and no counter is narrower than two
+     stroke widths; anything finer — the laces and crimped rim of the original
+     logo art — fuses into a slab at that size. The stroke-width on each group
+     is pre-divided by that group's scale so both objects end up at the same
+     visual weight. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2.48 8.12 87.15 87.15">
+  <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round">
+    <!-- boot: toe left, shaft right, tilted so it stacks over the pie -->
+    <g transform="translate(20.84,9.73) scale(0.8) rotate(25 35 28)" stroke-width="8.750">
+      <path d="M40,4 L36,26 Q32,34 14,35 Q4,36 4,44 L4,52 L58,52 Q66,52 66,44 L66,4 Z"/>
+    </g>
+    <!-- pie: dome, crimped rim, dish -->
+    <g transform="translate(0,46) scale(0.92)" stroke-width="7.609">
+      <path d="M3,28 Q30,1 57,28"/>
+      <path d="M3,28 q6.75,-6.5 13.5,0 q6.75,-6.5 13.5,0 q6.75,-6.5 13.5,0 q6.75,-6.5 13.5,0"/>
+      <path d="M6,29 L11,42 Q30,47 49,42 L54,29"/>
+    </g>
+  </g>
+</svg>

@@ -33,14 +33,16 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+export JACKBRIDGE_INSTANCE="$$-$(/bin/date +%s)"
+
 write_status() {
     tmp="${STATUS_FILE}.$$"
     printf '%s\n' "$1" > "$tmp"
     /bin/mv -f "$tmp" "$STATUS_FILE"
 }
 clear_status() { /bin/rm -f "$STATUS_FILE"; }
-
 [ -x "$OWNER_HELPER" ] || { echo "jackd-launch: $OWNER_HELPER missing" >&2; exit 1; }
+
 while :; do
     server_state=$("$OWNER_HELPER" state "$JACK_LSP" 2>/dev/null || printf '%s' none)
     case "$server_state" in

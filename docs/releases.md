@@ -54,7 +54,9 @@ Download and install both `.pkg` files, **jack2 first**:
 1. **`jack2-1.9.22+sastraxi.5.pkg`** — JACK2 fork we depend on. Stock `jackaudio/jack2` 1.9.22 is missing the multicast-interface pin; without this fork, netJACK2's discovery times out on hosts with both wifi and a direct-cable NIC. Installs to `/usr/local`.
 2. **`JackBridge-0.2.0.pkg`** — the HAL driver, the `JackBridged` daemon, the LaunchAgents, the route watcher, and the `jackd-launch` wrapper. Double-click and run. Trust the unsigned package (Right-click > Open) on first install.
 
-Re-running the same `JackBridge-*.pkg` is safe — the postinstall preserves a hand-edited `config.plist` and only re-bootstraps the LaunchAgents.
+Re-running the same `JackBridge-*.pkg` is safe — the postinstall preserves a
+hand-edited `config.plist`, refreshes the route watcher, and leaves JACK stopped
+until the Companion GUI starts it.
 
 ### What's in this release
 

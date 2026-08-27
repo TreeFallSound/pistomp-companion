@@ -40,12 +40,14 @@ We don't use a CoreAudio aggregate wrapper around the built-in: it would add a p
 
 ## Bringing the system up (post-install)
 
+The LaunchAgents are disabled by default. The Companion GUI is the owner of
+the stack: opening it runs `jackbridge-ctl start`, and quitting it runs
+`jackbridge-ctl stop`. The route LaunchDaemon only pins the network route; it
+does not start JACK.
+
+For recovery or headless development, use the explicit control command:
 ```bash
-# LaunchAgents start automatically at user login. Manual control:
-launchctl load   ~/Library/LaunchAgents/com.jackbridge.jackd.plist
-launchctl load   ~/Library/LaunchAgents/com.jackbridge.daemon.plist
-launchctl unload ~/Library/LaunchAgents/com.jackbridge.daemon.plist
-launchctl unload ~/Library/LaunchAgents/com.jackbridge.jackd.plist
+jackbridge-ctl start
 ```
 
 The `jackd-launch` wrapper script invokes:
@@ -71,21 +73,26 @@ Setting **System Settings → Sound → Output → JackBridge** routes all syste
 Caveats:
 - Latency ~5–15 ms end-to-end. Imperceptible for music, fine for video (players resync), edge-case for real-time interactive (Zoom, games).
 - Stereo only. Multichannel system audio is summed/dropped.
-- 48 kHz only. CoreAudio resamples app-side transparently.
 
 ## Turning JackBridge on and off
 
-The `jackbridge-ctl` wrapper (installed alongside the daemon) handles both LaunchAgents together. Stopping only one leaves either the audio device orphaned or the daemon crash-looping, so always move them as a pair.
+The Companion GUI owns both LaunchAgents. Opening the GUI starts them and
+quitting the GUI stops them. The `jackbridge-ctl` wrapper (installed alongside
+the daemon) remains the explicit recovery/headless control path and always
+moves both agents together.
 
 ```bash
-jackbridge-ctl start     # enable + bootstrap both agents into this GUI session
-jackbridge-ctl stop      # bootout + disable both (persists across reboots)
+jackbridge-ctl start     # enable + bootstrap both agents
+jackbridge-ctl stop      # bootout + disable both agents
 jackbridge-ctl restart   # stop + start
-jackbridge-ctl status    # per-agent state
-jackbridge-ctl logs      # tail -F the agent stdout/stderr logs in /tmp
+jackbridge-ctl status     # per-agent state
+jackbridge-ctl logs       # tail -F the agent stdout/stderr logs in /tmp
 ```
 
-`stop` writes to launchd's disabled-state database (`/var/db/com.apple.xpc.launchd/disabled.<uid>.plist`), so the agents stay off across reboots and login cycles until `jackbridge-ctl start` re-enables them. No `sudo` required — agents run in the user's GUI session.
+The agents remain disabled across login cycles until the GUI or an explicit
+`jackbridge-ctl start` enables them. No `sudo` is required; they run in the
+user's GUI session.
+
 
 Raw `launchctl` equivalent (for reference / scripting):
 ```bash

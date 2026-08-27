@@ -2,7 +2,10 @@ import AppKit
 import Foundation
 
 /// Menu-bar status item: template icon at 0.35/1.0 alpha, badge dot
-/// composited lower-right. Once a colored badge is composited the image is
+/// composited lower-right. `live` — not raw reachability — drives the dim:
+/// once the stack is wired the pi is demonstrably there, whether or not the
+/// mDNS/TCP probe (which rides wifi, not the audio link) answered this cycle.
+/// Once a colored badge is composited the image is
 /// NOT a template, so badge colors must read on light and dark menu bars —
 /// the system colors below adapt to appearance.
 final class StatusItemController {
@@ -18,14 +21,14 @@ final class StatusItemController {
 
     init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = Self.render(badge: .none, reachable: false)
+        statusItem.button?.image = Self.render(badge: .none, live: false)
     }
 
-    func update(badge: Badge, reachable: Bool) {
-        statusItem.button?.image = Self.render(badge: badge, reachable: reachable)
+    func update(badge: Badge, live: Bool) {
+        statusItem.button?.image = Self.render(badge: badge, live: live)
     }
 
-    static func render(badge: Badge, reachable: Bool) -> NSImage {
+    static func render(badge: Badge, live: Bool) -> NSImage {
         guard let base = NSImage(named: "MenuBarIcon")?.copy() as? NSImage else {
             return NSImage()
         }
@@ -35,7 +38,7 @@ final class StatusItemController {
             // template at reduced alpha — NSImage has no alpha property.
             let out = NSImage(size: NSSize(width: side, height: side))
             out.lockFocus()
-            NSGraphicsContext.current?.cgContext.setAlpha(reachable ? 1.0 : 0.35)
+            NSGraphicsContext.current?.cgContext.setAlpha(live ? 1.0 : 0.35)
             base.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
             out.unlockFocus()
             out.isTemplate = true
@@ -44,7 +47,7 @@ final class StatusItemController {
         let out = NSImage(size: NSSize(width: side, height: side))
         out.lockFocus()
         let full = NSRect(x: 0, y: 0, width: side, height: side)
-        NSGraphicsContext.current?.cgContext.setAlpha(reachable ? 1.0 : 0.35)
+        NSGraphicsContext.current?.cgContext.setAlpha(live ? 1.0 : 0.35)
         base.draw(in: full)
         NSGraphicsContext.current?.cgContext.setAlpha(1.0)
 

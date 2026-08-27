@@ -1,31 +1,12 @@
 #!/bin/sh
 # Long-running route pinner: re-runs jackbridge-pin-route on every macOS
 # network-state change (cable plug/unplug, link change, lease change, Wi-Fi
-# join, etc), and manages the lifecycle of the jackd + daemon LaunchAgents
-# so they only run when wired ethernet is up.
+# join, etc.). JACK service lifecycle belongs to the Companion GUI, not this
+# system daemon.
 #
-# Why we manage the agents explicitly (rather than relying on launchd
-# KeepAlive={PathState=...}): PathState only governs whether launchd
-# RESTARTS a job on exit — it does not actively SIGTERM a running job
-# when the file disappears. jackd has no self-exit path, so without an
-# active stop we'd end up with a zombie jackd pinned to a wifi route
-# pretending everything's fine.
-#
-# Lifecycle, paired with KeepAlive=true on com.jackbridge.route:
-#   1. launchd starts us.
-#   2. We snapshot the previously-pinned iface (ROUTE_STATE) for diffing.
-#   3. We pin the multicast route via the detector.
-#   4. We read the new iface.
-#   5. If wired: touch the sentinel (debug/state signal), enable+bootstrap
-#      both agents, and kickstart -k them if the iface changed while still
-#      wired (netmanager's IP_ADD_MEMBERSHIP is on the old iface).
-#   6. If wifi or nothing: remove the sentinel, bootout+disable both
-#      agents. bootout unloads the job; disable prevents the next login's
-#      LimitLoadToSessionType=Aqua auto-load from starting the agent
-#      before we've checked the network state.
-#   7. We block in `notifyutil -1` until the next network-change notification.
-#   8. notifyutil exits → this script exits → launchd restarts us.
-#   9. GOTO 2.
+# The watcher only owns routing state. It must not bootstrap or stop the
+# per-user JACK agents: doing that would let JACK survive after the GUI quits
+# and would also race the GUI's explicit start/stop commands.
 #
 # Steady state is one sleeping process. Pin-script failures don't tear down
 # the watcher — we want to keep waiting for the network to come back rather
@@ -38,65 +19,22 @@ SUPPORT="/Library/Application Support/JackBridge"
 PIN="$SUPPORT/jackbridge-pin-route"
 ROUTE_STATE=/var/run/jackbridge-route.iface
 SENTINEL=/var/run/jackbridge-ethernet.up
-LIBRARY_AGENTS=/Library/LaunchAgents
-JACKD_LABEL=com.jackbridge.jackd
-DAEMON_LABEL=com.jackbridge.daemon
-
-# Snapshot the previously-pinned iface BEFORE the pin script (which
-# overwrites ROUTE_STATE). Empty on first run after /var/run is cleared.
-old_iface=$(cat "$ROUTE_STATE" 2>/dev/null || true)
 
 "$PIN" || true
 
 new_iface=$(cat "$ROUTE_STATE" 2>/dev/null || true)
 
-# Root can manage user-domain agents via launchctl. /dev/console gives the
-# active console user's UID; root ("uid=0") means nobody is logged in via
-# Aqua, in which case we skip the launchctl calls (LimitLoadToSessionType
-# on the plists means the agents won't be loaded anyway).
-uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null || true)
-
-wired() {
-    [ -n "$uid" ] && [ "$uid" != "0" ]
-}
-
 if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
-    # Wired or direct-cable interface found.
+    # Wired or direct-cable interface found. Keep route maintenance here;
+    # service start/stop belongs exclusively to the Companion GUI.
     touch "$SENTINEL"
-    if wired; then
-        # Flush any stale link-local arp entries. macOS can keep a wrong-iface
-        # arp entry across cable unplug/replug events (e.g. the pi's
-        # 169.254.125.193 still cached on en0 wifi after the cable moved to
-        # en7) which silently breaks the master/slave handshake — the new
-        # jackd resolves the configured Pi hostname, the kernel returns the stale MAC,
-        # and packets never reach the pi. macOS does not auto-flush per-iface
-        # arp on link-state change, so we do it ourselves on every wired
-        # transition (not just iface changes — the most common case is
-        # wifi→wired or nothing→wired, where the arp can survive pointing
-        # at en0 even though the cable is now on en7). Link-local subnets
-        # are small (Mac + pi) so the blast radius is bounded; legitimate
-        # entries will re-arp on next packet. Done BEFORE bootstrap so the
-        # new jackd-launch's mDNS resolution races a clean cache.
-        for stale in $(/usr/sbin/arp -an 2>/dev/null | \
-                       awk '/169\.254\./ { gsub(/[()]/, "", $2); print $2 }'); do
-            /usr/sbin/arp -d "$stale" 2>/dev/null || true
-        done
-        for label in "$DAEMON_LABEL" "$JACKD_LABEL"; do
-            /bin/launchctl enable   "gui/$uid/$label" 2>/dev/null || true
-            /bin/launchctl bootstrap "gui/$uid" "$LIBRARY_AGENTS/$label.plist" 2>/dev/null || true
-        done
-        if [ -n "$old_iface" ] && [ "$old_iface" != "$new_iface" ] && ! is_wifi_iface "$old_iface"; then
-            # Wired → wired iface change (e.g. en7 → en4 when both are wired).
-            # netmanager's IP_ADD_MEMBERSHIP is on the old iface, so audio
-            # is silently broken until jackd re-runs and rejoins on the new
-            # one. Force a kickstart on both agents.
-            for label in "$DAEMON_LABEL" "$JACKD_LABEL"; do
-                /bin/launchctl kickstart -k "gui/$uid/$label" 2>/dev/null || true
-            done
-            echo "jackbridge-route-watcher: iface changed $old_iface → $new_iface — restarted jackd" >&2
-        else
-            echo "jackbridge-route-watcher: ethernet up on $new_iface — jackd enabled" >&2
-        fi
+    # Flush stale link-local ARP entries before a GUI-started jackd resolves
+    # the configured Pi hostname.
+    for stale in $(/usr/sbin/arp -an 2>/dev/null | \
+                   awk '/169\.254\./ { gsub(/[()]/, "", $2); print $2 }'); do
+        /usr/sbin/arp -d "$stale" 2>/dev/null || true
+    done
+    echo "jackbridge-route-watcher: ethernet up on $new_iface — route pinned; JACK remains GUI-owned" >&2
 
         # Background: listen for the pi's netJACK2 discovery packets (UDP to
         # 225.3.19.154:19000) and pin a host route on the wired interface for
@@ -137,20 +75,13 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
                 done
             done
         ) &
-    fi
 else
     # No ethernet (or fell back to wifi).
     rm -f "$SENTINEL"
-    if wired; then
-        for label in "$DAEMON_LABEL" "$JACKD_LABEL"; do
-            /bin/launchctl bootout  "gui/$uid/$label" 2>/dev/null || true
-            /bin/launchctl disable "gui/$uid/$label" 2>/dev/null || true
-        done
-    fi
     if [ -n "$new_iface" ]; then
-        echo "jackbridge-route-watcher: wifi-only ($new_iface) — jackd disabled" >&2
+        echo "jackbridge-route-watcher: wifi-only ($new_iface) — JACK remains GUI-owned" >&2
     else
-        echo "jackbridge-route-watcher: no network — jackd disabled" >&2
+        echo "jackbridge-route-watcher: no network — JACK remains GUI-owned" >&2
     fi
 fi
 

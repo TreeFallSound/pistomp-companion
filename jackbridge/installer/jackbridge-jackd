@@ -23,9 +23,11 @@ jackd_pids() {
 }
 
 instance_for_pid() {
-    # -Eww includes the process environment. Split on all whitespace because
-    # ps may print the environment and command in one long record.
-    /bin/ps -Eww -p "$1" 2>/dev/null | \
+    # The legacy `e` display modifier must not be grouped behind a dash:
+    # `-e` means all processes and `-E` is rejected by current macOS ps.
+    # Split on all whitespace because ps may print the environment and command
+    # in one long record.
+    /bin/ps eww -p "$1" 2>/dev/null | \
         /usr/bin/tr '[:space:]' '\n' | \
         /usr/bin/sed -n '/^JACKBRIDGE_INSTANCE=/ { s/^JACKBRIDGE_INSTANCE=//; p; q; }'
 }

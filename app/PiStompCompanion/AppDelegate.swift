@@ -9,11 +9,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastState = StatusMonitor.State()
     private var statusItem: StatusItemController!
     private var statusLineItem: NSMenuItem!
+    private var startItem: NSMenuItem!
+    private var stopItem: NSMenuItem!
+    private var restartItem: NSMenuItem!
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
     private var diagnosticsProgress: ProgressWindowController?
     private var settingsWindow: SettingsWindowController?
+    private enum StackControlOperation: Equatable {
+        case starting
+        case stopping
+        case restarting
+    }
+    private var pendingStackOperation: StackControlOperation?
+    private var controlCommandFinished = false
+    private var terminationPending = false
     private static let support = "/Library/Application Support/JackBridge"
     private static let ctl = "\(support)/jackbridge-ctl"
 
@@ -24,6 +35,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.render(state)
         }
         monitor.start()
+        // The menu-bar app is the user-facing owner of the stack. Launching
+        // it brings the services up; quitting it tears them down.
+        beginStackOperation(.starting, command: "start")
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationPending else { return .terminateLater }
+        terminationPending = true
+        monitor.stop()
+        runCtl("stop") { _ in
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     // MARK: - rendering
@@ -31,6 +55,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func render(_ state: StatusMonitor.State) {
         let previousJackCondition = lastState.jackCondition
         lastState = state
+        if let operation = pendingStackOperation, controlCommandFinished {
+            switch operation {
+            case .starting where state.health != .stackDown:
+                finishStackOperation()
+            case .stopping where state.health == .stackDown:
+                finishStackOperation()
+            default:
+                break
+            }
+        }
+        updateStackControls()
         statusLineItem.title = state.detailLine
         moduiItem.action = state.piReachable ? #selector(openModUI(_:)) : nil
         sshItem.action = state.piReachable ? #selector(openSSH(_:)) : nil
@@ -39,20 +74,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             confirmExistingJackServer()
         }
 
+        // `live` is the icon's brightness, and it is deliberately NOT
+        // `piReachable`: that probe TCP-connects to the pi over wifi, which
+        // drops out independently of the audio link. Any health that implies
+        // the pi is in the graph — or that demands attention — burns bright.
         let badge: StatusItemController.Badge
+        let live: Bool
         switch state.health {
         case .protocolMismatch:
             badge = .red
+            live = true
         case .streaming:
             badge = .solidGreen
+            live = true
         case .startedIdle, .linkedIdle:
             badge = .hollowGreen
+            live = true
         case .piUnreachable:
             badge = state.piReachable ? .amber : .none
+            live = state.piReachable
         case .stackDown:
             badge = .none
+            live = state.piReachable
         }
-        statusItem.update(badge: badge, reachable: state.piReachable)
+        statusItem.update(badge: badge, live: live)
+    }
+
+    private func updateStackControls() {
+        guard pendingStackOperation == nil else {
+            startItem.isEnabled = false
+            stopItem.isEnabled = false
+            restartItem.isEnabled = false
+            return
+        }
+        let stackStarted = lastState.health != .stackDown
+        startItem.isEnabled = !stackStarted
+        stopItem.isEnabled = stackStarted
+        restartItem.isEnabled = stackStarted
+    }
+
+    private func finishStackOperation() {
+        pendingStackOperation = nil
+        controlCommandFinished = false
     }
 
     private func confirmExistingJackServer() {
@@ -78,9 +141,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(statusLineItem)
         m.addItem(.separator())
 
-        m.addItem(item("Start JackBridge", #selector(startStack(_:))))
-        m.addItem(item("Stop JackBridge", #selector(stopStack(_:))))
-        m.addItem(item("Restart JackBridge", #selector(restartStack(_:))))
+        startItem = item("Start JackBridge", #selector(startStack(_:)))
+        stopItem = item("Stop JackBridge", #selector(stopStack(_:)))
+        stopItem.isEnabled = false
+        restartItem = item("Restart JackBridge", #selector(restartStack(_:)))
+        restartItem.isEnabled = false
+        m.addItem(startItem)
+        m.addItem(stopItem)
+        m.addItem(restartItem)
         m.addItem(.separator())
 
         moduiItem = item("Open MOD-UI", #selector(openModUI(_:)))
@@ -109,22 +177,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - actions
 
-    @objc private func startStack(_ s: Any?) { runCtl("start") }
-    @objc private func stopStack(_ s: Any?) { runCtl("stop") }
-    @objc private func restartStack(_ s: Any?) { runCtl("restart") }
+    @objc private func startStack(_ s: Any?) {
+        beginStackOperation(.starting, command: "start")
+    }
+
+    @objc private func stopStack(_ s: Any?) {
+        beginStackOperation(.stopping, command: "stop")
+    }
+
+    @objc private func restartStack(_ s: Any?) {
+        beginStackOperation(.restarting, command: "restart")
+    }
+
+    private func beginStackOperation(_ operation: StackControlOperation, command: String) {
+        guard pendingStackOperation == nil else { return }
+        pendingStackOperation = operation
+        controlCommandFinished = false
+        updateStackControls()
+
+        // Do not leave the menu locked forever if launchd accepts the command
+        // but the service never reaches a visible state.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 35) { [weak self] in
+            guard let self, self.pendingStackOperation == operation else { return }
+            self.finishStackOperation()
+            self.updateStackControls()
+        }
+
+        runCtl(command) { [weak self] succeeded in
+            guard let self, self.pendingStackOperation == operation else { return }
+            if !succeeded {
+                self.finishStackOperation()
+                self.updateStackControls()
+            } else if operation == .restarting {
+                self.finishStackOperation()
+                self.updateStackControls()
+            } else {
+                self.controlCommandFinished = true
+                self.render(self.lastState)
+            }
+        }
+    }
 
     /// `jackbridge-ctl restart` boots two agents out and back in; it takes a
     /// few seconds on a good day and can wedge on a jackd that won't die, so
     /// it runs off-main and bounded rather than fire-and-forget.
-    private func runCtl(_ sub: String) {
+    private func runCtl(_ sub: String, completion: @escaping (Bool) -> Void = { _ in }) {
         DispatchQueue.global(qos: .userInitiated).async {
             let r = ProcessRunner.run(Self.ctl, args: [sub], timeout: 30)
+            let succeeded = r.launchError == nil && !r.timedOut && r.status == 0
             if let launchError = r.launchError {
                 NSLog("jackbridge-ctl \(sub) failed to launch: \(launchError)")
             } else if r.timedOut {
                 NSLog("jackbridge-ctl \(sub) timed out; killed")
             } else if r.status != 0 {
                 NSLog("jackbridge-ctl \(sub) exit \(r.status.map(String.init) ?? "?"): \(r.combined)")
+            }
+            DispatchQueue.main.async {
+                completion(succeeded)
             }
         }
     }
