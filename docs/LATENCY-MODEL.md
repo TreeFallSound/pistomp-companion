@@ -74,20 +74,25 @@ fixed at 0. Values below that depend on the deployed Pi configuration.
 | T_dac  | Codec DAC          | Fixed group delay through the IQaudIO DAC | ~1 | ~0.02 |
 | **Σ**  | **Monitoring trip** | Sum of fixed and discovered contributions | **discovered** | **discovered** |
 
-The HAL splits the advertised total across two CoreAudio properties so
+The HAL splits the advertised latency across two CoreAudio properties so
 the host can act on each correctly (SA_Device.cpp):
 
-- `kAudioDevicePropertyLatency = kBaseLatencyFrames = 722` — everything
-  in the table except T_jf. Pure report; the DAW adds it to its
-  round-trip estimate.
+- `kAudioDevicePropertyLatency = kBaseLatencyFrames = 722` — the one-way
+  leg (either direction) at reference config: T_adc + T_alsa + T_pj + T_g
+  + T_l + T_wire + T_nm + T_mj = 1+128+64+256+128+17+64+64 = 722. Reported
+  for **both** input and output scope (CoreAudio's per-scope semantics).
+  The DAW sums input+output round-trip, so 2×722 − 2×(T_adc+T_dac+2 codec
+  re-counts) = 915 monitoring trip — the number below.
 - `kAudioDevicePropertySafetyOffset = JitterFrames` — *also* enters the
   DAW's round-trip estimate, **and** tells CoreAudio to schedule the
   IOProc that many frames earlier in sampleTime. That earlier
   scheduling is what realises the safety lead in practice.
 
-The DAW sums them, so the advertised round-trip is `722 + JitterFrames`
-just as before — only now the split is honest and retuning JitterFrames
-also retunes the actual scheduling, not just the reported number.
+The DAW sums Latency(in) + Latency(out) + SafetyOffset×2 + own buffers.
+722 per scope is correct because each is a one-way leg; the monitoring
+Σ below de-duplicates the codec group delays and the daemon-shm hop,
+which are counted once per direction in the per-scope figure but are
+physically a single hardware pass end-to-end.
 
 ### What this sum is
 

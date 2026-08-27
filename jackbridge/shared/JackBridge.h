@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 5
+#define JACKBRIDGE_PROTOCOL_VERSION 6
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -81,6 +81,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x0160      :    HAL output write head (mOutputTime.mSampleTime, frames)
 // 0x0168      :    HAL current cycle nframes
 // 0x0170      :    HAL current sample rate
+// 0x0180      :    CoreAudio device name (daemon-publisher, NUL-terminated UTF-8)
 // 0x0180      :    Current Frame Number(coreAudio read, stream 0)
 // 0x0188      :    Current Frame Number(coreAudio write, stream 0)
 // 0x0190      :    Current Frame Number(coreAudio read, stream 1)
@@ -110,6 +111,13 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 #define JB_OFF_HAL_OUTPUT_WRITE_HEAD (0x160)
 #define JB_OFF_HAL_NFRAMES         (0x168)
 #define JB_OFF_HAL_SAMPLE_RATE     (0x170)
+// Device display name the HAL should report via kAudioObjectPropertyName.
+// Written once by the daemon at attach (derived from DeviceName /
+// PiHostname in config.plist) and read once by the HAL at device open. Not a
+// sync field — no atomics, just bounded bytes + a NUL terminator.
+#define JB_DEVICE_NAME_MAX         128
+#define JB_OFF_DEVICE_NAME         (0x180)
+#define JB_DEVICE_NAME_FALLBACK    "pi-Stomp"
 #define JB_OFF_READ_FRAME_NUMBER(i)  (0x180+(i)*0x10)
 #define JB_OFF_WRITE_FRAME_NUMBER(i) (0x188+(i)*0x10)
 
@@ -165,6 +173,10 @@ protected:
     std::atomic<uint64_t> *shmHalOutputWriteHead;
     std::atomic<uint64_t> *shmHalNFrames;
     std::atomic<uint64_t> *shmHalSampleRate;
+    // Human-readable CoreAudio device name, written once by the daemon at
+    // attach. Plain bytes — read once by the HAL at device open, so no
+    // atomics/seqlock.
+    char (*shmDeviceName)[JB_DEVICE_NAME_MAX];
     std::atomic<uint64_t> *shmReadFrameNumber[MAX_STREAMS];
     std::atomic<uint64_t> *shmWriteFrameNumber[MAX_STREAMS];
 
@@ -243,6 +255,7 @@ protected:
         shmHalOutputWriteHead  = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_OUTPUT_WRITE_HEAD);
         shmHalNFrames          = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_NFRAMES);
         shmHalSampleRate       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_SAMPLE_RATE);
+        shmDeviceName          = reinterpret_cast<char(*)[JB_DEVICE_NAME_MAX]>(shm_base+JB_OFF_DEVICE_NAME);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

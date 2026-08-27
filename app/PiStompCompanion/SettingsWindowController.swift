@@ -255,6 +255,10 @@ private enum ConfigStore {
         "PiHostname": "pistomp.local",
         "ClockDeviceUID": "",
         "NetworkInterface": "",
+        // CoreAudio display-name base. The daemon renders the final name as
+        // "<DeviceName> (<PiHostname>)"; override this to rename the product
+        // half (e.g. a co-branded build) without touching code.
+        "DeviceName": "pi-Stomp",
     ]
     private static let forbidden = ["SampleRate", "PeriodFrames", "JackPrefix", "JitterFrames",
                                     "RealtimePriority", "NetJack", "AutoConnect", "Logging"]

@@ -89,7 +89,8 @@ SA_Device::SA_Device(AudioObjectID inObjectID, UInt32 instance)
 	mHealthMaxNFrames(0),
 	mHealthNearMiss(0),
 	mHealthLeadJitter(0),
-	mSafetyOffsetFrames(0)
+	mSafetyOffsetFrames(0),
+	mDeviceName(NULL)
 {
 	for(int i=0; i<kNumberOfInputSubObjects; i++)
     {
@@ -163,6 +164,10 @@ void	SA_Device::Deactivate()
 
 SA_Device::~SA_Device()
 {
+	if (mDeviceName) {
+		CFRelease(mDeviceName);
+		mDeviceName = NULL;
+	}
 }
 
 bool	SA_Device::IsStreamObjectID(AudioObjectID inObjectID) const
@@ -540,11 +545,15 @@ void	SA_Device::Device_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 	switch(inAddress.mSelector)
 	{
 		case kAudioObjectPropertyName:
-			//	This is the human readable name of the device. Note that in this case we return a
-			//	value that is a key into the localizable strings in this bundle. This allows us to
-			//	return a localized name for the device.
-			ThrowIf(inDataSize < sizeof(AudioObjectID), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioObjectPropertyManufacturer for the device");
-            *reinterpret_cast<CFStringRef*>(outData) = CFSTR("DeviceName");
+			//	Human-readable device name — the live CFString cached from the shm
+			//	field the daemon published ("pi-Stomp (<host>)"). We return the
+			//	retained cached string rather than a localization key because the
+			//	name is runtime config data, not a bundle-localized constant.
+			ThrowIf(inDataSize < sizeof(CFStringRef), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioObjectPropertyName for the device");
+			{
+				CFStringRef name = mDeviceName ? mDeviceName : CFSTR("pi-Stomp");
+				*reinterpret_cast<CFStringRef*>(outData) = (CFStringRef)CFRetain(name);
+			}
 			outDataSize = sizeof(CFStringRef);
 			break;
 
@@ -1734,8 +1743,11 @@ CFStringRef	SA_Device::HW_CopyDeviceUID()
 }
 
 
-// Base end-to-end latency in frames, excluding the fixed JitterFrames safety
-// value. Timing rate and period are discovered at JACK startup.
+// One-way latency leg in frames, excluding the fixed JitterFrames safety
+// value. Reference config: T_adc(1) + T_alsa(128) + T_pj(64) + T_g(256) +
+// T_l(128) + T_wire(17) + T_nm(64) + T_mj(64) = 722. Reported for both input
+// and output scope per CoreAudio semantics; the DAW sums them for round-trip.
+// JitterFrames is surfaced separately via kAudioDevicePropertySafetyOffset.
 static constexpr UInt32 kBaseLatencyFrames = 722;
 // Keep aligned with the daemon's fixed runtime default.
 static constexpr UInt32 kDefaultJitterFrames = 0;
@@ -1780,6 +1792,20 @@ void	SA_Device::_HW_Open()
     mReportedLatencyInput  = kBaseLatencyFrames;
     mReportedLatencyOutput = kBaseLatencyFrames;
     mSafetyOffsetFrames    = jitter;
+    // Device display name, published by the daemon at attach. Copy it out of
+    // shm into a retained CFString — the shm region can be torn down and
+    // recreated by a daemon restart while we hold the name.
+    {
+        char raw[JB_DEVICE_NAME_MAX + 1];
+        memcpy(raw, *shmDeviceName, JB_DEVICE_NAME_MAX);
+        raw[JB_DEVICE_NAME_MAX] = '\0';
+        if (mDeviceName) { CFRelease(mDeviceName); mDeviceName = NULL; }
+        mDeviceName = (raw[0] != '\0')
+            ? CFStringCreateWithCString(kCFAllocatorDefault, raw, kCFStringEncodingUTF8)
+            : CFStringCreateWithCString(kCFAllocatorDefault, JB_DEVICE_NAME_FALLBACK, kCFStringEncodingUTF8);
+        JB_LOG_INFO(jb_log_driver(), "device #%u name=%{public}s",
+            instance, raw[0] ? raw : JB_DEVICE_NAME_FALLBACK);
+    }
     JB_LOG_INFO(jb_log_driver(),
         "device #%u latency=%u frames, safetyOffset=%u frames",
         instance, (unsigned)mReportedLatencyInput,

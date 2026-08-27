@@ -65,28 +65,43 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
         # We also only act when the address actually changes: the route add
         # is idempotent, so re-adding a known IP is pure noise.
         (
-            last_ip=
+            last_key=
             while :; do
-                tcpdump -i "$new_iface" -n -l 'udp dst port 19000' 2>/dev/null | \
+                # -e so we get the Ethernet source alongside the IP: the
+                # discovery frame is the one place the pi's true MAC is
+                # available, and pinning that MAC is the whole fix (below).
+                tcpdump -i "$new_iface" -n -e -l 'udp dst port 19000' 2>/dev/null | \
                 awk '{
                     for(i=1;i<=NF;i++)
                         if(match($i,/^225\.3\.19\.154\.19000:?$/)) {
+                            # -e layout: $1 timestamp, $2 src MAC. The src
+                            # IP is two tokens left of the dst ($(i-1) is ">").
+                            if($2 !~ /^([0-9a-f]{1,2}:){5}[0-9a-f]{1,2}$/) next
                             split($(i-2),a,".")
-                            print a[1]"."a[2]"."a[3]"."a[4]
+                            print $2" "a[1]"."a[2]"."a[3]"."a[4]
                             fflush()
                             next
                         }
-                }' | while read pi_ip; do
-                    [ -n "$pi_ip" ] || continue
-                    [ "$pi_ip" = "$last_ip" ] && continue
-                    # Add an interface-scoped host route. This restricts
-                    # ARP resolution to the wired interface — the wifi
-                    # router never sees the request and can't proxy-ARP
-                    # a reply. The route is idempotent; if it already
-                    # exists, the add is a no-op.
-                    /sbin/route -n add -host "$pi_ip" -interface "$new_iface" >/dev/null 2>&1 || true
-                    echo "jackbridge-route-watcher: pinned $pi_ip to $new_iface" >&2
-                    last_ip=$pi_ip
+                }' | while read pi_mac pi_ip; do
+                    [ -n "$pi_ip" ] && [ -n "$pi_mac" ] || continue
+                    [ "$pi_mac $pi_ip" = "$last_key" ] && continue
+                    # Pin the pi's real MAC as an interface-scoped static
+                    # ARP entry. The wifi router can still proxy-ARP a
+                    # reply, but we never ask — and never believe it.
+                    #
+                    # NOT `route -n add -host <ip> -interface <if>`, which
+                    # is what this used to do. On XNU that installs a
+                    # direct route whose link-layer address is the
+                    # *interface's own* MAC, so the entry becomes
+                    # indistinguishable from the one for our own address
+                    # and every unicast packet to the pi is handed back to
+                    # our own NIC. Discovery (multicast, no ARP) still
+                    # worked, so netmanager heard the pi and then died in
+                    # the unicast handshake with "Slave doesn't respond".
+                    /sbin/route -n delete -host "$pi_ip" >/dev/null 2>&1 || true
+                    /usr/sbin/arp -S "$pi_ip" "$pi_mac" ifscope "$new_iface" >/dev/null 2>&1 || true
+                    echo "jackbridge-route-watcher: pinned $pi_ip at $pi_mac to $new_iface" >&2
+                    last_key="$pi_mac $pi_ip"
                 done
                 # Only reached if tcpdump exits (interface down, BPF error).
                 # A network change restarts the whole watcher via launchd;

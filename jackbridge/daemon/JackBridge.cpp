@@ -42,6 +42,56 @@ SOFTWARE.
 #include "RingProjector.hpp"
 #include "RingCopy.hpp"
 #include <mach/mach_time.h>
+// Minimal config.plist value extraction. Runs once at daemon startup (before
+// jack_activate), so blocking file I/O here is fine. We avoid PlistBuddy /
+// CFPreferences so the daemon stays a lean C++ JACK client with no CoreFoundation
+// dependency. Returns the string value for `key`, or "" when absent/unreadable.
+static std::string config_plist_string(const char* key) {
+    const char* path = getenv("JACKBRIDGE_CONFIG_PATH");
+    if (!path || !*path) return "";
+    FILE* f = fopen(path, "r");
+    if (!f) return "";
+    char line[512];
+    std::string result;
+    bool want_value = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (!want_value) {
+            char needle[128];
+            snprintf(needle, sizeof(needle), "<key>%s</key>", key);
+            if (strstr(line, needle)) want_value = true;
+            continue;
+        }
+        // Expect:  <string>value</string>
+        const char* open = strstr(line, "<string>");
+        const char* close = open ? strstr(open + 8, "</string>") : nullptr;
+        if (open && close && close > open + 8) {
+            result.assign(open + 8, close);
+        }
+        break;
+    }
+    fclose(f);
+    return result;
+}
+
+// Device display name: "pi-Stomp (<host>)" built from DeviceName (explicit
+// override) or PiHostname. Bounded to JB_DEVICE_NAME_MAX-1 so the shm field is
+// always NUL-terminated even on adversarial config.
+static std::string device_display_name() {
+    std::string host = config_plist_string("PiHostname");
+    if (host.empty()) host = "pistomp.local";
+    // Strip a trailing .local for readability — "pi-Stomp (pistomp)", not
+    // "pi-Stomp (pistomp.local)".
+    const std::string suffix = ".local";
+    if (host.size() > suffix.size() &&
+        host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        host.resize(host.size() - suffix.size());
+    }
+    std::string name = config_plist_string("DeviceName");
+    if (name.empty()) name = JB_DEVICE_NAME_FALLBACK;
+    std::string display = name + " (" + host + ")";
+    if (display.size() >= JB_DEVICE_NAME_MAX) display.resize(JB_DEVICE_NAME_MAX - 1);
+    return display;
+}
 
 // Set in main() before jack_activate; read by the port-registration callback to
 // wake the main thread out of sigwait when slave ports come or go. Notification
@@ -77,6 +127,15 @@ public:
         if (attach_shm() < 0) {
             JB_LOG_ERR(jb_log_shm(), "attach_shm failed (id=%d)", id);
             exit(1);
+        }
+        // Publish the CoreAudio device name before check_protocol_version() —
+        // the HAL reads it in _HW_Open after its own attach+handshake, and it
+        // must be present even if the version check later fails and we exit.
+        {
+            const std::string display = device_display_name();
+            memset(*shmDeviceName, 0, JB_DEVICE_NAME_MAX);
+            memcpy(*shmDeviceName, display.c_str(), display.size());
+            JB_LOG_INFO(jb_log_daemon(), "device name: %{public}s", display.c_str());
         }
 
         if (!check_protocol_version()) {

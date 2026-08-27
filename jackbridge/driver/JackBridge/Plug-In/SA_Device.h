@@ -72,6 +72,7 @@
 #include <sys/stat.h>
 #define _ERROR_SYSLOG_ 1
 #include "JackBridge.h"
+#include <CoreFoundation/CFString.h>
 
 //==================================================================================================
 //	SA_Device
@@ -213,6 +214,11 @@ private:
     // kAudioDevicePropertySafetyOffset, so we do not add it here.
     UInt32                   mReportedLatencyInput;
     UInt32                   mReportedLatencyOutput;
+    // Display name cached in _HW_Open from the shm field the daemon published
+    // ("pi-Stomp (<host>)"). kAudioObjectPropertyName returns this as a real
+    // CFString (the historical "localization key" indirection is gone — the
+    // name is runtime data now, not a bundle string).
+    CFStringRef                mDeviceName;
 
     // Fixed runtime safety margin; intentionally not user configurable.
     // Must remain aligned with kDefaultJitterFrames in JackBridge.cpp.

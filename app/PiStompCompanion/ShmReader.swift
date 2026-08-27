@@ -1,7 +1,7 @@
 import Foundation
 
 /// Snapshot of the /JackBridge shm control region. Field offsets are the
-/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 5.
+/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 6.
 /// Every field is a plain aligned uint64_t (compile-time asserted on the
 /// C++ side), so a read of UInt64 at these offsets is exact.
 struct ShmSnapshot {
@@ -23,7 +23,7 @@ struct ShmSnapshot {
     var readFrameNumber: [UInt64] = [0, 0]
     var writeFrameNumber: [UInt64] = [0, 0]
 
-    static let expectedProtocolVersion: UInt64 = 5
+    static let expectedProtocolVersion: UInt64 = 6
     static let driverStatusStarted: UInt64 = 2
 }
 

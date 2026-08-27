@@ -51,7 +51,11 @@ final class StatusItemController {
         guard let base = NSImage(named: "MenuBarIcon")?.copy() as? NSImage else {
             return NSImage()
         }
+        // The artwork's natural size is its 1x pixel size (64 pt). The status
+        // button does not scale an oversized image — it clips it — so every
+        // path out of here has to stamp the point size down to `iconSide`.
         guard !live else {
+            base.size = NSSize(width: iconSide, height: iconSide)
             base.isTemplate = true
             return base
         }
@@ -110,7 +114,7 @@ private final class BadgeView: NSView {
     private func drawDot(_ rect: NSRect, fill: NSColor?, stroke: NSColor? = nil) {
         if let fill {
             fill.setFill()
-            rect.insetBy(dx: -0.5, dy: -0.5).fill()
+            NSBezierPath(ovalIn: rect).fill()
         }
         if let stroke {
             stroke.setStroke()
