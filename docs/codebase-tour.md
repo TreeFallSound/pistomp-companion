@@ -54,8 +54,7 @@ HAL target.
 ## `jackbridge/tools/`
 
 ```
-chkshm.c    Read and dump the shm region for debugging. Useful for verifying daemon is alive.
-rmshm.c     Unlink stale shm regions.
+rmshm.c     Unlink stale shm regions. Built as `jb-rmshm` by build-pkg.sh (no Xcode target).
 jackbridge-ctl  Start, stop, restart, status, and log the Mac services.
 ```
 

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Snapshot of the /JackBridge shm control region. Field offsets are the
-/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 6.
+/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 7.
 /// Every field is a plain aligned uint64_t (compile-time asserted on the
 /// C++ side), so a read of UInt64 at these offsets is exact.
 struct ShmSnapshot {
@@ -22,8 +22,12 @@ struct ShmSnapshot {
     var halSampleRate: UInt64 = 0
     var readFrameNumber: [UInt64] = [0, 0]
     var writeFrameNumber: [UInt64] = [0, 0]
+    /// JACK timing the daemon discovered from the Pi; inputs to the advertised
+    /// latency model (see docs/LATENCY-MODEL.md).
+    var jackPeriodFrames: UInt64 = 0
+    var jackSampleRate: UInt64 = 0
 
-    static let expectedProtocolVersion: UInt64 = 6
+    static let expectedProtocolVersion: UInt64 = 7
     static let driverStatusStarted: UInt64 = 2
 }
 
@@ -145,6 +149,8 @@ final class ShmReader {
         s.halSampleRate       = field(0x170)
         s.readFrameNumber     = [field(0x180), field(0x190)]
         s.writeFrameNumber    = [field(0x188), field(0x198)]
+        s.jackPeriodFrames    = field(0x1a0)
+        s.jackSampleRate      = field(0x1a8)
         return s
     }
 }

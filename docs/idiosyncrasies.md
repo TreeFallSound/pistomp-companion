@@ -31,6 +31,19 @@ The daemon and HAL use `std::atomic<uint64_t>` with explicit memory ordering,
 including the protocol version, heartbeat, frame cursors, and HAL anchor.
 The companion maps the region read-only and only samples the control area.
 
+### The shm control region is hand-laid-out, and asserts say so
+Field addresses in `jackbridge/shared/JackBridge.h` are literal offsets, not a
+struct, so nothing but the `static_assert` block near `STRBUF_UP` stops two
+fields from claiming the same bytes. That is not hypothetical: before protocol
+7, `JB_OFF_DEVICE_NAME` started at `0x180`, the same address as
+`JB_OFF_READ_FRAME_NUMBER(0)`. The daemon wrote 128 bytes of device name over
+the per-stream frame counters at attach, and the HAL's IO thread then wrote the
+counters back over the name. It only ever worked because the HAL reads the name
+exactly once, in `_HW_Open`, before IO starts. The device name now lives at
+`0x200`, past every atomic, and the asserts fail the build on the next overlap.
+Add a new field by extending that assert block, not by picking a free-looking
+address.
+
 ### Protocol mismatch is intentional
 `JACKBRIDGE_PROTOCOL_VERSION` is published into fresh shm and both service
 processes refuse to attach when the observed version differs. Remove the shm

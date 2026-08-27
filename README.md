@@ -1,239 +1,103 @@
 # PiStomp Companion
 
-PiStomp Companion is the macOS menu bar app for a JackBridge-backed pi-Stomp
-audio interface. It creates a virtual audio device called **JackBridge**:
-four inputs and two outputs at 48 kHz. The device is backed by JACK. The menu
-bar shows the connection state, the controls, and the diagnostics.
+PiStomp Companion is a macOS menu bar app. It gives your Mac a virtual audio
+device backed by a pi-Stomp pedal over Ethernet. The device is four inputs and
+two outputs at 48 kHz. Its name is **pi-Stomp (<host>)**.
 
-The main use case: a Raspberry Pi runs netJACK2 over Ethernet and acts as a
-recording interface for Mac DAWs (Logic, Pro Tools, REAPER).
+Use it to record and monitor through a Mac DAW (Logic, Pro Tools, REAPER).
 
-**Apple Silicon only.** The app runs on arm64. It does not run on Intel Macs.
-The `.pkg` files on the [Releases](https://github.com/treefallsound/pistomp-companion/releases)
-page are arm64-only and the install fails on x86_64.
+**Apple Silicon only.** The app and the release packages are arm64-only.
+They do not run on Intel Macs.
+
+---
 
 ## Requirements
 
-- Apple Silicon (arm64) Mac.
-- macOS 13 or later.
-- Xcode (to build the app).
-- JACK2 (for the full stack; the release package installs it).
-- For audio: a pi-Stomp device and an Ethernet cable.
+- Apple Silicon Mac, macOS 13 or later.
+- A pi-Stomp device (pistomp 3.3.0 or newer).
+- An Ethernet cable, connected directly from the Mac to the pi.
+- For daily use: the two release packages. For development: Xcode.
 
-## Build the App
+---
 
-The Xcode project is at `app/PiStompCompanion.xcodeproj`.
+## Daily use
 
-To build with the command line:
+1. Connect the Ethernet cable directly from the Mac to the pi.
+2. On the pi, open the network menu. Select **Wired Connection**, then enable
+   audio streaming.
+3. Install the packages, then open the app (see below).
+4. In your DAW, select **pi-Stomp (<host>)** as the audio device.
 
-1. Open Terminal.
-2. Go to the project folder:
+The app has no Dock icon and no window. Find the pi-Stomp icon in the menu
+bar. The icon shows the connection state. The menu has start, stop, restart,
+SSH, MOD-UI, and diagnostics.
 
-   ```sh
-cd pistomp-companion
-   ```
+### Audio channels in your DAW
 
-3. Build the app:
+| DAW channel | Source |
+|-------------|--------|
+| In1, In2    | Hardware capture from the pi, before the pedalboard |
+| ModOut1/2   | The signal after the pedalboard |
+| Out1/2      | The stereo monitor return to the pi |
 
-   ```sh
-xcodebuild -project app/PiStompCompanion.xcodeproj -scheme PiStompCompanion -configuration Debug -derivedDataPath build build
-   ```
+---
 
-4. Find the app here:
+## Install
 
-   ```sh
-build/Build/Products/Debug/PiStompCompanion.app
-   ```
+The [Releases](https://github.com/treefallsound/pistomp-companion/releases)
+page has two packages. Install them in this order:
 
-You can also open the project in Xcode and press Command-R (Run). The build
-takes about 20 seconds on an M1 Mac.
+1. **`jack2-<version>.pkg`** — the JACK2 fork the engine needs. Install this
+   first.
+2. **`PiStompCompanion-<version>.pkg`** — the app, the HAL driver, the daemon,
+   and the service scripts.
 
-## Start the App
+You can run the same package again to reinstall; your changes `config.plist`
+will not be overwritten, but make sure to read the release notes for new
+configuration options and defaults.
 
-To start the app, open it:
+The app owns the service lifecycle. Opening the app starts the audio stack.
+Quitting the app stops it.
 
-```sh
-open build/Build/Products/Debug/PiStompCompanion.app
-```
-
-The app is a menu bar app. It has no Dock icon and it opens no window. Look
-for the pi-Stomp icon in the menu bar.
-
-### The Rebuild Loop
-
-While you work on the app, `app-restart.sh` does the whole cycle in one step.
-It stops the running copy, rebuilds, and starts the new one:
-
-```sh
-./app-restart.sh              # Debug
-./app-restart.sh Release      # any xcodebuild configuration
-./app-restart.sh --no-launch  # stop and rebuild, do not start
-```
-
-The new copy runs detached. It belongs to launchd, not to your shell, so it
-keeps running after you close the Terminal window. The script prints nothing
-from the build unless the build fails. If it fails, you get the whole log and
-no running app — never the previous binary pretending to be the new one.
-
-The Companion owns the JackBridge service lifecycle. Opening the app starts
-the stack; quitting the app stops it. The driver, daemon, and JACK binaries
-come from the release packages. If you did not install them, the app shows the
-offline state. Use `jackbridge-ctl status` to inspect the stack.
-
-## Install the Packages
-
-You can use the app without building it. Install the release packages. The
-[Releases](https://github.com/treefallsound/pistomp-companion/releases) page
-has two packages. Install them in this order:
-
-1. **`jack2-<version>.pkg`** — the JACK2 fork we depend on. Install this
-   first. Stock `jackaudio/jack2` 1.9.22 does not have the
-   multicast-interface pin. Without this fork, netJACK2 discovery times out
-   on hosts with both Wi-Fi and a direct-cable NIC. The package installs to
-   `/usr/local`.
-2. **`PiStompCompanion-<version>.pkg`** — the app, the HAL driver, the
-   `JackBridged` daemon, the LaunchAgents, the route watcher, and the
-   `jackd-launch` wrapper. Double-click it and run it. A signed release
-   passes Gatekeeper without the unsigned-package workaround that local
-   builds need.
-
-You can run the same package again. The postinstall preserves a hand-edited
-`config.plist`, refreshes the route watcher, and leaves JACK stopped until the
-Companion GUI starts it.
-
-## Use the App
-
-One-time preparation:
-
-1. Make sure you are running pistomp 3.3.0 or newer.
-2. Install JACK2, then install `PiStompCompanion-<version>.pkg`.
-
-Daily workflow:
-
-1. Connect the Ethernet cable directly from your Mac to the pi.
-2. On the pi-Stomp, open the network menu. Select **"Wired Connection"**, then
-   enable audio streaming.
-3. Ensure the stream state is flowing in the companion menu.
-4. Open your DAW. Select **JackBridge** as the audio device.
-
-Command-line escape hatch:
-
-```sh
-jackbridge-ctl status
-jackbridge-ctl start
-```
-
-### The audio channels in your DAW
-
-| DAW input  | Source                                            |
-|------------|---------------------------------------------------|
-| In1, In2   | Raw hardware capture from the pi (guitar before the pedalboard) |
-| ModOut1/2  | The signal after mod-host (the pedalboard tone)   |
-| **Out1/2** | The stereo monitor return to the pi               |
-
-### What the menu shows
-
-- **Reachability.** The icon dims when the pi is unplugged.
-- **Audio state badge:**
-  - Amber: the pi is reachable but not in the JACK graph.
-  - Green: linked and streaming.
-  - Red: the shared memory protocol does not match.
-- **Start, stop, and restart** shortcuts.
-- **One-click SSH and MOD-UI.**
-- **"Network Diagnostics…"** collects diagnostic probes into
-  `~/Library/Logs/JackBridge/` and opens the folder in Console.app. Run it
-  when the pi does not connect. Include the log in any bug report.
-
-The app only reads the shared memory region. It never contends with the
-daemon.
+---
 
 ## Troubleshooting
 
-### 1. The Mac loses Internet
+Ordered by how often each one occurs.
 
-macOS can prefer the Ethernet cable over Wi-Fi. The pi has no Internet
-gateway, so the Mac gets stuck trying to use the cable.
+**The Mac loses Internet.**
+macOS can prefer the Ethernet cable over Wi-Fi. The pi has no gateway.
+Fix: System Settings → Network → "…" → **Set Service Order**. Drag **Wi-Fi**
+above the Ethernet device.
 
-Fix: set the service order.
+**The services do not start.**
+MOD Desktop, Jamulus, or SONABUS can own the JACK server.
+Fix: stop the other program. The engine starts by itself. The menu shows the
+state.
 
-1. Open System Settings > Network.
-2. Select the "..." (three dots) menu, then **"Set Service Order…"**.
-3. Drag **Wi-Fi** above the Ethernet device (sometimes called "10/100/1000").
+**The pi ports do not appear.**
+The network route landed on Wi-Fi, not Ethernet.
+Fix: `sudo launchctl kickstart -k system/com.treefallsound.companion.route`.
 
-### 2. The services do not start (or the ports are wrong)
+**The audio has clicks or distortion.**
+This is buffer overruns (xruns).
+Fix: increase `PeriodFrames` in `config.plist` (try 128).
 
-Cause: MOD Desktop, Jamulus, or SONABUS can own the `default` JACK server.
-JackBridge does not stop them, and it cannot load `netmanager` into another
-program's server. The menu shows **"A different program uses JACK"** while it
-waits.
+**No audio over Wi-Fi.**
+This is by design, not a bug. Audio needs the Ethernet cable.
+Fix: connect the cable, or attach a USB Ethernet adapter.
 
-Fix: stop the other program. JackBridge starts automatically. Use
-`jackbridge-ctl restart` to check again immediately.
+Full diagnostics and rare cases: `docs/macos-setup.md`.
 
-Stale JackBridge server: if the launcher stopped but its JACK server remains,
-the menu shows **"JackBridge waits for JACK"**. Select **"Quit Other Server"**.
-JackBridge stops its own marked server and restarts.
+---
 
-Check the logs: `jackbridge-ctl logs`.
+## Development
 
-### 3. The pi ports do not appear in `jack_lsp`
-
-Cause: the multicast route lands on the wrong interface (Wi-Fi instead of
-Ethernet).
-
-Fix: force the route watcher to re-pin the interface.
+The command runner is [`just`](https://just.systems). Install it with
+`brew install just`. Run `just --list` to see every command.
 
 ```sh
-sudo launchctl kickstart -k system/com.treefallsound.companion.route
-```
-
-### 4. The audio is silent but the ports are visible
-
-1. Check the connections. Run `jack_lsp -c`. Make sure the `pistomp` ports
-   are connected to the `JackBridge` ports. If not, check `AutoConnect` in
-   `config.plist`.
-2. Wait for the sync. netJACK2's resampler can take 5–10 seconds to stabilize
-   on a fresh connection.
-3. Check the pi side. SSH into the pi (`ssh pistomp@pistomp.local`) and run
-   `jack_lsp`. If the pi does not see its own `system` hardware ports, it has
-   nothing to send to the Mac.
-4. Restart pi-Stomp. Sometimes the internal audio engine (mod-host) needs a
-   kick. Toggle the "Ethernet Audio" setting off and on.
-
-### 5. The audio is distorted or has clicks
-
-Cause: xruns. Check the logs (`jackbridge-ctl logs`). If you see
-`JackEngine::XRun`, the latency settings are too aggressive.
-
-Fix: increase `PeriodFrames` in `config.plist` (try 128). Do not raise
-`JitterFrames` — it defaults to 0, and the multicast-pin path no longer needs
-a HAL-side safety lead.
-
-### 6. jackd does not start on Wi-Fi
-
-This is intentional, not a bug. The route daemon only enables jackd when a
-wired/direct-cable interface is up. netJACK2 at 48 kHz with four channels
-saturates a typical 2.4 GHz link and causes constant xruns. There is no
-override.
-
-Fix: plug in an Ethernet cable (or attach a USB Ethernet adapter). jackd
-starts within about 2 seconds. See `docs/architecture.md` for the
-clock-domain rationale and why we do not add SRC.
-
-## Configuration
-
-The file `/Library/Application Support/JackBridge/config.plist` holds the
-settings. Saving it restarts the LaunchAgents (WatchPaths).
-
-- `ClockDeviceUID` — the CoreAudio UID for jackd's backend device. Empty =
-  auto-detect the built-in output.
-- `PeriodFrames` — the dominant latency control. 64 or 128 is recommended.
-- `NetworkInterface` — the name of the NIC. Empty = auto-detect (prefers
-  169.254.x).
-- `PiHostname` — the hostname for Pi reachability, MOD-UI, SSH, and
-  diagnostics. Default: `pistomp.local`.
-
-## Architecture
+# Architecture
 
 JackBridge is the engine inside PiStomp Companion. It is a fork of
 [`madhatter68/JackRouter`](https://github.com/madhatter68/JackRouter),
@@ -257,14 +121,22 @@ crossing.
 - [jackbridge/installer/build-pkg.sh](jackbridge/installer/build-pkg.sh) —
   build the packages
 
-Optional helper tools for developers:
-
-```sh
-gcc -O2 jackbridge/tools/rmshm.c -o jackbridge/tools/rmshm
-gcc -O2 jackbridge/tools/chkshm.c -o jackbridge/tools/chkshm
+just              # rebuild the engine and reload it live
+just run-app      # build and run the app
+just app-restart  # kill, rebuild, and relaunch the app
+just device-name  # show the audio device entry
+just status       # show service health
+just logs         # follow the engine logs
 ```
+
+For a release package: `just pkg-install` (requires sudo).
+
+The user-facing install, diagnostics, and troubleshooting reference is in
+`docs/macos-setup.md`. The architecture is in `docs/architecture.md`.
+
+---
 
 ## License
 
-See `LICENSE`. The JackBridge engine inherits from the upstream
-`madhatter68/JackRouter` project.
+See `LICENSE`. The engine is a fork of
+[`madhatter68/JackRouter`](https://github.com/madhatter68/JackRouter).

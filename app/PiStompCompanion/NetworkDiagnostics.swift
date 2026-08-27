@@ -145,6 +145,8 @@ enum NetworkDiagnostics {
             ("readFrameNumber[1] 0x190", snap.readFrameNumber[1]),
             ("writeFrameNumber[0] 0x188", snap.writeFrameNumber[0]),
             ("writeFrameNumber[1] 0x198", snap.writeFrameNumber[1]),
+            ("jackPeriodFrames 0x1a0", snap.jackPeriodFrames),
+            ("jackSampleRate 0x1a8", snap.jackSampleRate),
         ]
         for (name, v) in rows { s += String(format: "  %-26s %llu (0x%llx)\n", (name as NSString).utf8String!, v, v) }
         s += "\n"

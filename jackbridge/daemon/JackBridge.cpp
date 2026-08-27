@@ -157,6 +157,12 @@ public:
         shmBufferSize->store(STRBUFSZ, std::memory_order_release);
         shmSyncMode->store(0, std::memory_order_release);
 
+        // Publish the JACK timing the HAL needs for its advertised-latency
+        // model. Both are discovered from the Pi at startup (the coordinator
+        // passes them to jackd-launch), so the HAL cannot hardcode them.
+        shmJackPeriodFrames->store((uint64_t)BufSize, std::memory_order_relaxed);
+        shmJackSampleRate->store((uint64_t)SampleRate, std::memory_order_release);
+
         config_audio_ports();
 #ifdef _WITH_MIDI_BRIDGE_
         create_midi_ports(name, num_Min, num_Mout);
@@ -185,6 +191,14 @@ public:
         JB_LOG_INFO(jb_log_daemon(),
             "JackBridge#%u: start sr=%d Hz, bufsize=%u bytes, jitter=%ld frames",
             instance, SampleRate, (unsigned)BufSize, g_jitter_frames);
+        JB_LOG_INFO(jb_log_daemon(),
+            "latency model: period=%u f_s=%d -> one-way=%u frames, monitoring trip=%u frames (%.1f ms)",
+            (unsigned)BufSize, SampleRate,
+            jb_one_way_latency_frames(BufSize, SampleRate),
+            jb_monitoring_trip_frames(BufSize, SampleRate),
+            SampleRate > 0
+                ? 1000.0 * jb_monitoring_trip_frames(BufSize, SampleRate) / SampleRate
+                : 0.0);
     }
 
     ~JackBridge() {

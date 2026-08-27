@@ -14,10 +14,12 @@ lives entirely in the Pi's `netadapter`. So tuning `netadapter` tunes
 
 ## The picture
 
-JackBridge is bidirectional but the two directions are *not symmetric*:
-the IQaudIO codec (ADC + DAC) lives entirely on the pi. The Mac side
-terminates at the DAW — no DAC in the model at all. So we draw the two
-directions explicitly.
+The chain is topologically lopsided: the IQaudIO codec (ADC + DAC) lives
+entirely on the pi, and the Mac side terminates at the DAW — no DAC in the
+model at all. But the two *directions* carry the same stages in reverse
+order, one codec pass each, so their latency is equal. We draw both
+explicitly anyway, because the resampler sits at opposite ends of the two
+pictures.
 
 ### Recording (pi mic → Mac DAW)
 
@@ -57,61 +59,90 @@ clock B). Drift between A and B is absorbed by the netadapter slip ring
 ## Latency contributions
 
 The monitoring path's timing is runtime-discovered from the Pi at 44.1, 48,
-or 96 kHz. Mac JACK uses the same sample rate and period. `JitterFrames` is
-fixed at 0. Values below that depend on the deployed Pi configuration.
+or 96 kHz. Mac JACK uses the same sample rate and period, so one symbol `P`
+covers both sides. `JitterFrames` is fixed at 0. Every term below is either a
+multiple of `P`, a multiple of the netadapter ring `G`, or a fixed constant —
+which is why the advertised figure is computed at runtime rather than baked in.
 
-| Symbol | Stage | What it is | Frames | ms @ 48 k |
-|--------|-------|------------|--------|-----------|
-| T_adc  | Codec ADC          | Fixed group delay through the IQaudIO ADC | ~1 | ~0.02 |
-| T_alsa | ALSA capture       | `period_size × nperiods` on the pi ALSA backend (`-p × -n`) | discovered | — |
-| T_pj   | Pi jackd cycle     | One JACK period on the pi (`P_pi`) | discovered | — |
-| T_l    | netadapter cycles  | Network latency in cycles (`-l N` → N · P_pi). **jack2 1.9.22 default = 2 cycles, max 30** (verified on-device via `Network latency : N cycles` log). | 128 | 2.67 |
-| T_wire | UDP transit        | LAN one-way, direct cable. Dominated by NIC + switch fabric; sub-millisecond on a direct cable, ~0.5–1 ms through one consumer switch. | ~17 | ~0.35 |
-| T_nm   | Mac netmanager     | One netjack cycle on the master side (≈ P_mac) | discovered | — |
-| T_mj   | Mac jackd cycle    | One JACK period on the Mac (equal to P_pi) | discovered | — |
-| T_d    | Daemon shm publish | memcpy + atomic release — nanoseconds, ignore | 0 | 0 |
-| T_jf   | HAL safety lead    | Fixed `JitterFrames=0`, returned as `kAudioDevicePropertySafetyOffset` | 0 | 0 |
-| T_dac  | Codec DAC          | Fixed group delay through the IQaudIO DAC | ~1 | ~0.02 |
-| **Σ**  | **Monitoring trip** | Sum of fixed and discovered contributions | **discovered** | **discovered** |
+| Symbol | Stage | What it is | Frames | Frames @ P=64 | ms @ 48 k |
+|--------|-------|------------|--------|---------------|-----------|
+| T_adc  | Codec ADC          | Fixed group delay through the IQaudIO ADC | 1 | 1 | ~0.02 |
+| T_alsa | ALSA capture       | `period_size × nperiods` on the pi ALSA backend (`-p × -n`) | N_pi · P | 128 | 2.67 |
+| T_pj   | Pi jackd cycle     | One JACK period on the pi | P | 64 | 1.33 |
+| T_g    | netadapter ring    | Slip-ring steady-state fill, `G/2` (see the note below) | G/2 | 256 | 5.33 |
+| T_l    | netadapter cycles  | Network latency in cycles (`-l N` → N · P). **jack2 1.9.22 default = 2 cycles, max 30** (verified on-device via `Network latency : N cycles` log). | L · P | 128 | 2.67 |
+| T_wire | UDP transit        | LAN one-way, direct cable. Dominated by NIC + switch fabric; ~0.35 ms on a direct cable, ~0.5–1 ms through one consumer switch (the model assumes direct cable). | 354 µs · f_s | 17 | ~0.35 |
+| T_nm   | Mac netmanager     | One netjack cycle on the master side (≈ P_mac) | P | 64 | 1.33 |
+| T_mj   | Mac jackd cycle    | One JACK period on the Mac (equal to P_pi) | P | 64 | 1.33 |
+| T_d    | Daemon shm publish | memcpy + atomic release — nanoseconds, ignore | 0 | 0 | 0 |
+| T_jf   | HAL safety lead    | Fixed `JitterFrames=0`, returned as `kAudioDevicePropertySafetyOffset` | 0 | 0 | 0 |
+| T_dac  | Codec DAC          | Fixed group delay through the IQaudIO DAC | 1 | 1 | ~0.02 |
 
-The HAL splits the advertised latency across two CoreAudio properties so
-the host can act on each correctly (SA_Device.cpp):
+### The one-way leg
 
-- `kAudioDevicePropertyLatency = kBaseLatencyFrames = 722` — the one-way
-  leg (either direction) at reference config: T_adc + T_alsa + T_pj + T_g
-  + T_l + T_wire + T_nm + T_mj = 1+128+64+256+128+17+64+64 = 722. Reported
-  for **both** input and output scope (CoreAudio's per-scope semantics).
-  The DAW sums input+output round-trip, so 2×722 − 2×(T_adc+T_dac+2 codec
-  re-counts) = 915 monitoring trip — the number below.
-- `kAudioDevicePropertySafetyOffset = JitterFrames` — *also* enters the
-  DAW's round-trip estimate, **and** tells CoreAudio to schedule the
-  IOProc that many frames earlier in sampleTime. That earlier
-  scheduling is what realises the safety lead in practice.
+The two directions are symmetric: each carries exactly one codec pass, one
+netadapter ring, one wire hop, and one JACK period at each of the four cycle
+stages. So a single expression covers both:
 
-The DAW sums Latency(in) + Latency(out) + SafetyOffset×2 + own buffers.
-722 per scope is correct because each is a one-way leg; the monitoring
-Σ below de-duplicates the codec group delays and the daemon-shm hop,
-which are counted once per direction in the per-scope figure but are
-physically a single hardware pass end-to-end.
+```
+one-way = 1 + (N_pi + L + 3)·P + G/2 + T_wire
+        = 1 + 7·P + 256 + T_wire        (with N_pi = 2, L = 2, G = 512)
+```
 
-### What this sum is
+At the reference config (P = 64, f_s = 48 kHz) that is
+`1 + 448 + 256 + 17 = 722 frames`. That number is the *reference value*, not a
+constant — at P = 128 the same expression gives 1170 frames, and at
+P = 128 / 96 kHz it gives 1187.
 
-The 915-frame total represents the **monitoring path**: a signal that
-enters the pi's ADC, traverses the whole chain to the Mac, and comes
-back out the pi's DAC. This is what a guitarist hears when monitoring
-through the Mac.
+This is implemented once, in `jb_one_way_latency_frames()`
+(`jackbridge/shared/JackBridge.h`), and used by both the daemon's startup log
+and the HAL. The daemon publishes its discovered period and sample rate into
+shm (`JB_OFF_JACK_PERIOD_FRAMES`, `JB_OFF_JACK_SAMPLE_RATE`); the HAL reads
+them in `_HW_Open` and again in `_HW_StartIO`, recomputes, and fires a
+`kAudioDevicePropertyLatency` change notification if the value moved
+(`SA_Device::_UpdateAdvertisedLatency`). If the daemon has not published yet,
+the HAL advertises the reference config and corrects itself at StartIO.
 
-| Measurement scenario | What to do to Σ |
-|----------------------|-----------------|
-| **Monitoring** (in pi ADC → Mac → out pi DAC)  | Σ as-is = **915 frames / 19.1 ms** |
-| **One-way recording** (pi ADC → Mac DAW, no return) | Σ − T_dac (drop the playback codec leg from `T_jf` onward; recording stops at HAL/DAW) |
-| **One-way playback** (Mac DAW → pi DAC) | Σ − T_adc (no ADC at start; DAW source is digital) |
-| **Pure-digital round-trip** (Mac plays signal → returns via JackBridge loopback, no codec) | ≈ 2 × (Σ − T_adc − T_dac) — both digital chains, no codec passes |
-| **Hardware loopback round-trip** (pi DAC output cabled into pi ADC input) | ≈ 2 × Σ — full monitoring trip, twice |
+### How it reaches the DAW
 
-Σ represents one full traversal in/out of the codec, which is the
-useful unit for most listener-facing reasoning. The DAW's own internal
-buffer (typically 128–512 frames) sits on top of all of these.
+The HAL splits the advertised latency across two CoreAudio properties:
+
+- `kAudioDevicePropertyLatency` = the one-way leg, reported for **both** input
+  and output scope (CoreAudio's per-scope semantics). Each scope is genuinely
+  one-way, so the DAW summing them gives the correct round trip.
+- `kAudioDevicePropertySafetyOffset` = `JitterFrames` = **0**. It is reported
+  for completeness and is inert at its fixed value. Note that it does *not*
+  currently function as a producer-side write lead: the daemon never consumes
+  it (`docs/investigation-bug1.md`, verified), and raising it to 192/1024/4096
+  had no measurable effect on click rate or on the driver's `nearMiss` counter
+  (`docs/JITTER.md` — "the SafetyOffset experiment"). Treat it as a reported
+  constant, not as a working knob.
+
+The DAW sums Latency(in) + Latency(out) + SafetyOffset×2 + its own buffers.
+
+### The monitoring trip
+
+```
+Σ = 2 × one-way
+```
+
+Σ is what a guitarist monitoring through the Mac hears: a signal that enters
+the pi's ADC, traverses the whole chain to the Mac, and comes back out the
+pi's DAC. At the reference config that is **1444 frames / 30.1 ms @ 48 kHz**.
+There is no de-duplication to apply — the forward leg carries T_adc and the
+return leg carries T_dac, one codec pass each, and every other stage is
+genuinely traversed twice.
+
+| Measurement scenario | What to expect |
+|----------------------|----------------|
+| **Monitoring** (pi ADC → Mac → pi DAC)  | Σ = 2 × one-way = **1444 frames / 30.1 ms** at reference |
+| **One-way recording** (pi ADC → Mac DAW, no return) | one-way = **722 frames / 15.0 ms** at reference |
+| **One-way playback** (Mac DAW → pi DAC) | one-way, same figure (the legs are symmetric) |
+| **Pure-digital round-trip** (Mac plays → returns via JackBridge loopback, no codec) | Σ − T_adc − T_dac ≈ **1442 frames** |
+| **Hardware loopback round-trip** (pi DAC cabled into pi ADC) | ≈ 2 × Σ — the monitoring trip, twice |
+
+The DAW's own internal buffer (typically 128–512 frames) sits on top of all of
+these.
 
 ### Notes on the math
 
@@ -126,9 +157,12 @@ buffer (typically 128–512 frames) sits on top of all of these.
   cycles* of cushion the netadapter requests against network jitter,
   expressed in period-frames; T_wire is the actual UDP transit time on
   the wire. Both add up.
-- **Round-trip latency** ≈ 2 · Σ if recording and monitoring through
-  the Mac, but in practice DAW monitoring/effects sit between, so the
-  RTT depends on your signal flow.
+- **Σ is already a round trip.** Σ = 2 × the one-way leg. Don't double it
+  again for "round-trip monitoring" — that scenario *is* Σ. Only a hardware
+  loopback (pi DAC cabled back into pi ADC) traverses the chain twice.
+- **The advertised figure is not a build constant.** Five of the eight terms
+  scale with P, so the HAL computes it from the Pi's discovered timing at
+  device open and at StartIO. See `jb_one_way_latency_frames()`.
 
 ---
 
@@ -139,24 +173,30 @@ delta you get per unit of change.
 
 | Symbol | Knob | Where | Default | Impact on latency (frames per unit) |
 |--------|------|-------|---------|-------------------------------------|
-| G | netadapter ring size (`-g N`) | `jackbridge/pi/bin/jackbridge-pi-up:20` (deployed: `/usr/local/libexec/jackbridge/jackbridge-pi-up`) | `512` (was adaptive) | **0.5** — half a frame steady-state per ring frame; full frame in burst headroom |
+| G | netadapter ring size (`-g N`) | `jackbridge/pi/bin/jackbridge-pi-up:70` (deployed: `/usr/local/libexec/jackbridge/jackbridge-pi-up`) | `512` (was adaptive) | **0.5** — half a frame steady-state per ring frame; full frame in burst headroom |
 | P_pi | Pi JACK period (`-p N`) | Pi image JACK configuration | discovered live from the Pi | T_pj scales 1:1, T_alsa scales N_pi:1 — **the largest knob** |
 | N_pi | ALSA periods (`-n N`) | `pistomp-arch/files/jackdrc:19` (hardcoded `-n 2`) | `2` | P_pi frames per period — biggest non-G one-shot saving if dropped to 1 (but risky) |
-| L | netadapter network latency (`-l N`, cycles, range 0–30) | `jackbridge/pi/bin/jackbridge-pi-up:20` (currently unset → default) | `2` (jack2 1.9.22, verified on-device) | P_pi frames per cycle |
+| L | netadapter network latency (`-l N`, cycles, range 0–30) | `jackbridge/pi/bin/jackbridge-pi-up:70` (currently unset → default) | `2` (jack2 1.9.22, verified on-device) | P_pi frames per cycle |
 | P_mac | Mac JACK period | coordinator runtime arguments | equal to discovered P_pi | Must equal P_pi or netJACK2 resampler chokes |
-| J | HAL safety lead (`JitterFrames`) | fixed runtime default in driver and daemon | `0` | 1:1 — surfaces as `kAudioDevicePropertySafetyOffset` |
+| J | HAL safety lead (`JitterFrames`) | fixed runtime default in driver and daemon | `0` | Reported via `kAudioDevicePropertySafetyOffset`, but not consumed as a write lead — see "J is reported, not enforced" below |
 | f_s | Sample rate | discovered live from the Pi | `44100`, `48000`, or `96000` | All times are `frames / f_s` |
-| Q | netadapter resampler quality (`-q N`, **0 = lowest, 4 = highest**) | `jackbridge/pi/bin/jackbridge-pi-up:20` | `0` (we set it explicitly) | No latency impact — only CPU/fidelity |
+| Q | netadapter resampler quality (`-q N`, **0 = lowest, 4 = highest**) | `jackbridge/pi/bin/jackbridge-pi-up:70` | `0` (we set it explicitly) | No latency impact — only CPU/fidelity |
 | MTU | netJACK MTU | Pi runtime | `1500` | Affects T_wire only at jumbo-frame scale |
 | RT prio | jackd realtime priority | Pi image / Mac launcher | `75` | No direct latency; affects jitter |
 | Storm threshold | Auto-restart on xrun storm | `JACKBRIDGE_XRUN_THRESHOLD` env | `50/s` | Recovers from degraded state |
 
 ### Knobs that DON'T affect latency
 
-- `ClockDeviceUID` (`config.plist:27`) — picks *which* clock B is, not how the buffers are sized.
-- `NetworkInterface` (`config.plist:73`) — routing, not buffering.
-- `AutoConnect` block — wiring topology only.
-- `Logging.Level` — observability only.
+`jackbridge/installer/config.plist` holds only persistent user settings —
+runtime timing is discovered, not configured — so none of its keys move
+latency:
+
+- `ClockDeviceUID` — picks *which* clock B is, not how the buffers are sized.
+- `NetworkInterface` — routing, not buffering.
+- `PiHostname` — reachability, MOD-UI, SSH, and probes only.
+
+Auto-wiring topology (`jackbridge-pi-up`'s `jack_connect` pass) and log
+verbosity likewise change no buffer size.
 
 ---
 
@@ -166,14 +206,16 @@ A few non-obvious couplings:
 
 ### P_pi and P_mac must match
 
-`config.plist:33-36` documents this and `CLOCK_WARS.md` explains why:
-netJACK2's master/slave handshake expects equal cycle sizes. If they
+`CLOCK_WARS.md` explains why: netJACK2's master/slave handshake expects
+equal cycle sizes. If they
 differ, netadapter's resampler throws `WriteResample error` on cycle 1
-and thrashes. So you tune them as a pair, not independently.
+and thrashes. This is enforced in practice rather than configured — the
+coordinator probes the Pi and passes the same `--rate` / `--period` to
+`jackbridge/installer/jackd-launch`, which hard-fails if no period arrives.
 
 ### G interacts with measured network jitter
 
-`-g 512` ≈ 11 ms of burst tolerance. JITTER.md §5 measured network
+`-g 512` gives 10.6 ms of burst tolerance. JITTER.md §5 measured network
 inter-arrival p99=2.7 ms, max=13 ms. So an extreme burst can still
 overflow this ring. With the auto-restart sentinel in place, that
 becomes "3 s of audio dropout, then recovery" rather than "permanently
@@ -182,18 +224,30 @@ tolerance:
 
 | G (frames) | Steady (ms) | Burst tolerance (ms) | Trade |
 |------------|-------------|----------------------|-------|
-| 256        | 2.67        | 5.33                 | **Current default.** Storm-restart is the safety net for the gap between this and measured network max (13 ms). |
-| 512        | 5.33        | 10.6                 | Closer to measured p99 (2.7 ms) with ~4× headroom. |
+| 256        | 2.67        | 5.33                 | Tighter, but well under measured network max (13 ms). |
+| 512        | 5.33        | 10.6                 | **Current default** (`jackbridge-pi-up:70`, `jack_load netadapter -i "… -g 512"`). ~4× headroom over measured p99 (2.7 ms); storm-restart is the safety net for the gap to measured max. |
 | 1024       | 10.6        | 21.3                 | Comfortably above measured max jitter. |
 | 2048       | 21.3        | 42.6                 | "Set and forget." |
 | 4096       | 42.6        | 85.3                 | Studio session, no storm risk acceptable. |
 
-### J (JitterFrames) is single-clock-domain only
+### J (JitterFrames) is reported, not enforced
 
-Because the Mac is one clock end-to-end (CLOCK_WARS.md "where the SRC
-actually lives"), J doesn't need a controller — it's just a constant
-lead. Sizing it is purely about absorbing thread scheduling jitter on
-the Mac (`docs/idiosyncrasies.md` — daemon's JACK thread vs HAL's IO
+J is fixed at 0 and is currently **cosmetic**. Two findings pin this down:
+
+- `docs/investigation-bug1.md` (verified): the daemon and the HAL use two
+  independent modulo counters on the same ring. Nothing consumes J as a write
+  lead, so raising it would not actually move the daemon's write point.
+- `docs/JITTER.md` ("the SafetyOffset experiment"): tested at 192, 1024, and
+  4096, click rate was identical and the driver's `nearMiss` counter stayed at
+  0. The bottleneck is Mac jackd's netJACK2 master thread under preemption,
+  not HAL scheduling.
+
+So J is reported through `kAudioDevicePropertySafetyOffset` and enters the
+DAW's round-trip sum, but it buys no jitter absorption today. If it is ever
+made load-bearing, the design constraint is this: because the Mac is one clock
+end-to-end (CLOCK_WARS.md "where the SRC actually lives"), J needs no
+controller — it would be a constant lead, sized to absorb thread scheduling
+jitter on the Mac (`docs/idiosyncrasies.md` — daemon's JACK thread vs HAL's IO
 proc), not clock drift. If you ever broke the same-clock assumption
 (e.g. ran jackd on a different physical device than `ClockDeviceUID`
 selected), J would need to grow to slip-ring proportions or you'd need
@@ -210,15 +264,32 @@ Pi CPU helps the netadapter cycle hit its budget under mod-host load.
 
 ## Quick recipes
 
-All Σ figures are **monitoring trip** (pi ADC → Mac → pi DAC).
+All Σ figures are **monitoring trip** (pi ADC → Mac → pi DAC) = 2 × one-way.
 
 **Current runtime behavior:**
 - Pi sample rate and period are discovered at startup; Mac JACK receives the same values.
 - Supported sample rates are 44100, 48000, and 96000 Hz.
 - `JitterFrames=0`; no persistent timing keys are stored in the home plist.
+- The advertised latency follows the discovered timing automatically.
 
 Tune the Pi JACK period on the Pi itself. The next Mac startup probe follows
 that value; the settings editor does not expose a period control.
+
+**Read the figure your stack actually computed:**
+
+```sh
+just logs   # daemon: "latency model: period=… f_s=… -> one-way=… monitoring trip=…"
+            # driver: "latency: period=… f_s=… -> N frames per scope"
+```
+
+Reference values from the model, for orientation:
+
+| P | f_s | one-way | monitoring trip |
+|---|-----|---------|-----------------|
+| 64 | 48000 | 722 | 1444 (30.1 ms) |
+| 128 | 48000 | 1170 | 2340 (48.8 ms) |
+| 64 | 44100 | 721 | 1442 (32.7 ms) |
+| 128 | 96000 | 1187 | 2374 (24.7 ms) |
 
 **Diagnose where latency lives in YOUR setup:**
 - Send a known transient (handclap, click track) from DAW to pi headphones, record back.
@@ -231,7 +302,9 @@ that value; the settings editor does not expose a period control.
 
 - T_alsa, T_pj, T_mj, T_nm are from the JACK / ALSA buffer math (frames ÷ sample rate).
 - T_g midpoint behavior is documented in jack2's `JackAudioAdapter::PushAndPull` — the controller targets midpoint via the resampler ratio.
-- T_jf reasoning is in `jackbridge/installer/config.plist:40-48` and `docs/architecture.md`.
+- T_jf is fixed at 0 in both `jackbridge/daemon/JackBridge.cpp` (`kDefaultJitterFrames`) and `SA_Device.cpp`; the reasoning for leaving it there is in `docs/investigation-bug1.md` and `docs/JITTER.md`.
+- The model itself lives in `jb_one_way_latency_frames()` in `jackbridge/shared/JackBridge.h`, alongside the constants it uses (`JB_ALSA_PERIODS_PI`, `JB_NET_LATENCY_CYCLES`, `JB_NETADAPTER_RING_FRAMES`, `JB_WIRE_TRANSIT_MICROS`). Change a Pi-side knob and you must change the matching constant there, or the advertised figure drifts from reality.
 - Network latency default (`-l 2`, max 30) verified on the live pi by loading netadapter under a probe client name and reading the `Network latency : N cycles` line from `journalctl -u jack` (jack2 1.9.22 on Arch).
 - T_adc / T_dac are codec group-delay values from the IQaudIO datasheet (low ms).
-- ms numbers are computed for 48 kHz; scale for other rates.
+- ms numbers are computed for 48 kHz unless stated; scale for other rates.
+- T_wire is an assumption, not a measurement: 354 µs, the direct-cable case. A consumer switch in the path adds ~0.15–0.65 ms that the model does not account for.

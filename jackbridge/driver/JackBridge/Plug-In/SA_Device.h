@@ -142,6 +142,10 @@ public:
 	static CFStringRef			HW_CopyDeviceUID();
 	
 private:
+	// Recomputes mReportedLatency{Input,Output} from the JACK timing the
+	// daemon published in shm. Returns true if the value changed, so the
+	// caller can notify the host. Never call from the IO thread.
+	bool						_UpdateAdvertisedLatency();
 	void						_HW_Open();
 	void						_HW_Close();
 	kern_return_t				_HW_StartIO();
@@ -209,9 +213,12 @@ private:
     UInt32                   mHealthNearMiss;         // cycles with inLead OR outLead < 16
     UInt64                   mHealthLeadJitter;       // Σ |lead - nominal| over in+out samples
 
-    // Reported end-to-end latency in frames, set once in _HW_Open to
-    // kBaseLatencyFrames. JitterFrames is advertised separately via
-    // kAudioDevicePropertySafetyOffset, so we do not add it here.
+    // Reported one-way latency in frames, computed by
+    // _UpdateAdvertisedLatency() from the period and sample rate the daemon
+    // discovered from the Pi. Refreshed at _HW_Open and again at StartIO,
+    // because the Pi's timing is not known at build time. JitterFrames is
+    // advertised separately via kAudioDevicePropertySafetyOffset, so we do
+    // not add it here.
     UInt32                   mReportedLatencyInput;
     UInt32                   mReportedLatencyOutput;
     // Display name cached in _HW_Open from the shm field the daemon published
@@ -221,6 +228,10 @@ private:
     CFStringRef                mDeviceName;
 
     // Fixed runtime safety margin; intentionally not user configurable.
+    // Advertised via kAudioDevicePropertySafetyOffset, but note that the
+    // daemon does not consume it as a write lead (docs/investigation-bug1.md)
+    // and raising it had no measurable effect on jitter (docs/JITTER.md), so
+    // at 0 it is inert by design rather than by accident.
     // Must remain aligned with kDefaultJitterFrames in JackBridge.cpp.
     UInt32                   mSafetyOffsetFrames;
 };

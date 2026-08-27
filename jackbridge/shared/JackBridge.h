@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 6
+#define JACKBRIDGE_PROTOCOL_VERSION 7
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -81,11 +81,13 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x0160      :    HAL output write head (mOutputTime.mSampleTime, frames)
 // 0x0168      :    HAL current cycle nframes
 // 0x0170      :    HAL current sample rate
-// 0x0180      :    CoreAudio device name (daemon-publisher, NUL-terminated UTF-8)
 // 0x0180      :    Current Frame Number(coreAudio read, stream 0)
 // 0x0188      :    Current Frame Number(coreAudio write, stream 0)
 // 0x0190      :    Current Frame Number(coreAudio read, stream 1)
 // 0x0198      :    Current Frame Number(coreAudio write, stream 1)
+// 0x01a0      :    JACK period frames the daemon observed (P, latency model)
+// 0x01a8      :    JACK sample rate the daemon observed (f_s, latency model)
+// 0x0200      :    CoreAudio device name (daemon-published, NUL-terminated UTF-8)
 // 0x10000     : Upstream buffer #0 (Driver -> Application)
 // 0x18000     : Downstream buffer #0 (Application -> Driver)
 // 0x20000     : Upstream buffer #0 (Driver -> Application)
@@ -111,15 +113,105 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 #define JB_OFF_HAL_OUTPUT_WRITE_HEAD (0x160)
 #define JB_OFF_HAL_NFRAMES         (0x168)
 #define JB_OFF_HAL_SAMPLE_RATE     (0x170)
-// Device display name the HAL should report via kAudioObjectPropertyName.
-// Written once by the daemon at attach (derived from DeviceName /
-// PiHostname in config.plist) and read once by the HAL at device open. Not a
-// sync field — no atomics, just bounded bytes + a NUL terminator.
-#define JB_DEVICE_NAME_MAX         128
-#define JB_OFF_DEVICE_NAME         (0x180)
-#define JB_DEVICE_NAME_FALLBACK    "pi-Stomp"
+// Per-stream frame cursors, written by the HAL IO thread every cycle.
 #define JB_OFF_READ_FRAME_NUMBER(i)  (0x180+(i)*0x10)
 #define JB_OFF_WRITE_FRAME_NUMBER(i) (0x188+(i)*0x10)
+// One past the last per-stream counter. New atomic fields go here, not at a
+// hand-picked address — the frame-number block grows with MAX_STREAMS.
+#define JB_OFF_END_FRAME_NUMBERS   (JB_OFF_WRITE_FRAME_NUMBER(MAX_STREAMS-1)+8)
+
+// Runtime timing the daemon discovers from its JACK server and the HAL needs
+// for the advertised-latency model. Written once by the daemon at attach, read
+// by the HAL at device open and again at StartIO.
+#define JB_OFF_JACK_PERIOD_FRAMES  (0x1a0)
+#define JB_OFF_JACK_SAMPLE_RATE    (0x1a8)
+
+// Device display name the HAL reports via kAudioObjectPropertyName (derived
+// from PiHostname in config.plist). Bounded bytes plus a NUL, not a sync field.
+//
+// This lives past every atomic field on purpose. It used to start at 0x180,
+// which is also where the per-stream frame counters live: the daemon wrote the
+// name over the counters at attach, and the HAL's IO thread then wrote the
+// counters back over the name. That only ever worked because the HAL happens
+// to read the name once in _HW_Open before IO starts. The static_asserts below
+// make the next such overlap a build error instead of a latent corruption.
+#define JB_DEVICE_NAME_MAX         128
+#define JB_OFF_DEVICE_NAME         (0x200)
+#define JB_DEVICE_NAME_FALLBACK    "pi-Stomp"
+
+/******************************************************************************
+ Advertised latency model
+ ------------------------
+ One-way leg, pi codec <-> Mac HAL, in frames. Both sides compute it from the
+ same function so the daemon's log and the HAL's kAudioDevicePropertyLatency
+ can never disagree. Full derivation and the per-hop table: docs/LATENCY-MODEL.md.
+
+     T_adc/T_dac  codec group delay                  JB_CODEC_GROUP_DELAY_FRAMES
+     T_alsa       pi ALSA capture (-n periods)       JB_ALSA_PERIODS_PI * P
+     T_pj         pi jackd cycle                     P
+     T_g          netadapter slip ring, steady state JB_NETADAPTER_RING_FRAMES / 2
+     T_l          netadapter -l cycles of cushion    JB_NET_LATENCY_CYCLES * P
+     T_wire       UDP transit, direct cable          JB_WIRE_TRANSIT_MICROS * f_s
+     T_nm         Mac netmanager cycle               P
+     T_mj         Mac jackd cycle                    P
+
+ P is the JACK period. netJACK2 requires P_pi == P_mac, so one P covers both
+ sides. T_g uses G/2 because the slip-ring controller resamples toward the ring
+ midpoint; the full G is burst headroom, not steady-state latency.
+
+ P and f_s are discovered from the Pi at startup, so this must be evaluated at
+ runtime — a compile-time constant would only be right at the reference config
+ (P=64, f_s=48000, which yields 722).
+******************************************************************************/
+// jackd -n on the pi (pistomp-arch jackdrc).
+#define JB_ALSA_PERIODS_PI          2
+// netadapter -l, in netjack cycles. jack2 1.9.22 defaults to 2; we leave it
+// unset in jackbridge-pi-up, so the default is what runs.
+#define JB_NET_LATENCY_CYCLES       2
+// netadapter -g, in frames. Set explicitly in jackbridge-pi-up's jack_load.
+#define JB_NETADAPTER_RING_FRAMES   512
+// IQaudIO ADC/DAC group delay (datasheet, low ms -> ~1 frame).
+#define JB_CODEC_GROUP_DELAY_FRAMES 1
+// LAN one-way transit on a direct cable. A consumer switch in the path costs
+// more (0.5-1 ms); this constant assumes the supported direct-cable topology.
+#define JB_WIRE_TRANSIT_MICROS      354
+// Reference config used when the daemon has not published its timing yet.
+#define JB_REFERENCE_PERIOD_FRAMES  64
+#define JB_REFERENCE_SAMPLE_RATE    48000
+
+// Plausibility bounds. Anything outside these means we are reading a stale or
+// uninitialized shm field, so fall back to the reference config rather than
+// advertise nonsense to the DAW.
+static inline bool jb_timing_is_plausible(uint64_t period_frames, uint64_t sample_rate) {
+    return period_frames >= 16 && period_frames <= 8192 &&
+           sample_rate   >= 8000 && sample_rate   <= 384000;
+}
+
+// One-way leg in frames: pi ADC -> Mac HAL, or Mac HAL -> pi DAC. The two
+// directions are symmetric (each carries exactly one codec pass), so the
+// monitoring round trip is 2x this.
+static inline uint32_t jb_one_way_latency_frames(uint64_t period_frames, uint64_t sample_rate) {
+    if (!jb_timing_is_plausible(period_frames, sample_rate)) {
+        period_frames = JB_REFERENCE_PERIOD_FRAMES;
+        sample_rate   = JB_REFERENCE_SAMPLE_RATE;
+    }
+    // T_alsa + T_pj + T_l + T_nm + T_mj, all integer multiples of the period.
+    const uint64_t period_terms =
+        (uint64_t)(JB_ALSA_PERIODS_PI + JB_NET_LATENCY_CYCLES + 3) * period_frames;
+    // T_wire, rounded to the nearest frame at this sample rate.
+    const uint64_t wire =
+        (sample_rate * JB_WIRE_TRANSIT_MICROS + 500000ULL) / 1000000ULL;
+    return (uint32_t)(JB_CODEC_GROUP_DELAY_FRAMES +
+                      period_terms +
+                      (JB_NETADAPTER_RING_FRAMES / 2) +
+                      wire);
+}
+
+// Monitoring trip: pi ADC -> Mac -> pi DAC. What a guitarist monitoring
+// through the Mac actually hears, excluding the DAW's own buffers.
+static inline uint32_t jb_monitoring_trip_frames(uint64_t period_frames, uint64_t sample_rate) {
+    return 2 * jb_one_way_latency_frames(period_frames, sample_rate);
+}
 
 typedef float sample_t;
 #define AUDIO_SAMPLE_SIZE (sizeof(sample_t))
@@ -140,6 +232,22 @@ typedef float sample_t;
 #define STRBUF_U0           (0x10000)
 #define STRBUF_UP(i)        (0x10000*(i)+0x10000)
 #define STRBUF_DOWN(i)      (0x10000*(i)+0x18000)
+
+// Control-region layout guards. The region is laid out by hand with literal
+// offsets, so nothing but these asserts stops two fields from claiming the
+// same bytes — which is exactly what happened between the device name and the
+// per-stream frame counters before protocol 7. Each new field belongs here.
+static_assert(JB_OFF_JACK_PERIOD_FRAMES >= JB_OFF_END_FRAME_NUMBERS,
+              "JACK timing fields overlap the per-stream frame counters");
+static_assert(JB_OFF_JACK_SAMPLE_RATE >= JB_OFF_JACK_PERIOD_FRAMES + 8,
+              "JACK sample rate overlaps the JACK period field");
+static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_JACK_SAMPLE_RATE + 8,
+              "device name overlaps the control atomics");
+static_assert(JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX <= STRBUF_U0,
+              "device name runs into the first ring buffer");
+static_assert((JB_OFF_JACK_PERIOD_FRAMES % 8) == 0 &&
+              (JB_OFF_JACK_SAMPLE_RATE % 8) == 0,
+              "atomic<uint64_t> fields must be 8-byte aligned");
 
 #define JACK_SHMPATH        "/JackBridge"
 
@@ -177,6 +285,9 @@ protected:
     // attach. Plain bytes — read once by the HAL at device open, so no
     // atomics/seqlock.
     char (*shmDeviceName)[JB_DEVICE_NAME_MAX];
+    // Daemon-observed JACK timing, consumed by the HAL's latency model.
+    std::atomic<uint64_t> *shmJackPeriodFrames;
+    std::atomic<uint64_t> *shmJackSampleRate;
     std::atomic<uint64_t> *shmReadFrameNumber[MAX_STREAMS];
     std::atomic<uint64_t> *shmWriteFrameNumber[MAX_STREAMS];
 
@@ -256,6 +367,8 @@ protected:
         shmHalNFrames          = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_NFRAMES);
         shmHalSampleRate       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_SAMPLE_RATE);
         shmDeviceName          = reinterpret_cast<char(*)[JB_DEVICE_NAME_MAX]>(shm_base+JB_OFF_DEVICE_NAME);
+        shmJackPeriodFrames    = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_JACK_PERIOD_FRAMES);
+        shmJackSampleRate      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_JACK_SAMPLE_RATE);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

@@ -1,79 +1,116 @@
-# PiStomp Companion Development Guide
+# PiStomp Companion — Development Guide
 
-PiStomp Companion is the macOS front end for a JackBridge-backed pi-Stomp
-audio interface. The app presents status and controls; JackBridge supplies
-the virtual 4-in / 2-out CoreAudio device and JACK bridge underneath.
+PiStomp Companion is the macOS front end for the JackBridge audio engine.
+The app shows status and controls. JackBridge supplies the virtual 4-in /
+2-out CoreAudio device and the JACK bridge.
 
-The primary use case is a Raspberry Pi running JACK + netJACK2 as a network
-audio interface for macOS DAWs. See `README.md` for the user-facing overview,
-`jackbridge/pi/README.md` for the pi side, and `docs/` for architecture and
-gotchas.
+Use this file to work on the code. For users, `README.md`. For the design,
+`docs/architecture.md`. For the rules that will surprise you,
+`docs/idiosyncrasies.md`.
 
-## Repo layout
+---
+
+## 1. Build and run (most common tasks)
+
+The command runner is [`just`](https://just.systems). Install it with
+`brew install just`. Run `just --list` to see every command.
+
+**Engine loop.** Edit C++ in `jackbridge/`, then:
+
+```sh
+just reload       # build driver + daemon, swap binaries, bounce the stack
+```
+
+This copies the built binaries over `/Library/...` and restarts `coreaudiod`
+and the two LaunchAgents. It needs sudo for the copy and the `coreaudiod`
+kill. Verify with `just device-name` and `just logs`.
+
+**App loop.** Edit Swift in `app/`, then:
+
+```sh
+just app-restart          # kill the running app, rebuild Debug, relaunch
+just app-restart Release  # any xcodebuild configuration
+```
+
+This wraps `./app-restart.sh`: `pkill` the old copy, rebuild, relaunch
+detached through launchd. The relaunched app survives you closing the
+terminal. Build output is quiet on success and full on failure; on failure
+there is no running app, never the old binary pretending to be new.
+
+**Individual targets** when you want one piece:
+
+```sh
+just driver       # HAL driver only
+just daemon       # daemon only
+just app          # app only, no launch
+just run-app      # build the app and open the build-tree copy
+```
+
+**Observe:**
+
+```sh
+just device-name  # the CoreAudio device entry (name, channels, transport)
+just status       # LaunchAgent health
+just logs         # os_log stream, subsystem com.treefallsound.companion
+```
+
+**Recover:**
+
+```sh
+just restart      # bounce the agents and coreaudiod, no rebuild
+just rmshm        # drop the stale shm region (needed after a protocol bump)
+```
+
+---
+
+## 2. Repo layout
 
 ```
-app/                  PiStompCompanion menu-bar app and Xcode project
-jackbridge/           JackBridge engine and deployment subtree
+app/                  menu-bar app and Xcode project
+jackbridge/
   daemon/             JACK client + shm publisher
   driver/             AudioServerPlugIn HAL bundle + Xcode project
   installer/          build-pkg.sh, LaunchAgents, helpers, postinstall
-  pi/                 systemd service + helpers for the pi-Stomp side
+  pi/                 systemd service + helpers for the pi side
   shared/             JackBridge.h IPC contract and logging
-  tools/              shm utilities, jackbridge-ctl, diagnostics
-docs/                 Architecture, setup, idiosyncrasies, spike results
-plans/                Open work and historical planning
+  tools/              jackbridge-ctl, rmshm.c
+docs/                 architecture, setup, idiosyncrasies, spike results
 ```
 
-Source of truth lives in `jackbridge/daemon/`,
-`jackbridge/driver/JackBridge/Plug-In/`, and `jackbridge/shared/`.
+Source of truth: `jackbridge/daemon/`,
+`jackbridge/driver/JackBridge/Plug-In/`, `jackbridge/shared/`.
 
-## Build
+For a guided read: `docs/codebase-tour.md`.
 
-Driver and daemon are targets in
-`jackbridge/driver/JackBridgePlugIn.xcodeproj`. The full release pipeline:
+---
 
-```bash
-# 1. Build the jack2 fork .pkg (one-time, only when the fork moves)
-git clone https://github.com/sastraxi/jack2.git
-cd jack2 && ./build-macos-pkg.sh 1.9.22-sastraxi.5
-#  → build/jack2-1.9.22-sastraxi.5.pkg  (~720 KB, installs to /usr/local)
+## 3. Release builds
 
-# 2. Install JACK2, then build the PiStomp Companion .pkg
-sudo installer -pkg jack2-1.9.22-sastraxi.5.pkg -target /
-./jackbridge/installer/build-pkg.sh [version]
-# Apple Silicon Homebrew (jack2 already on /opt/homebrew):
-JACK_PREFIX=/opt/homebrew ./jackbridge/installer/build-pkg.sh
+`just reload` copies binaries directly. For a real installer:
+
+```sh
+just pkg            # build the .pkg (unsigned local build by default)
+just pkg-install    # build and install the .pkg (sudo)
 ```
 
-`build-pkg.sh` does a `check_jack` against `$JACK_PREFIX` and refuses to
-build without a `libjack.0.dylib` there. Default `$JACK_PREFIX` is `/usr/local`
-(where the jack2 package installs).
+Signing and notarization gate on `SIGN_APP_IDENTITY`,
+`SIGN_INSTALLER_IDENTITY`, and `NOTARY_PROFILE`. Unset means an unsigned
+local build.
 
-Signing/notarization gates on `SIGN_APP_IDENTITY`,
-`SIGN_INSTALLER_IDENTITY`, and `NOTARY_PROFILE`; unset means an unsigned local
-build.
+The engine links against the [`sastraxi/jack2`](https://github.com/sastraxi/jack2)
+fork, not upstream `jackaudio/jack2`. The fork's `build-macos-pkg.sh`
+installs to `/usr/local`. Override the prefix:
 
-## jack2 dependency
-
-JackBridge is a JACK client (the daemon `dlopen`s `libjack`). It depends on the [`sastraxi/jack2`](https://github.com/sastraxi/jack2) fork, not upstream `jackaudio/jack2`, for three commits on top of v1.9.22 + the WAF backport from 1.9.23:
-
-- `3a2f2488` — netadapter PI controller integrator reset on ringbuffer reset (without this, the resample ratio biases further from true on each cycle; the existing `JackPIControler::OurOfBounds()` had zero call sites in upstream 1.9.22).
-- `719d833a` — `IP_ADD_MEMBERSHIP` / `IP_BOUND_IF` pin on the master's multicast group join via `JACK_NETJACK_MULTICAST_IF`. Stock upstream picks `INADDR_ANY`'s default-route interface, which on a Mac with both wifi and a direct-cable link-local is the wifi one — discovery then times out.
-- `b3bfc408` — mirror pin on the slave's outgoing multicast `sendto()`. Without this, the slave's discovery packets leave on the default route (wifi), even when the netJACK2 link is on eth0.
-
-The fork's `build-macos-pkg.sh` produces a `.pkg` that drops everything into `/usr/local`. See `sastraxi/jack2/ChangeLog.rst` and `sastraxi/jack2/build-macos-pkg.sh` for the full list and build details.
-
-## Pi-stomp
-
-We can connect to a Raspberry Pi 5-based guitar pedal called pi-Stomp via ssh:
-
-```bash
-ssh pistomp@pistomp.local
+```sh
+just --set jack_prefix /opt/homebrew engine
 ```
 
-This connection is always over wifi; it does not use the ethernet connection we stream audio on.
+Why the fork is required, and how to build it: `docs/vendor-jack2.md`.
+How to ship a release: `docs/releases.md`.
 
-## Architecture in 30 seconds
+---
+
+## 4. Architecture in 30 seconds
 
 ```
 JACK process callback                CoreAudio IO proc
@@ -85,79 +122,82 @@ JACK process callback                CoreAudio IO proc
    jackd / netJACK2                  DAW / system audio
 ```
 
-Two processes, one shared-memory region (`/JackBridge`), two ring buffers (in + out). Both sides run in the same CoreAudio host-clock domain — see `docs/architecture.md` for why and what that constrains.
+Two processes, one POSIX shared-memory region (`/JackBridge`), two ring
+buffers. Both run in the same CoreAudio host-clock domain. netJACK2 does the
+Pi↔Mac clock crossing. There is no SRC in JackBridge.
 
-## Key idiosyncrasies (do not be surprised by these)
+Full design and constraints: `docs/architecture.md`.
 
-- **IPC contract header** lives at `jackbridge/shared/JackBridge.h`. Both targets pick it up via `HEADER_SEARCH_PATHS=$(SRCROOT)/../shared`. Bump `JACKBRIDGE_PROTOCOL_VERSION` on every shm layout change — the refuse-on-mismatch handshake will then force a clean rebuild on both sides.
-- **shm sync uses `std::atomic<uint64_t>` with explicit acquire/release.** `static_assert`s in `jackbridge/shared/JackBridge.h` pin size, alignment, and `is_always_lock_free`. Don't reintroduce `volatile`-as-synchronization.
-- **Hardcoded `*2` and `8`-byte-per-frame literals** throughout assume stereo float per ring. Don't generalize without auditing every site.
-- **`jackbridge/tools/rmshm.c` also unlinks legacy `/jackrouter` + `/jackrouter2` names** — intentional, helps users migrating from the upstream project.
-- **HAL flips `kAudioDevicePropertyDeviceIsAlive=0`** when the daemon's heartbeat (`shmDaemonAlive`) stalls past 5 ring-buffer cycles, then re-arms on `_HW_StartIO`. Don't paper over this with stale-buffer playback.
-- **The Companion remaps `/JackBridge` on every poll, by design.** A POSIX shm mapping outlives the name on XNU (`shm_unlink` + recreate leaves a readable, frozen orphan) and `fstat` reports `st_dev == 0` / `st_ino == 0`, so there is no identity to compare — re-resolving the name is the only way to notice an upgrade or a `jb-rmshm`. See `app/PiStompCompanion/ShmReader.swift`.
-- **`StatusMonitor.State` is owned by one serial queue and published to the UI by value.** Reading the monitor from the main thread is the race this design removed; render only from the copy `onUpdate` delivers.
-- **Every Companion subprocess goes through `ProcessRunner`** (SIGTERM → SIGKILL watchdog, non-blocking pipe drain, bounded end-of-output wait). Don't hand-roll a `Process` + `waitUntilExit` — it deadlocks on any child that fills the 64 KiB pipe buffer.
-- **One JACK prefix, stamped at build time.** `build-pkg.sh` writes `$JACK_PREFIX` into `config.plist` as `JackPrefix`; `jackbridge/installer/jack-prefix.sh` (shell) and `app/PiStompCompanion/JackTools.swift` (Swift) resolve it identically. No new hardcoded `/usr/local/bin/jack_*` paths.
-- **The netJACK2 multicast pin lives in the jack2 fork, not JackBridge.** Master + slave both call `setsockopt` to pin the multicast group to a specific interface. The Mac wrapper is `jackbridge/installer/jackd-launch`; the pi helper is `jackbridge/pi/bin/jackbridge-pi-up`.
-- **Wifi-router proxy-ARP poisons the pi's link-local unicast.** Even with the multicast group correctly pinned, the Mac's kernel sends ARP requests for the pi's link-local IP out every interface matching 169.254/16 (en7 + en0). The wifi router proxy-ARPs a reply with its own MAC on en0, which often arrives before the pi's real reply on en7, poisoning the cache. The fix is an interface-scoped **static ARP entry carrying the pi's real MAC** (`arp -S <pi-ip> <pi-mac> ifscope <iface>`): the router can still proxy-ARP, but we never ask and never believe it. Since multicast packets don't trigger ARP learning on XNU, the `jackbridge-route-watcher` LaunchDaemon runs a background `tcpdump -e` loop on the wired interface to capture the pi's netJACK2 discovery (UDP to 225.3.19.154:19000) and extracts both the source IP and the Ethernet source. See `installer/jackbridge-route-watcher`.
+### The rules you must not break
 
-  **Do not "simplify" this back to `route add -host <pi-ip> -interface <iface>`.** That was the pre-0.2.5 implementation and it silently black-holes the link: on XNU an interface-direct route installs an llinfo entry whose link-layer address is the *interface's own* MAC, so `arp -an` shows the pi at our en7 MAC, marked `permanent`, indistinguishable from the entry for our own address. Multicast discovery still works (no ARP), so netmanager hears the pi and then dies in the unicast handshake with `Slave doesn't respond, exiting` / `Can't init new NetMaster`. `ping` to the pi is 100% loss until `arp -d <pi-ip>`.
+1. **Bump `JACKBRIDGE_PROTOCOL_VERSION` on every shm layout change.** The
+   handshake refuses to attach on mismatch, forcing a clean rebuild on both
+   sides. The contract header is `jackbridge/shared/JackBridge.h`.
+2. **No allocation, syscalls, logging, or locks in the audio paths.** The
+   HAL IO proc and the daemon's JACK process callback do ring-buffer memcpy
+   only. This is a realtime constraint.
+3. **No SRC in JackBridge.** Both sides share the CoreAudio clock; netJACK2
+   handles the cross-clock resampling. This is load-bearing.
+4. **Fail loud, not silent.** Refuse to attach on protocol mismatch; refuse
+   the wrong jackd backend; exit on a bad `jack_client_open`.
+5. **shm sync uses `std::atomic<uint64_t>` with explicit acquire/release.**
+   `static_assert`s pin size, alignment, and `is_always_lock_free`. Do not
+   reintroduce `volatile`-as-synchronization.
 
-Full list with file/line citations: `docs/idiosyncrasies.md`.
+The full list with file/line citations: `docs/idiosyncrasies.md`.
+Why the clock-domain rule holds: `docs/CLOCK_WARS.md` and `docs/architecture.md`.
 
-## Development principles for this fork
+---
 
-- **Same-clock-domain assumption is load-bearing.** Mac jackd must run with the CoreAudio backend pinned to a stable hardware device; netJACK2 handles the Pi↔Mac clock crossing. Do not add SRC to JackBridge — that's netJACK2's job. See `docs/architecture.md`.
-- **Realtime safety in audio paths.** No allocation, no syscalls, no logging, no locks in the HAL IO proc or the daemon's JACK process callback. Ring-buffer memcpy only.
-- **Apple Silicon only.** Intel Macs are not supported. The Xcode project
-  *can* produce a universal binary (`arm64 x86_64`) and the
-  `jackbridge-pi-up` shell scripts are arch-agnostic, but the released
-  `.pkg` files on the GitHub Releases page are arm64-only — the
-  jack2 fork's `build-macos-pkg.sh` doesn't yet `lipo` an x86_64
-  build, so the resulting `/usr/local/lib/libjack.dylib` is single-arch
-  and the JackBridge xcodebuild is forced to `ARCHS=arm64` to link.
-  Revisit if a user actually needs Intel support.
-- **Fail loud, not silent.** Refuse to attach on protocol mismatch; refuse to run on the wrong jackd backend; exit on bad `jack_client_open`. LaunchAgent `KeepAlive` + `WatchPaths` on `config.plist` handle restart.
-- **Pragmatic over perfect.** The shm IPC layout, single-device assumption, and 4-in/2-out scope are *fine for the use case* — don't grow them speculatively.
+## 5. Logging and diagnostics
 
-## Logging
-
-Both JackBridge targets route through `jackbridge/shared/jb_log.hpp` → `os_log`, subsystem `com.treefallsound.companion`, categories `daemon` / `driver` / `shm` / `jack`. Tail with:
+Both engine targets log through `jackbridge/shared/jb_log.hpp` → `os_log`,
+subsystem `com.treefallsound.companion`, categories `daemon` / `driver` /
+`shm` / `jack`.
 
 ```sh
-log stream --predicate 'subsystem == "com.treefallsound.companion"'
+just logs
 ```
 
-Format-string literals only; use `%{public}s` when caller-supplied strings need to be visible.
+Use format-string literals only. Use `%{public}s` for caller-supplied
+strings.
 
-## Codesigning + macOS specifics
+The menu-bar "Network Diagnostics…" collects probes into
+`~/Library/Logs/JackBridge/`. Run it when the pi does not connect, and attach
+the log to bug reports.
 
-Driver and daemon both need hardened runtime; release builds use Developer ID
-and notarization inside a `.pkg`. Daemon carries
-`com.apple.security.cs.disable-library-validation` in
-`jackbridge/daemon/daemon.entitlements` to `dlopen` libjack. Install path is
-`/Library/Audio/Plug-Ins/HAL/JackBridgePlugIn.driver`; daemon + helpers live
-under `/Library/Application Support/JackBridge/`. Postinstall restarts
-`coreaudiod` and bootstraps the services into the active GUI session.
+---
 
-Details: `docs/macos-setup.md`.
+## 6. Platform constraints
 
-## Tunables — what to change and where
+- **Apple Silicon only.** The released packages and the default `just`
+  builds are arm64. The jack2 fork does not yet build an x86_64 `libjack`,
+  so the engine cannot link Intel. Revisit only if a user needs it.
+- **Codesigning.** The driver and daemon run with the hardened runtime. The
+  daemon carries `com.apple.security.cs.disable-library-validation` in
+  `jackbridge/daemon/daemon.entitlements` to `dlopen` libjack.
+- **Install paths.** Driver:
+  `/Library/Audio/Plug-Ins/HAL/JackBridgePlugIn.driver`. Daemon and helpers:
+  `/Library/Application Support/JackBridge/`. Postinstall restarts
+  `coreaudiod` and bootstraps the services into the active GUI session.
 
-Ordered roughly by latency impact (biggest first), with the latency
-delta you get per unit of change.
+Codesigning and notarization detail: `docs/macos-setup.md`.
 
-| Symbol | Knob | Where | Default | Impact on latency (frames per unit) |
-|--------|------|-------|---------|-------------------------------------|
-| G | netadapter ring size (`-g N`) | `jackbridge/pi/bin/jackbridge-pi-up:50` (deployed: `/usr/local/libexec/jackbridge/jackbridge-pi-up`) | `512` (was adaptive) | **0.5** — half a frame steady-state per ring frame; full frame in burst headroom |
-| P_pi | Pi JACK period (`-p N`) | `/etc/default/jack` (`JACK_PERIOD`), seeded by `pistomp-arch/files/pistomp.conf:28` | `64` | T_pj scales 1:1, T_alsa scales N_pi:1, T_l scales L:1 — **the largest knob** |
-| N_pi | ALSA periods (`-n N`) | `pistomp-arch/files/jackdrc:19` (hardcoded `-n 2`) | `2` | P_pi frames per period — biggest non-G one-shot saving if dropped to 1 (but risky) |
-| L | netadapter network latency (`-l N`, cycles, range 0–30) | `jackbridge/pi/bin/jackbridge-pi-up:50` (currently unset → default) | `2` (jack2 1.9.22, verified on-device) | P_pi frames per cycle |
-| P_mac | Mac JACK period (`PeriodFrames`) | `jackbridge/installer/config.plist:44` → `/Library/Application Support/JackBridge/config.plist` | `64` | T_mj scales 1:1; **must match P_pi or netJACK2 resampler chokes** |
-| J | HAL safety lead (`JitterFrames`) | `jackbridge/installer/config.plist:52` | `0` | 1:1 — pure latency, no slip-ring effect (single clock domain). Default is 0; the upstream-recommended 192 was rolled back once the new setsockopt-based multicast pin eliminated the need for a HAL-side safety lead. |
-| f_s | Sample rate | `pistomp.conf:27` AND `jackbridge/installer/config.plist:30` | `48000` | All times are `frames / f_s`, so doubling f_s halves all ms costs but doubles CPU |
-| Q | netadapter resampler quality (`-q N`, **0 = lowest, 4 = highest**) | `jackbridge/pi/bin/jackbridge-pi-up:50` | `0` (we set it explicitly) | No latency impact — only CPU/fidelity |
-| MTU | netJACK MTU | `jackbridge/installer/config.plist:64` | `1500` | Affects T_wire only at jumbo-frame scale; only changes packet count, not buffer math |
-| RT prio | jackd realtime priority | Pi: hardcoded `-P 75` in `jackdrc:19`. Mac: `RealtimePriority` in `jackbridge/installer/config.plist:58` | `75` both | No direct latency; affects jitter (variance), not mean |
-| Storm threshold | Auto-restart on xrun storm | `JACKBRIDGE_XRUN_THRESHOLD` env (read by `jackbridge-xrun-watcher`) | `50/s` | Recovers from degraded state; doesn't change steady-state latency |
-| Multicast pin | `JACK_NETJACK_MULTICAST_IF` env var | Read by `JackNetMasterManager` (master) and `JackNetAdapter` (slave) in the jack2 fork. Pi: `jackbridge/pi/bin/jackbridge-pi-up` exports it (default `eth0`, override via `/run/jackbridge.iface` from `jackbridge-pin-route`'s auto-detect). Mac: `jackd-launch` exports it from `/var/run/jackbridge-route.iface`. | empty (legacy INADDR_ANY behavior — broken on multi-NIC hosts) | n/a — required for discovery to work at all when the host has wifi + a direct cable NIC |
+---
+
+## 7. Where to look next
+
+Read these when you touch the matching area, not before:
+
+| Topic | File |
+|-------|------|
+| Architecture and clock domains | `docs/architecture.md` |
+| Latency math and tunables | `docs/LATENCY-MODEL.md` |
+| Jitter and crackle | `docs/JITTER.md` |
+| Why one clock, the four options | `docs/CLOCK_WARS.md` |
+| Surprising behaviors, with citations | `docs/idiosyncrasies.md` |
+| Install, config, post-install | `docs/macos-setup.md` |
+| The pi side | `docs/pi-stomp.md` |
+| The jack2 fork | `docs/vendor-jack2.md` |
+| Shipping a release | `docs/releases.md` |
+| Walkthrough of the source tree | `docs/codebase-tour.md` |

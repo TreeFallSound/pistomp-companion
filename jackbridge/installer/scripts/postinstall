@@ -3,8 +3,6 @@
 # JACK stopped until the Companion GUI starts it.
 set -e
 
-/usr/bin/killall coreaudiod 2>/dev/null || true
-
 SUPPORT="/Library/Application Support/JackBridge"
 DEFAULT="$SUPPORT/config.plist.default"
 LEGACY_PKG_ID=com.jackbridge.pkg
@@ -86,4 +84,13 @@ if [ -n "$loggedInUID" ]; then
 fi
 
 /usr/sbin/pkgutil --forget "$LEGACY_PKG_ID" >/dev/null 2>&1 || true
+
+# ORDER MATTERS: shm wipe before the coreaudiod bounce. Killing coreaudiod
+# first makes it respawn and load the driver from disk while the previous
+# install's plug-in still holds the stale shm pinned; the new daemon then
+# crash-loops on the protocol-version handshake.
+if [ -x "$SUPPORT/jb-rmshm" ]; then
+    "$SUPPORT/jb-rmshm" 2>/dev/null || true
+fi
+/usr/bin/killall coreaudiod 2>/dev/null || true
 exit 0

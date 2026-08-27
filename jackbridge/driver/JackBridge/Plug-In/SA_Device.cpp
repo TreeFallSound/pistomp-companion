@@ -749,10 +749,11 @@ void	SA_Device::Device_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			break;
 
 		case kAudioDevicePropertyLatency:
-			//	Presentation latency of the device. We report the end-to-end chain
-			//	documented in docs/LATENCY-MODEL.md *excluding* JitterFrames, which
-			//	is surfaced separately via kAudioDevicePropertySafetyOffset. The DAW
-			//	sums Latency + SafetyOffset + BufferFrameSize + StreamLatency.
+			//	Presentation latency of the device: the one-way leg for the Pi's
+			//	discovered timing, per the model in docs/LATENCY-MODEL.md, and
+			//	*excluding* JitterFrames, which is surfaced separately via
+			//	kAudioDevicePropertySafetyOffset. The DAW sums Latency +
+			//	SafetyOffset + BufferFrameSize + StreamLatency.
 			ThrowIf(inDataSize < sizeof(UInt32), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioDevicePropertyLatency for the device");
 			if (inAddress.mScope == kAudioObjectPropertyScopeInput) {
 				*reinterpret_cast<UInt32*>(outData) = mReportedLatencyInput;
@@ -1743,14 +1744,45 @@ CFStringRef	SA_Device::HW_CopyDeviceUID()
 }
 
 
-// One-way latency leg in frames, excluding the fixed JitterFrames safety
-// value. Reference config: T_adc(1) + T_alsa(128) + T_pj(64) + T_g(256) +
-// T_l(128) + T_wire(17) + T_nm(64) + T_mj(64) = 722. Reported for both input
-// and output scope per CoreAudio semantics; the DAW sums them for round-trip.
-// JitterFrames is surfaced separately via kAudioDevicePropertySafetyOffset.
-static constexpr UInt32 kBaseLatencyFrames = 722;
 // Keep aligned with the daemon's fixed runtime default.
 static constexpr UInt32 kDefaultJitterFrames = 0;
+
+// The one-way latency leg is computed at runtime from the JACK period and
+// sample rate the daemon discovered from the Pi — see jb_one_way_latency_frames
+// in shared/JackBridge.h and docs/LATENCY-MODEL.md. It is not a constant: five
+// of the eight terms scale with the period, so hardcoding it would only be
+// right at the reference config (P=64, f_s=48000 → 722 frames).
+//
+// Reported for both input and output scope per CoreAudio semantics; the DAW
+// sums them for its round-trip figure. JitterFrames is surfaced separately via
+// kAudioDevicePropertySafetyOffset.
+bool	SA_Device::_UpdateAdvertisedLatency()
+{
+    const uint64_t period = shmJackPeriodFrames->load(std::memory_order_relaxed);
+    const uint64_t rate   = shmJackSampleRate->load(std::memory_order_acquire);
+    const bool     known  = jb_timing_is_plausible(period, rate);
+    const UInt32   oneWay = jb_one_way_latency_frames(period, rate);
+
+    if (oneWay == mReportedLatencyInput && oneWay == mReportedLatencyOutput) {
+        return false;
+    }
+
+    if (known) {
+        JB_LOG_INFO(jb_log_driver(),
+            "latency: period=%llu f_s=%llu -> %u frames per scope (monitoring trip %u)",
+            (unsigned long long)period, (unsigned long long)rate,
+            (unsigned)oneWay, (unsigned)(2 * oneWay));
+    } else {
+        JB_LOG_INFO(jb_log_driver(),
+            "latency: daemon has not published JACK timing yet - advertising the "
+            "reference config (%u frames per scope). Refreshed at StartIO.",
+            (unsigned)oneWay);
+    }
+
+    mReportedLatencyInput  = oneWay;
+    mReportedLatencyOutput = oneWay;
+    return true;
+}
 
 void	SA_Device::_HW_Open()
 {
@@ -1783,15 +1815,15 @@ void	SA_Device::_HW_Open()
     shmDriverStatus->store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     mRingBufferFrameSize = STRBUFNUM / 2;
 
-    // Advertised latency = fixed monitoring-chain base; JitterFrames is
-    // surfaced separately via kAudioDevicePropertySafetyOffset so CoreAudio
-    // can act on it (scheduling the IOProc earlier) instead of just reporting
-    // it. The DAW sums Latency + SafetyOffset, so adding jitter here would
-    // double-count it. See docs/LATENCY-MODEL.md.
-    constexpr UInt32 jitter = kDefaultJitterFrames;
-    mReportedLatencyInput  = kBaseLatencyFrames;
-    mReportedLatencyOutput = kBaseLatencyFrames;
-    mSafetyOffsetFrames    = jitter;
+    // Advertised latency = the one-way leg for the Pi's discovered timing.
+    // JitterFrames is surfaced separately via kAudioDevicePropertySafetyOffset
+    // because the DAW sums Latency + SafetyOffset, so adding jitter here would
+    // double-count it. See docs/LATENCY-MODEL.md. The daemon may not have
+    // published its timing yet at open time, so StartIO refreshes this.
+    mReportedLatencyInput  = 0;
+    mReportedLatencyOutput = 0;
+    _UpdateAdvertisedLatency();
+    mSafetyOffsetFrames    = kDefaultJitterFrames;
     // Device display name, published by the daemon at attach. Copy it out of
     // shm into a retained CFString — the shm region can be torn down and
     // recreated by a daemon restart while we hold the name.
@@ -1837,6 +1869,18 @@ kern_return_t	SA_Device::_HW_StartIO()
     mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
     mLastDaemonAliveHostTime = mach_absolute_time();
     mDeviceIsAlive.store(true, std::memory_order_release);
+
+    // The Pi's period and sample rate are discovered at startup and can change
+    // across a daemon restart, so re-derive the advertised latency here rather
+    // than trusting whatever _HW_Open saw. StartIO is not the IO thread, so
+    // notifying the host is allowed.
+    if (_UpdateAdvertisedLatency()) {
+        AudioObjectPropertyAddress addrs[2] = {
+            { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput,  kAudioObjectPropertyElementMain },
+            { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain }
+        };
+        SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 2, addrs);
+    }
     return 0;
 }
 

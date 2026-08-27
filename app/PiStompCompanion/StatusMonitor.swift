@@ -11,7 +11,7 @@ import Foundation
 /// a straight data race, and could show a half-updated mix of two polls.
 final class StatusMonitor {
     enum Health: Equatable {
-        case protocolMismatch(UInt64)     // shm protocolVersion != 5
+        case protocolMismatch(UInt64)     // shm protocolVersion != expectedProtocolVersion
         case streaming(UInt64, UInt64)    // sampleRate, nFrames — audio flowing
         case startedIdle                  // driverStatus == STARTED but HAL head not advancing
         case linkedIdle                   // ports wired, driverStatus != STARTED
