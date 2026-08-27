@@ -6,12 +6,16 @@
 # kernel uses the resulting route to choose which iface to IP_ADD_MEMBERSHIP
 # on when netmanager (loaded inside the user-session jackd) binds the group.
 #
-# Config: reads /Library/Application Support/JackBridge/config.plist for an
-# optional NetworkInterface override.
+# Config: reads the active user's generated home plist.
 set -eu
 
 SUPPORT="/Library/Application Support/JackBridge"
-CONFIG="$SUPPORT/config.plist"
+CONFIG="${JACKBRIDGE_CONFIG_PATH:-$HOME/Library/Application Support/JackBridge/config.plist}"
+console_user=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+if [ -n "$console_user" ] && [ "$console_user" != root ]; then
+    console_home=$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+    [ -n "$console_home" ] && CONFIG="$console_home/Library/Application Support/JackBridge/config.plist"
+fi
 DETECT="$SUPPORT/jb-detect-net-iface"
 STATE=/var/run/jackbridge-route.iface
 GROUP=225.3.19.154
@@ -20,7 +24,9 @@ OVERRIDE=""
 if [ -f "$CONFIG" ]; then
     OVERRIDE=$(/usr/libexec/PlistBuddy -c "Print :NetworkInterface" "$CONFIG" 2>/dev/null || true)
 fi
-
+case "$OVERRIDE" in
+    *[!A-Za-z0-9_.-]*) echo "jackbridge-pin-route: invalid NetworkInterface" >&2; exit 1 ;;
+esac
 iface=$("$DETECT" "$OVERRIDE") || {
     echo "jackbridge-pin-route: no usable interface, leaving multicast route alone." >&2
     exit 1

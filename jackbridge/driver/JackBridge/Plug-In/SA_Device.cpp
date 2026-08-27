@@ -497,9 +497,9 @@ UInt32	SA_Device::Device_GetPropertyDataSize(AudioObjectID inObjectID, pid_t inC
 			theAnswer = sizeof(Float64);
 			break;
 
-		case kAudioDevicePropertyAvailableNominalSampleRates:
-			theAnswer = 2 * sizeof(AudioValueRange);
-			break;
+        case kAudioDevicePropertyAvailableNominalSampleRates:
+            theAnswer = 3 * sizeof(AudioValueRange);
+            break;
 
 		case kAudioDevicePropertyIsHidden:
 			theAnswer = sizeof(UInt32);
@@ -866,23 +866,27 @@ void	SA_Device::Device_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			//	case, only that number of items will be returned
 			theNumberItemsToFetch = inDataSize / sizeof(AudioValueRange);
 
-			//	clamp it to the number of items we have
-			if(theNumberItemsToFetch > 2)
-			{
-				theNumberItemsToFetch = 2;
-			}
+            if(theNumberItemsToFetch > 3)
+            {
+                theNumberItemsToFetch = 3;
+            }
 
-			//	fill out the return array
-			if(theNumberItemsToFetch > 0)
-			{
-				((AudioValueRange*)outData)[0].mMinimum = 44100.0;
-				((AudioValueRange*)outData)[0].mMaximum = 44100.0;
-			}
-			if(theNumberItemsToFetch > 1)
-			{
-				((AudioValueRange*)outData)[1].mMinimum = 48000.0;
-				((AudioValueRange*)outData)[1].mMaximum = 48000.0;
-			}
+            // fill out the return array
+            if(theNumberItemsToFetch > 0)
+            {
+                ((AudioValueRange*)outData)[0].mMinimum = 44100.0;
+                ((AudioValueRange*)outData)[0].mMaximum = 44100.0;
+            }
+            if(theNumberItemsToFetch > 1)
+            {
+                ((AudioValueRange*)outData)[1].mMinimum = 48000.0;
+                ((AudioValueRange*)outData)[1].mMaximum = 48000.0;
+            }
+            if(theNumberItemsToFetch > 2)
+            {
+                ((AudioValueRange*)outData)[2].mMinimum = 96000.0;
+                ((AudioValueRange*)outData)[2].mMaximum = 96000.0;
+            }
 
 			//	report how much we wrote
 			outDataSize = theNumberItemsToFetch * sizeof(AudioValueRange);
@@ -980,7 +984,7 @@ void	SA_Device::Device_SetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			{
 				//	check the arguments
 				ThrowIf(inDataSize != sizeof(Float64), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_SetPropertyData: wrong size for the data for kAudioDevicePropertyNominalSampleRate");
-				ThrowIf((*((const Float64*)inData) != 44100.0) && (*((const Float64*)inData) != 48000.0), CAException(kAudioHardwareIllegalOperationError), "SA_Device::Device_SetPropertyData: unsupported value for kAudioDevicePropertyNominalSampleRate");
+                ThrowIf(((*((const Float64*)inData) != 44100.0) && (*((const Float64*)inData) != 48000.0) && (*((const Float64*)inData) != 96000.0)), CAException(kAudioHardwareIllegalOperationError), "SA_Device::Device_SetPropertyData: unsupported value for kAudioDevicePropertyNominalSampleRate");
 
 				//	we need to lock around getting the current sample rate to compare against the new rate
 				UInt64 theOldSampleRate = 0;
@@ -1104,10 +1108,10 @@ UInt32	SA_Device::Stream_GetPropertyDataSize(AudioObjectID inObjectID, pid_t inC
 			theAnswer = sizeof(AudioStreamBasicDescription);
 			break;
 
-		case kAudioStreamPropertyAvailableVirtualFormats:
-		case kAudioStreamPropertyAvailablePhysicalFormats:
-			theAnswer = 2 * sizeof(AudioStreamRangedDescription);
-			break;
+        case kAudioStreamPropertyAvailableVirtualFormats:
+        case kAudioStreamPropertyAvailablePhysicalFormats:
+            theAnswer = 3 * sizeof(AudioStreamRangedDescription);
+            break;
 
 		case kAudioObjectPropertyElementName:
 			theAnswer = sizeof(CFStringRef);
@@ -1237,10 +1241,10 @@ void	SA_Device::Stream_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			theNumberItemsToFetch = inDataSize / sizeof(AudioStreamRangedDescription);
 
 			//	clamp it to the number of items we have
-			if(theNumberItemsToFetch > 2)
-			{
-				theNumberItemsToFetch = 2;
-			}
+            if(theNumberItemsToFetch > 3)
+            {
+                theNumberItemsToFetch = 3;
+            }
 
 			//	fill out the return array
 			if(theNumberItemsToFetch > 0)
@@ -1269,6 +1273,19 @@ void	SA_Device::Stream_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 				((AudioStreamRangedDescription*)outData)[1].mSampleRateRange.mMinimum = 48000.0;
 				((AudioStreamRangedDescription*)outData)[1].mSampleRateRange.mMaximum = 48000.0;
 			}
+            if(theNumberItemsToFetch > 2)
+            {
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mSampleRate = 96000.0;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mFormatID = kAudioFormatLinearPCM;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mBytesPerPacket = 8;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mFramesPerPacket = 1;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mBytesPerFrame = 8;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mChannelsPerFrame = 2;
+                ((AudioStreamRangedDescription*)outData)[2].mFormat.mBitsPerChannel = 32;
+                ((AudioStreamRangedDescription*)outData)[2].mSampleRateRange.mMinimum = 96000.0;
+                ((AudioStreamRangedDescription*)outData)[2].mSampleRateRange.mMaximum = 96000.0;
+            }
 
 			//	report how much we wrote
 			outDataSize = theNumberItemsToFetch * sizeof(AudioStreamRangedDescription);
@@ -1347,7 +1364,6 @@ void	SA_Device::Stream_SetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			}
 			break;
 
-		case kAudioStreamPropertyVirtualFormat:
 		case kAudioStreamPropertyPhysicalFormat:
 			{
 				//	Changing the stream format needs to be handled via the
@@ -1364,7 +1380,7 @@ void	SA_Device::Stream_SetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 				ThrowIf(theNewFormat->mBytesPerFrame != 8, CAException(kAudioDeviceUnsupportedFormatError), "SA_Device::Stream_SetPropertyData: unsupported bytes per frame for kAudioStreamPropertyPhysicalFormat");
 				ThrowIf(theNewFormat->mChannelsPerFrame != 2, CAException(kAudioDeviceUnsupportedFormatError), "SA_Device::Stream_SetPropertyData: unsupported channels per frame for kAudioStreamPropertyPhysicalFormat");
 				ThrowIf(theNewFormat->mBitsPerChannel != 32, CAException(kAudioDeviceUnsupportedFormatError), "SA_Device::Stream_SetPropertyData: unsupported bits per channel for kAudioStreamPropertyPhysicalFormat");
-				ThrowIf((theNewFormat->mSampleRate != 44100.0) && (theNewFormat->mSampleRate != 48000.0), CAException(kAudioDeviceUnsupportedFormatError), "SA_Device::Stream_SetPropertyData: unsupported sample rate for kAudioStreamPropertyPhysicalFormat");
+                ThrowIf((theNewFormat->mSampleRate != 44100.0) && (theNewFormat->mSampleRate != 48000.0) && (theNewFormat->mSampleRate != 96000.0), CAException(kAudioDeviceUnsupportedFormatError), "SA_Device::Stream_SetPropertyData: unsupported sample rate for kAudioStreamPropertyPhysicalFormat");
 
 				//	we need to lock around getting the current sample rate to compare against the new rate
 				UInt64 theOldSampleRate = 0;
@@ -1717,30 +1733,12 @@ CFStringRef	SA_Device::HW_CopyDeviceUID()
 	return theAnswer;
 }
 
-// Read a UInt32 from config.plist at init time. Falls back to `def` if the
-// file/key is missing or unparseable. Runs once in _HW_Open; popen cost is
-// irrelevant outside the realtime path.
-static UInt32 read_uint_from_plist(const char* key, UInt32 def) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-        "/usr/libexec/PlistBuddy -c 'Print :%s' "
-        "'/Library/Application Support/JackBridge/config.plist' 2>/dev/null",
-        key);
-    FILE* f = popen(cmd, "r");
-    if (!f) return def;
-    UInt32 val = def;
-    if (fscanf(f, "%u", &val) != 1) val = def;
-    pclose(f);
-    return val;
-}
 
-// Base end-to-end latency in frames, excluding JitterFrames. Derived from
-// docs/LATENCY-MODEL.md Σ at the documented defaults (48 kHz, pi -p 64,
-// netadapter -g 512 -l 2, MTU 1500): everything except T_jf sums to 722.
-// Both directions are advertised identically; the DAW adds buffer size and
-// SafetyOffset on top, so we do NOT include JitterFrames here.
+// Base end-to-end latency in frames, excluding the fixed JitterFrames safety
+// value. Timing rate and period are discovered at JACK startup.
 static constexpr UInt32 kBaseLatencyFrames = 722;
-static constexpr UInt32 kDefaultJitterFrames = 192;
+// Keep aligned with the daemon's fixed runtime default.
+static constexpr UInt32 kDefaultJitterFrames = 0;
 
 void	SA_Device::_HW_Open()
 {
@@ -1778,7 +1776,7 @@ void	SA_Device::_HW_Open()
     // can act on it (scheduling the IOProc earlier) instead of just reporting
     // it. The DAW sums Latency + SafetyOffset, so adding jitter here would
     // double-count it. See docs/LATENCY-MODEL.md.
-    UInt32 jitter = read_uint_from_plist("JitterFrames", kDefaultJitterFrames);
+    constexpr UInt32 jitter = kDefaultJitterFrames;
     mReportedLatencyInput  = kBaseLatencyFrames;
     mReportedLatencyOutput = kBaseLatencyFrames;
     mSafetyOffsetFrames    = jitter;

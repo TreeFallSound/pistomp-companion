@@ -12,7 +12,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
-    private var diagnosticsAlert: NSAlert?
+    private var diagnosticsProgress: ProgressWindowController?
+    private var settingsWindow: SettingsWindowController?
     private static let support = "/Library/Application Support/JackBridge"
     private static let ctl = "\(support)/jackbridge-ctl"
 
@@ -176,20 +177,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func runDiagnostics(_ s: Any?) {
-        guard diagnosticsAlert == nil else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Collecting network diagnostics…"
-        alert.informativeText = "Checking the Pi, network routes, and JACK. This can take up to 30 seconds."
-        alert.window.isReleasedWhenClosed = false
-        diagnosticsAlert = alert
+        guard diagnosticsProgress == nil else { return }
+        let progress = ProgressWindowController(title: "Collecting network diagnostics…")
+        diagnosticsProgress = progress
         NSApp.activate(ignoringOtherApps: true)
-        alert.window.center()
-        alert.window.orderFrontRegardless()
-        NetworkDiagnostics.run(state: lastState) { [weak self] in
-            self?.diagnosticsAlert?.window.close()
-            self?.diagnosticsAlert = nil
-        }
+        progress.window?.orderFrontRegardless()
+        NetworkDiagnostics.run(state: lastState,
+            onProgress: { completed, total, label in
+                progress.advance(completed: completed, total: total, label: label)
+            },
+            completion: { [weak progress] in
+                progress?.window?.close()
+                self.diagnosticsProgress = nil
+            })
     }
 
     @objc private func openLogs(_ s: Any?) {
@@ -199,10 +199,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Settings live in a root-owned plist. Phase 1: open it in the user's
-    /// editor (zero privilege). Saving it restarts the agents via WatchPaths.
     @objc private func openSettings(_ s: Any?) {
-        NSWorkspace.shared.open(URL(fileURLWithPath: "\(Self.support)/config.plist"))
+        if settingsWindow == nil { settingsWindow = SettingsWindowController() }
+        settingsWindow?.present()
     }
 
     @objc private func toggleLaunchAtLogin(_ s: Any?) {

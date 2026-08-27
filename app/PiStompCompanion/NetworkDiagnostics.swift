@@ -8,11 +8,14 @@ enum NetworkDiagnostics {
     static let logDir = NSString(string: "~/Library/Logs/JackBridge").expandingTildeInPath
 
     /// Runs off-main and calls completion on the main queue after the report
-    /// has been written and opened.
-    static func run(state: StatusMonitor.State, completion: @escaping () -> Void = {}) {
+    /// has been written and opened. `onProgress` fires on the main queue as
+    /// each probe lands: (completed, total, label of the probe that finished).
+    static func run(state: StatusMonitor.State,
+                    onProgress: @escaping (Int, Int, String) -> Void = { _, _, _ in },
+                    completion: @escaping () -> Void = {}) {
         let queue = DispatchQueue(label: "com.jackbridge.companion.diagnostics", qos: .userInitiated)
         queue.async {
-            writeAndOpen(collect(state: state), completion: completion)
+            writeAndOpen(collect(state: state, onProgress: onProgress), completion: completion)
         }
     }
     private static func writeAndOpen(_ text: String, completion: @escaping () -> Void) {
@@ -33,7 +36,19 @@ enum NetworkDiagnostics {
 
     // MARK: - collection
 
-    private static func collect(state: StatusMonitor.State) -> String {
+    private typealias Shm = ShmSnapshot
+
+    /// One bounded probe plus its human-readable progress label. `id` keys
+    /// the result dict, so reusing one probe's body for two report sections
+    /// (only the TCP probe, per host) renders both.
+    private struct Probe {
+        let id: String
+        let label: String
+        let body: () -> String
+    }
+
+    private static func collect(state: StatusMonitor.State,
+                                onProgress: @escaping (Int, Int, String) -> Void) -> String {
         var s = ""
         let stamp = ISO8601DateFormatter().string(from: Date())
         s += "JackBridge Network Diagnostics — \(stamp)\n"
@@ -43,15 +58,62 @@ enum NetworkDiagnostics {
         s += state.jackGraphError.map { " (\($0))" } ?? ""
         s += "\n"
         s += "JACK prefix: \(JackTools.prefix) (\(JackTools.prefixOrigin))\n\n"
-        s += shmSection(snap: state.snapshot, attached: state.shmAttached, error: state.shmError)
-        s += commandSection()
-        s += jackSection()
+
+        // The shm snapshot is already in `state` — zero work, report
+        // synchronously.
+        let shmText = shmSection(snap: state.snapshot, attached: state.shmAttached, error: state.shmError)
+
+        let commandProbes = makeCommandProbes()
+        let jackProbes: [Probe] = [
+            Probe(id: "jack_lsp", label: "JACK port list") {
+                JackGraphMonitor.runJackLsp(connect: false).report(includeExit: true)
+            },
+            Probe(id: "jack_lsp_c", label: "JACK connections") {
+                JackGraphMonitor.runJackLsp(connect: true).report(includeExit: true)
+            },
+        ]
+        let logTailProbes: [Probe] = ["com.jackbridge.jackd.err.log", "com.jackbridge.jackd.out.log",
+                                      "com.jackbridge.daemon.err.log", "com.jackbridge.daemon.out.log"]
+            .map { name in
+                Probe(id: name, label: name) { logTail(path: "/tmp/\(name)") }
+            }
+
+        let all = commandProbes + jackProbes + logTailProbes
+        var results = [String: String]()
+        let resultsLock = NSLock()
+        let doneLock = NSLock()
+        var done = 0
+
+        // Every probe is already individually bounded (ProcessRunner, the
+        // tcpProbeSync semaphore); running them concurrently turns the dump's
+        // wall time from the SUM of budgets into the LONGEST one, and the
+        // group.wait(timeout:) deadline below just backstops that — a wedged probe
+        // keeps costing nobody nothing.
+        let group = DispatchGroup()
+        for p in all {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let text = p.body()
+                resultsLock.lock()
+                results[p.id] = text
+                resultsLock.unlock()
+                doneLock.lock()
+                done += 1
+                let completed = done
+                doneLock.unlock()
+                DispatchQueue.main.async { onProgress(completed, all.count, p.label) }
+                group.leave()
+            }
+        }
+        _ = group.wait(timeout: .now() + 45)
+
+        s += shmText
+        s += commandSection(probes: commandProbes, results: results)
+        s += jackSection(results: results)
         s += sentinelSection()
-        s += logTailSection()
+        s += logTailSection(probes: logTailProbes, results: results)
         return s
     }
-
-    private typealias Shm = ShmSnapshot
 
     private static func shmSection(snap: Shm, attached: Bool, error: String?) -> String {
         var s = "== shm snapshot ==\n"
@@ -89,48 +151,88 @@ enum NetworkDiagnostics {
         return s
     }
 
-    private static func commandSection() -> String {
+    private static func runCommand(_ path: String, args: [String], timeout: TimeInterval,
+                                   includeExit: Bool) -> String {
+        ProcessRunner.run(path, args: args, timeout: timeout).report(includeExit: includeExit)
+    }
+
+    private static func makeCommandProbes() -> [Probe] {
+        let hostname = JackTools.piHostname
+        var probes: [Probe] = [
+            Probe(id: "airport", label: "Wi-Fi interface") {
+                runCommand("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
+                           args: ["-I"], timeout: 5, includeExit: true)
+            },
+            Probe(id: "networksetup", label: "Hardware ports") {
+                runCommand("/usr/sbin/networksetup", args: ["-listallhardwareports"], timeout: 5, includeExit: true)
+            },
+            Probe(id: "ifconfig", label: "Interfaces") {
+                runCommand("/sbin/ifconfig", args: [], timeout: 5, includeExit: true)
+            },
+            Probe(id: "netstat", label: "Routing table") {
+                runCommand("/usr/sbin/netstat", args: ["-rn"], timeout: 5, includeExit: true)
+            },
+            Probe(id: "route", label: "Default route") {
+                runCommand("/sbin/route", args: ["-n", "get", "default"], timeout: 5, includeExit: true)
+            },
+            Probe(id: "arp", label: "ARP table") {
+                runCommand("/usr/sbin/arp", args: ["-an"], timeout: 5, includeExit: true)
+            },
+            Probe(id: "dns-sd", label: "Name resolution") {
+                runCommand("/usr/bin/dns-sd", args: ["-Q", hostname, "A"], timeout: 5, includeExit: false)
+            },
+            Probe(id: "ping", label: "Ping \(hostname)") {
+                runCommand("/sbin/ping", args: ["-c", "3", "-t", "3", hostname], timeout: 6, includeExit: true)
+            },
+        ]
+        // The tcpProbeSync result is reused for every report section, so one
+        // probe per host covers ports 22 and 80 in both the hostname and
+        // last-known-good-IP lines below.
+        for host in [hostname] + (ReachabilityMonitor.cachedIP != nil ? [ReachabilityMonitor.cachedIP!] : []) {
+            probes.append(Probe(id: "tcp-\(host)", label: "TCP probe \(host)") {
+                let line22 = tcpProbeSync(host, port: 22)
+                let line80 = tcpProbeSync(host, port: 80)
+                return "  \(host):22 → \(line22)\n  \(host):80 → \(line80)\n"
+            })
+        }
+        return probes
+    }
+
+    private static func commandSection(probes: [Probe], results: [String: String]) -> String {
         var s = "== network state ==\n"
         let cached = ReachabilityMonitor.cachedIP ?? "-"
         s += "cached last-known-good IP: \(cached)\n"
 
-        s += "\n-- SSID --\n"
-        s += runCommand("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
-                        args: ["-I"], timeout: 5, includeExit: true)
-        s += "\n-- networksetup -listallhardwareports --\n"
-        s += runCommand("/usr/sbin/networksetup", args: ["-listallhardwareports"], timeout: 5, includeExit: true)
-        s += "\n-- ifconfig --\n"
-        s += runCommand("/sbin/ifconfig", args: [], timeout: 5, includeExit: true)
-        s += "\n-- netstat -rn --\n"
-        s += runCommand("/usr/sbin/netstat", args: ["-rn"], timeout: 5, includeExit: true)
-        s += "\n-- route -n get default --\n"
-        s += runCommand("/sbin/route", args: ["-n", "get", "default"], timeout: 5, includeExit: true)
-        s += "\n-- arp -an --\n"
-        s += runCommand("/usr/sbin/arp", args: ["-an"], timeout: 5, includeExit: true)
-
-        let hostname = JackTools.piHostname
-        s += "\n== name resolution ==\n"
-        s += "\n-- dns-sd -Q \(hostname) (5s cap) --\n"
-        s += runCommand("/usr/bin/dns-sd", args: ["-Q", hostname, "A"], timeout: 5, includeExit: false)
-        s += "\n-- ping -c 3 -t 3 \(hostname) --\n"
-        s += runCommand("/sbin/ping", args: ["-c", "3", "-t", "3", hostname], timeout: 6, includeExit: true)
+        for p in probes where !p.id.hasPrefix("tcp-") {
+            let heading: String
+            switch p.id {
+            case "airport":      heading = "SSID"
+            case "networksetup": heading = "networksetup -listallhardwareports"
+            case "dns-sd":       heading = "dns-sd -Q \(JackTools.piHostname) (5s cap)"
+            case "ping":         heading = "ping -c 3 -t 3 \(JackTools.piHostname)"
+            default:             heading = p.id
+            }
+            if p.id == "dns-sd" {
+                s += "\n== name resolution ==\n"
+            }
+            s += "\n-- \(heading) --\n"
+            s += results[p.id] ?? "[did not complete]\n"
+        }
 
         s += "\n== TCP probes (3s cap) ==\n"
-        for host in [hostname] + (ReachabilityMonitor.cachedIP != nil ? [ReachabilityMonitor.cachedIP!] : []) {
-            for port in [UInt16(22), 80] {
-                s += "  \(host):\(port) → \(tcpProbeSync(host, port: port))\n"
-            }
+        for p in probes where p.id.hasPrefix("tcp-") {
+            s += results[p.id] ?? "[did not complete]\n"
         }
         return s + "\n"
     }
 
-    private static func jackSection() -> String {
+    private static func jackSection(results: [String: String]) -> String {
         var s = "== JACK graph ==\n"
         s += "jack_lsp: \(JackTools.jackLsp)\n"
         s += "\n-- jack_lsp --\n"
-        s += JackGraphMonitor.runJackLsp(connect: false).report(includeExit: true)
+        s += results["jack_lsp"] ?? "[did not complete]\n"
         s += "\n-- jack_lsp -c --\n"
-        s += JackGraphMonitor.runJackLsp(connect: true).report(includeExit: true)
+        s += results["jack_lsp_c"] ?? "[did not complete]\n"
         return s + "\n"
     }
 
@@ -146,33 +248,21 @@ enum NetworkDiagnostics {
         return s + "\n"
     }
 
-    private static func logTailSection() -> String {
-        var s = "== /tmp log tails (last 50 lines each) ==\n"
-        let names = ["com.jackbridge.jackd.err.log", "com.jackbridge.jackd.out.log",
-                     "com.jackbridge.daemon.err.log", "com.jackbridge.daemon.out.log"]
-        for n in names {
-            let path = "/tmp/\(n)"
-            s += "\n-- \(path) --\n"
-            if let text = try? String(contentsOfFile: path, encoding: .utf8) {
-                let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-                s += lines.suffix(50).joined(separator: "\n")
-                s += "\n"
-            } else {
-                s += "  (absent)\n"
-            }
+    private static func logTail(path: String) -> String {
+        if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            return lines.suffix(50).joined(separator: "\n") + "\n"
         }
-        return s + "\n"
+        return "  (absent)\n"
     }
 
-    // MARK: - process helpers
-
-    /// Every probe is bounded by ProcessRunner: SIGTERM at the budget,
-    /// SIGKILL a second later, partial output kept either way. A wedged
-    /// `ping` or a jackd-blocked `jack_lsp` costs the dump its budget and
-    /// nothing more.
-    static func runCommand(_ path: String, args: [String], timeout: TimeInterval,
-                           includeExit: Bool) -> String {
-        ProcessRunner.run(path, args: args, timeout: timeout).report(includeExit: includeExit)
+    private static func logTailSection(probes: [Probe], results: [String: String]) -> String {
+        var s = "== /tmp log tails (last 50 lines each) ==\n"
+        for p in probes {
+            s += "\n-- /tmp/\(p.id) --\n"
+            s += results[p.id] ?? "[did not complete]\n"
+        }
+        return s + "\n"
     }
 
 }

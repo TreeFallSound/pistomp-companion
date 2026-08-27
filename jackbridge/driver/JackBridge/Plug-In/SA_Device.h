@@ -214,10 +214,8 @@ private:
     UInt32                   mReportedLatencyInput;
     UInt32                   mReportedLatencyOutput;
 
-    // Producer-side safety lead in frames. Read from config.plist in _HW_Open
-    // and returned from kAudioDevicePropertySafetyOffset; CoreAudio schedules
-    // the IOProc that many frames earlier in sampleTime, so the daemon's
-    // write head naturally sits ahead of the HAL's read head in the ring.
+    // Fixed runtime safety margin; intentionally not user configurable.
+    // Must remain aligned with kDefaultJitterFrames in JackBridge.cpp.
     UInt32                   mSafetyOffsetFrames;
 };
 

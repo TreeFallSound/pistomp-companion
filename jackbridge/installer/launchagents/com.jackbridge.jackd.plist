@@ -36,15 +36,16 @@
     <string>/tmp/com.jackbridge.jackd.out.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/com.jackbridge.jackd.err.log</string>
-
-    <!-- Restart jackd when config.plist changes (e.g. ClockDeviceUID edit). -->
+    <!-- Restart jackd when the user's home configuration changes. -->
     <key>WatchPaths</key>
     <array>
-        <string>/Library/Application Support/JackBridge/config.plist</string>
+        <string>@HOME_CONFIG@</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>JACKBRIDGE_CONFIG_PATH</key>
+        <string>@CONFIG_PATH@</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

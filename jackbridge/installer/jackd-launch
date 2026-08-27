@@ -1,202 +1,98 @@
 #!/bin/sh
-# jackd-launch — start jackd with the JackBridge clock topology, then load
-# netmanager once the server is up.
-#
-# Clock device selection:
-#   1. config.plist ClockDeviceUID, if set.
-#   2. Otherwise, jb-detect-builtin auto-detects the Mac's built-in output.
-#   3. If neither yields a UID, refuse to start (loud log, non-zero exit;
-#      LaunchAgent KeepAlive backs off).
-#
-# Single-clock-domain is load-bearing — see docs/architecture.md. `-P 75` is
-# load-bearing — see docs/spike-b-clock-stability.md.
-
-set -e
-
-# jack_lsp / jack_load / any jack_* CLI tool default to JackNullOption, which
-# auto-spawns a default-config jackd against whatever CoreAudio considers the
-# system default output (often a USB interface at 44.1k/256). That stray jackd
-# beats the real one to the "default" server slot, triggers a microphone
-# permission prompt for any device with input streams, and produces wrong
-# sample rate / buffer. Suppress it process-tree-wide.
+# JackBridge JACK LaunchAgent entrypoint. Normal startup delegates timing
+# discovery to jackbridge-coordinator; --launch-jack is its internal path.
+set -u
 export JACK_NO_START_SERVER=1
 
 SUPPORT="/Library/Application Support/JackBridge"
-CONFIG="$SUPPORT/config.plist"
-DETECT="$SUPPORT/jb-detect-builtin"
-# JACK_PREFIX / JACKD / JACK_LOAD / JACK_LSP all come from the one resolver
-# so the Companion app, this wrapper, and the build agree on which JACK2 the
-# package is driving. See jack-prefix.sh for the precedence.
+OWNER_HELPER="$SUPPORT/jackbridge-jackd"
+STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
 PREFIX_HELPER="$SUPPORT/jack-prefix.sh"
 if [ -r "$PREFIX_HELPER" ]; then
     . "$PREFIX_HELPER"
 else
-    echo "jackd-launch: $PREFIX_HELPER missing — falling back to /usr/local" >&2
-    JACK_PREFIX="/usr/local"
+    JACK_PREFIX=/usr/local
     JACKD="$JACK_PREFIX/bin/jackd"
     JACK_LOAD="$JACK_PREFIX/bin/jack_load"
     JACK_LSP="$JACK_PREFIX/bin/jack_lsp"
 fi
-JACK_MIN_VERSION="1.9.22"
-# A fresh marker is inherited by jackd and is visible to same-user `ps -Eww`.
-# It distinguishes our server from another program's server without changing
-# the JACK server name (`default`).
-JACKBRIDGE_INSTANCE=$(/usr/bin/uuidgen 2>/dev/null || printf '%s-%s' "$(/bin/date +%s)" "$$")
-export JACKBRIDGE_INSTANCE
-OWNER_HELPER="$SUPPORT/jackbridge-jackd"
-STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
+
+if [ "${1:-}" != --launch-jack ]; then
+    exec "$SUPPORT/jackbridge-coordinator" "$@"
+fi
+shift
+RATE=48000
+PERIOD=""
+CLOCK_UID=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --rate) [ "$#" -ge 2 ] || exit 2; RATE="$2"; shift 2 ;;
+        --period) [ "$#" -ge 2 ] || exit 2; PERIOD="$2"; shift 2 ;;
+        --clock-device) [ "$#" -ge 2 ] || exit 2; CLOCK_UID="$2"; shift 2 ;;
+        *) echo "jackd-launch: unexpected argument '$1'" >&2; exit 2 ;;
+    esac
+done
 
 write_status() {
     tmp="${STATUS_FILE}.$$"
     printf '%s\n' "$1" > "$tmp"
     /bin/mv -f "$tmp" "$STATUS_FILE"
 }
+clear_status() { /bin/rm -f "$STATUS_FILE"; }
 
-clear_status() {
-    /bin/rm -f "$STATUS_FILE"
-}
-
-if [ ! -x "$OWNER_HELPER" ]; then
-    echo "jackd-launch: $OWNER_HELPER missing — cannot classify an existing JACK server" >&2
-    exit 1
-fi
-
-# Do not start jackd while another default server owns the JACK socket. Keep
-# this process alive and recheck at a bounded rate; launchd then does not
-# crash-loop, and the Companion can show the condition in its menu.
+[ -x "$OWNER_HELPER" ] || { echo "jackd-launch: $OWNER_HELPER missing" >&2; exit 1; }
 while :; do
     server_state=$("$OWNER_HELPER" state "$JACK_LSP" 2>/dev/null || printf '%s' none)
     case "$server_state" in
-        none)
-            clear_status
-            break
-            ;;
-        owned)
-            write_status owned
-            echo "jackd-launch: an existing JackBridge JACK server is waiting for confirmation" >&2
-            sleep 10
-            ;;
-        foreign)
-            write_status foreign
-            echo "jackd-launch: a different program uses JACK; waiting" >&2
-            sleep 10
-            ;;
-        *)
-            write_status foreign
-            echo "jackd-launch: cannot classify the JACK server; waiting" >&2
-            sleep 10
-            ;;
+        none) clear_status; break ;;
+        owned) write_status owned; echo "jackd-launch: existing JackBridge JACK server is waiting" >&2; sleep 10 ;;
+        foreign) write_status foreign; echo "jackd-launch: a different program uses JACK; waiting" >&2; sleep 10 ;;
+        *) write_status foreign; echo "jackd-launch: cannot classify JACK server; waiting" >&2; sleep 10 ;;
     esac
 done
 
-if [ ! -x "$JACKD" ]; then
-    echo "jackd not found at $JACKD (prefix $JACK_PREFIX) — install JACK2 ${JACK_MIN_VERSION}+ from jackaudio.org" >&2
-    exit 1
-fi
-
-ver=$("$JACKD" --version 2>&1 | head -1 | awk '{print $3}')
-if [ -n "$ver" ] && ! printf '%s\n%s\n' "$JACK_MIN_VERSION" "$ver" | sort -V -C; then
-    echo "jackd $ver too old (need ${JACK_MIN_VERSION}+). Reinstall JACK2 from jackaudio.org" >&2
-    exit 1
-fi
-
-# Read ClockDeviceUID and PeriodFrames from config.plist; empty/missing both
-# return empty. ClockDeviceUID falls through to auto-detect; PeriodFrames
-# falls back to 64 (must match the Pi-side jackd period — see comment by the
-# jackd invocation below).
-CLOCK_UID=""
-PERIOD_FRAMES=""
-if [ -f "$CONFIG" ]; then
-    CLOCK_UID=$(/usr/libexec/PlistBuddy -c "Print :ClockDeviceUID" "$CONFIG" 2>/dev/null || true)
-    PERIOD_FRAMES=$(/usr/libexec/PlistBuddy -c "Print :PeriodFrames" "$CONFIG" 2>/dev/null || true)
-fi
-PERIOD_FRAMES="${PERIOD_FRAMES:-64}"
-
+[ -x "$JACKD" ] || { echo "jackd-launch: jackd not found at $JACKD" >&2; exit 1; }
 if [ -z "$CLOCK_UID" ]; then
-    if [ ! -x "$DETECT" ]; then
-        echo "ClockDeviceUID unset in $CONFIG and $DETECT missing — cannot determine jackd backend device." >&2
-        exit 1
-    fi
-    CLOCK_UID=$("$DETECT") || {
-        echo "jb-detect-builtin failed to find a built-in audio device. Set ClockDeviceUID in $CONFIG explicitly." >&2
-        exit 1
-    }
+    DETECT="$SUPPORT/jb-detect-builtin"
+    [ -x "$DETECT" ] || { echo "jackd-launch: clock device detector missing" >&2; exit 1; }
+    CLOCK_UID=$("$DETECT") || { echo "jackd-launch: no usable CoreAudio clock device" >&2; exit 1; }
 fi
+[ -n "$PERIOD" ] || { echo "jackd-launch: period was not supplied by coordinator" >&2; exit 1; }
+echo "jackd-launch: using ClockDeviceUID=$CLOCK_UID rate=$RATE period=$PERIOD" >&2
 
-echo "jackd-launch: using ClockDeviceUID=$CLOCK_UID PeriodFrames=$PERIOD_FRAMES" >&2
-
-# Wait for the route daemon (com.jackbridge.route LaunchDaemon) to pin the
-# netJACK2 multicast group to a real interface before starting jackd.
-# netmanager calls IP_ADD_MEMBERSHIP at load time — if no route exists for
-# 225.3.19.154 yet, the join silently fails and every Init() attempt returns
-# "Network is unreachable" for the lifetime of that jackd process.
-# /var/run is cleared on each boot, so a missing state file always means the
-# daemon hasn't run yet (not a stale file from a previous boot).
 ROUTE_STATE=/var/run/jackbridge-route.iface
 for i in $(seq 1 20); do
     [ -f "$ROUTE_STATE" ] && break
     sleep 0.5
 done
-if [ ! -f "$ROUTE_STATE" ]; then
-    echo "jackd-launch: multicast route not pinned after 10 s — netmanager may fail to join the group" >&2
-else
-    # Source of truth for the wired iface: jackbridge-pin-route writes it
-    # to /var/run/jackbridge-route.iface on every transition. Use the same
-    # value as the IP_BOUND_IF setsockopt pin on netmanager's socket, so
-    # the join and the kernel's route table stay in agreement.
+if [ -f "$ROUTE_STATE" ]; then
     WIRED_IFACE=$(cat "$ROUTE_STATE")
     export JACK_NETJACK_MULTICAST_IF="$WIRED_IFACE"
     echo "jackd-launch: multicast route pinned to $WIRED_IFACE" >&2
+else
+    echo "jackd-launch: multicast route not pinned after 10 s" >&2
 fi
 
-# `-P <uid>` (playback-only) rather than `-d ~:<uid>` (duplex): the typical
-# built-in output device has no input streams, so duplex silently falls back
-# to "default in + default out" — a different-clock-domain pair that fails
-# aggregate creation, and (worse) opens the default microphone, triggering
-# repeated TCC prompts on every KeepAlive restart. JackBridge's actual audio
-# I/O flows through shm + netJACK2, so the clock device only needs playback.
-# -p <PERIOD_FRAMES> must match the Pi-side jackd period (pi-stomp's stock
-# /etc/jackdrc uses `-p 64`). netJACK2's adaptive resampler chokes on cycle 1
-# with off-by-one `WriteResample error` when periods differ, then thrashes.
-# Sourced from config.plist `PeriodFrames` (default 64).
-"$JACKD" -R -P 75 -d coreaudio -P "$CLOCK_UID" -r 48000 -p "$PERIOD_FRAMES" &
+"$JACKD" -R -P 75 -d coreaudio -P "$CLOCK_UID" -r "$RATE" -p "$PERIOD" &
 JACKD_PID=$!
-# Publish jackd's PID for diagnostics; cleaned up via trap below.
 JACKD_PID_FILE=/tmp/jackbridge-jackd.pid
 echo "$JACKD_PID" > "$JACKD_PID_FILE"
-# On any exit — clean shutdown, set -e failure, or SIGTERM from launchd's
-# bootout when the route watcher stops us — kill jackd too. jackd is a
-# background child of this script; without an explicit kill, the script
-# exits and jackd is orphaned under launchd, holding the JACK server
-# socket and stale netmanager multicast group membership.
 trap 'kill "$JACKD_PID" 2>/dev/null || true; rm -f "$JACKD_PID_FILE"' EXIT INT TERM
 
-# Wait for jackd to be ready, then load netmanager. Both probe and load can
-# fail transiently while coreaudiod is mid-restart cascade after a clock
-# device change — retry the load itself, not just the probe, because the
-# old readiness loop would exhaust its budget against a half-up server and
-# we'd silently lose the internal client (no slave ports => no auto-wire =>
-# no audio).
 jackd_ready=0
 for i in $(seq 1 30); do
-    if "$JACK_LSP" >/dev/null 2>&1; then
-        jackd_ready=1
-        break
-    fi
+    if "$JACK_LSP" >/dev/null 2>&1; then jackd_ready=1; break; fi
     sleep 0.5
 done
-
-if [ "$jackd_ready" = "1" ] && [ -x "$JACK_LOAD" ]; then
+if [ "$jackd_ready" = 1 ] && [ -x "$JACK_LOAD" ]; then
     for i in 1 2 3 4 5; do
         if "$JACK_LOAD" netmanager >/dev/null 2>&1; then
-            echo "jackd-launch: netmanager loaded" >&2
-            break
+            echo "jackd-launch: netmanager loaded" >&2; break
         fi
-        echo "jackd-launch: jack_load netmanager attempt $i failed, retrying" >&2
+        echo "jackd-launch: jack_load netmanager attempt $i failed" >&2
         sleep 1
     done
-elif [ "$jackd_ready" != "1" ]; then
-    echo "jackd-launch: jackd not ready after 15s — netmanager not loaded" >&2
+elif [ "$jackd_ready" != 1 ]; then
+    echo "jackd-launch: jackd not ready after 15s" >&2
 fi
-
 wait "$JACKD_PID"

@@ -22,13 +22,16 @@
     <key>KeepAlive</key>
     <true/>
 
-    <!-- Re-pin when the operator edits the NetworkInterface override in
-         config.plist. WatchPaths kicks the job, which exits the existing
-         notifyutil wait and lets the new instance pick up the new value. -->
+    <!-- Re-pin when the active user's home configuration changes. -->
     <key>WatchPaths</key>
     <array>
-        <string>/Library/Application Support/JackBridge/config.plist</string>
+        <string>@HOME_CONFIG@</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>JACKBRIDGE_CONFIG_PATH</key>
+        <string>@CONFIG_PATH@</string>
+    </dict>
 
     <!-- Throttle restarts so a flapping cable can't burn CPU. KeepAlive will
          still restart us, just at most every 5s. -->

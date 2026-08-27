@@ -32,8 +32,13 @@
     <string>Interactive</string>
     <key>WatchPaths</key>
     <array>
-        <string>/Library/Application Support/JackBridge/config.plist</string>
+        <string>@HOME_CONFIG@</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>JACKBRIDGE_CONFIG_PATH</key>
+        <string>@CONFIG_PATH@</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>/tmp/com.jackbridge.daemon.out.log</string>
     <key>StandardErrorPath</key>

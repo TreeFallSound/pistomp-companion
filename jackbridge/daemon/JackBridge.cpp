@@ -51,35 +51,11 @@ SOFTWARE.
 static pthread_t g_main_thread;
 static std::atomic<bool> g_wire_dirty{false};
 
-// Daemon-side safety margin in frames, read once at startup from config.plist.
-// The HAL realises this by returning JitterFrames from
-// kAudioDevicePropertySafetyOffset; CoreAudio then schedules the IOProc that
-// many frames earlier in sampleTime, so the daemon's write head naturally
-// sits JitterFrames ahead of the HAL's read head in the ring.
-static constexpr long kDefaultJitterFrames = 192;
+// Fixed runtime safety margin. JitterFrames is intentionally not user
+// configurable; keep this value aligned with the HAL driver.
+static constexpr long kDefaultJitterFrames = 0;
 static long g_jitter_frames = kDefaultJitterFrames;
-
-// Drift threshold (frames) at which |FrameNumber - (halReadHead + JitterFrames)|
-// exceeds the safety window. Counted in the 5s drift trace as a diagnostic for
-// scheduler hiccups large enough to consume the SafetyOffset lead.
 static constexpr int64_t kSnapThresholdFrames = 512;
-
-// Reads a long-valued key from /Library/Application Support/JackBridge/config.plist
-// via PlistBuddy. Returns `def` if the file/key is missing or unparseable.
-// Runs once at startup; popen cost is irrelevant outside the realtime path.
-static long read_config_long(const char* key, long def) {
-    char cmd[512];
-    snprintf(cmd, sizeof cmd,
-        "/usr/libexec/PlistBuddy -c 'Print :%s' "
-        "'/Library/Application Support/JackBridge/config.plist' 2>/dev/null",
-        key);
-    FILE* f = popen(cmd, "r");
-    if (!f) return def;
-    long val = def;
-    if (fscanf(f, "%ld", &val) != 1) val = def;
-    pclose(f);
-    return val;
-}
 #ifdef _WITH_MIDI_BRIDGE_
 #include <rtmidi/RtMidi.h>
 #define MAX_MIDI_PORTS 256
@@ -202,8 +178,8 @@ public:
                 JB_LOG_ERR(jb_log_jack(),
                     "jackd is clocked off JackBridge itself (alias=%{public}s). "
                     "This creates a CoreAudio feedback loop. Set ClockDeviceUID in "
-                    "/Library/Application Support/JackBridge/config.plist to a different "
-                    "device (e.g. built-in output). See docs/idiosyncrasies.md.",
+                    "JackBridge Settings to a different device (e.g. built-in output). "
+                    "See docs/idiosyncrasies.md.",
                     alias_storage[i]);
                 free(alias_storage[0]);
                 free(alias_storage[1]);
@@ -372,8 +348,7 @@ public:
     // EEXIST for already-connected pairs, which we treat as success.
     //
     // Policy is "first match per channel": the first *:from_slave_<n> seen is
-    // wired to JackBridge input_<n>, etc. Multi-slave fan-out and an opt-out
-    // are deferred to config.plist (PLAN.md §3.4.3).
+    // wired to JackBridge input_<n>, etc. The graph contract is fixed.
     void auto_wire() {
         wire_direction("from_slave", JackPortIsOutput, audioIn, nAudioIn);
         wire_direction("to_slave",   JackPortIsInput,  audioOut, nAudioOut);
@@ -721,9 +696,8 @@ main(int argc, char** argv)
     // can pthread_kill us awake.
     g_main_thread = pthread_self();
 
-    // Read tunables from config.plist before any RT code runs.
-    g_jitter_frames = read_config_long("JitterFrames", kDefaultJitterFrames);
-    if (g_jitter_frames < 0) g_jitter_frames = kDefaultJitterFrames;
+    // Keep the daemon and HAL on the same fixed runtime default.
+    g_jitter_frames = kDefaultJitterFrames;
     JB_LOG_DEFAULT(jb_log_daemon(), "config: JitterFrames=%ld", g_jitter_frames);
 
     while ((ch = getopt(argc, argv, "vi:o:")) != -1) {

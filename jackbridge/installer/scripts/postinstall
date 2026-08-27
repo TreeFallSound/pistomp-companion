@@ -1,34 +1,50 @@
 #!/bin/sh
-# JackBridge postinstall.
-#
-# - Reload coreaudiod so the freshly-installed HAL plugin is picked up.
-# - Bootstrap the system LaunchDaemon that pins the netJACK2 multicast group
-#   to the right wired NIC (without this netmanager joins on the default
-#   route, which is usually Wi-Fi, and the pi is invisible).
-# - Bootstrap the per-user LaunchAgents into the active GUI session so the user
-#   doesn't have to log out / back in.
-#
-# The LaunchAgents themselves carry LimitLoadToSessionType=Aqua, so they will
-# also be auto-loaded by launchd for any subsequent GUI login.
-
+# JackBridge postinstall: install the HAL, seed the active user's home
+# configuration, and bootstrap the existing launchd service stack.
 set -e
 
 /usr/bin/killall coreaudiod 2>/dev/null || true
 
-# Seed config.plist from the shipped default only if the user doesn't already
-# have one. Reinstalls and upgrades must preserve hand-edited settings
-# (ClockDeviceUID, NetworkInterface, etc.) — the LaunchAgents WatchPaths this
-# file, so clobbering it on every install also kicks jackd unnecessarily.
-CONFIG_DIR="/Library/Application Support/JackBridge"
-if [ ! -f "$CONFIG_DIR/config.plist" ] && [ -f "$CONFIG_DIR/config.plist.default" ]; then
-    /bin/cp "$CONFIG_DIR/config.plist.default" "$CONFIG_DIR/config.plist"
-    /bin/chmod 0644 "$CONFIG_DIR/config.plist"
+SUPPORT="/Library/Application Support/JackBridge"
+DEFAULT="$SUPPORT/config.plist.default"
+loggedInUser=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+homeConfig=""
+loggedInUID=""
+if [ -n "$loggedInUser" ] && [ "$loggedInUser" != root ]; then
+    loggedInUID=$(/usr/bin/id -u "$loggedInUser")
+    userHome=$(/usr/bin/dscl . -read "/Users/$loggedInUser" NFSHomeDirectory 2>/dev/null | \
+        /usr/bin/awk '{print $2}')
+    userHome=${userHome:-/Users/$loggedInUser}
+    homeConfig="$userHome/Library/Application Support/JackBridge/config.plist"
+    homeDir=$(/usr/bin/dirname "$homeConfig")
+    /bin/mkdir -p "$homeDir"
+    /usr/sbin/chown "$loggedInUser":staff "$userHome/Library/Application Support" "$homeDir" 2>/dev/null || true
+    /bin/chmod 700 "$userHome/Library/Application Support" "$homeDir" 2>/dev/null || true
+    if [ ! -f "$homeConfig" ] && [ -f "$DEFAULT" ]; then
+        /bin/cp "$DEFAULT" "$homeConfig"
+        /usr/sbin/chown "$loggedInUser":staff "$homeConfig"
+        /bin/chmod 600 "$homeConfig"
+    fi
 fi
 
-# Bootstrap the netJACK2 multicast-route watcher (system domain, runs as
-# root). The watcher pins the route, then blocks on notifyutil waiting for
-# the next network-state change; KeepAlive=true cycles it on every change.
-# launchd starts it immediately on bootstrap, so the first pin happens here.
+# Launchd watches the resolved home path, never a tilde or unresolved token.
+# If installation occurs at the login window, /var/empty intentionally keeps
+# the agents dormant; the route watcher resolves the active user dynamically.
+watchPath=${homeConfig:-/var/empty/jackbridge-config.plist}
+for plist in \
+    /Library/LaunchAgents/com.jackbridge.daemon.plist \
+    /Library/LaunchAgents/com.jackbridge.jackd.plist \
+    /Library/LaunchDaemons/com.jackbridge.route.plist; do
+    if [ -f "$plist" ]; then
+        tmp="$plist.$$"
+        /usr/bin/sed -e "s|@HOME_CONFIG@|$watchPath|g" \
+            -e "s|@CONFIG_PATH@|$watchPath|g" "$plist" > "$tmp"
+        /usr/sbin/chown root:wheel "$tmp"
+        /bin/chmod 644 "$tmp"
+        /bin/mv -f "$tmp" "$plist"
+    fi
+done
+
 ROUTE_LABEL=com.jackbridge.route
 ROUTE_PLIST=/Library/LaunchDaemons/$ROUTE_LABEL.plist
 if [ -f "$ROUTE_PLIST" ]; then
@@ -37,51 +53,31 @@ if [ -f "$ROUTE_PLIST" ]; then
     /bin/launchctl bootstrap system "$ROUTE_PLIST" || true
 fi
 
-# Expose jackbridge-ctl on $PATH. /usr/local/bin exists by default on macOS;
-# `ln -sf` overwrites any prior symlink (e.g. an upgrade reinstall) without
-# touching an unrelated file with the same name.
 /bin/mkdir -p /usr/local/bin
-/bin/ln -sf "/Library/Application Support/JackBridge/jackbridge-ctl" /usr/local/bin/jackbridge-ctl
-OWNER_HELPER="$CONFIG_DIR/jackbridge-jackd"
+/bin/ln -sf "$SUPPORT/jackbridge-ctl" /usr/local/bin/jackbridge-ctl
+OWNER_HELPER="$SUPPORT/jackbridge-jackd"
 STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
 owned_jackd_pids() {
     [ -x "$OWNER_HELPER" ] || return 0
     "$OWNER_HELPER" owned-pids "$loggedInUID" 2>/dev/null || true
 }
 
-loggedInUser=$(/usr/bin/stat -f%Su /dev/console)
-if [ -n "$loggedInUser" ] && [ "$loggedInUser" != "root" ]; then
-    loggedInUID=$(/usr/bin/id -u "$loggedInUser")
-    # Bootout both labels first, *then* wait + SIGKILL stragglers, *then*
-    # bootstrap. Doing bootout-then-bootstrap per-label races: bootout returns
-    # before the process actually exits, so the bootstrap of the same label can
-    # hit "default server already active" and KeepAlive-loops forever (jackd
-    # holds the JACK server socket past SIGTERM if it was wedged from the
-    # killall coreaudiod cascade above). Mirrors jackbridge-ctl's stop logic.
+if [ -n "$loggedInUID" ]; then
     for label in com.jackbridge.daemon com.jackbridge.jackd; do
         /bin/launchctl bootout "gui/$loggedInUID/$label" 2>/dev/null || true
     done
-    # Only terminate JACK servers carrying JackBridge's environment mark.
-    # A different program may use the same `default` server name.
     for i in 1 2 3 4 5 6; do
         if ! /usr/bin/pgrep -x -U "$loggedInUID" JackBridged >/dev/null && \
-           [ -z "$(owned_jackd_pids)" ]; then
-            break
-        fi
+           [ -z "$(owned_jackd_pids)" ]; then break; fi
         /bin/sleep 0.5
     done
     /usr/bin/pkill -9 -x -U "$loggedInUID" JackBridged 2>/dev/null || true
-    for pid in $(owned_jackd_pids); do
-        /bin/kill -9 "$pid" 2>/dev/null || true
-    done
+    for pid in $(owned_jackd_pids); do /bin/kill -9 "$pid" 2>/dev/null || true; done
     /bin/rm -f "$STATUS_FILE"
-
     for label in com.jackbridge.jackd com.jackbridge.daemon; do
         plist="/Library/LaunchAgents/$label.plist"
-        # Clear any persisted disabled-state override
         /bin/launchctl enable "gui/$loggedInUID/$label" 2>/dev/null || true
         /bin/launchctl bootstrap "gui/$loggedInUID" "$plist" || true
     done
 fi
-
 exit 0

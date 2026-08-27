@@ -56,26 +56,23 @@ clock B). Drift between A and B is absorbed by the netadapter slip ring
 
 ## Latency contributions
 
-Per-link, **monitoring path** (pi codec input → Mac → pi codec output)
-with defaults at 48 kHz / Pi `-p 64` / Mac `PeriodFrames=64` / `-g 512`
-/ `JitterFrames=192`. See "What this sum is" below for what to add or
-subtract for other measurements (one-way recording, round-trip
-loopback, etc.).
+The monitoring path's timing is runtime-discovered from the Pi at 44.1, 48,
+or 96 kHz. Mac JACK uses the same sample rate and period. `JitterFrames` is
+fixed at 0. Values below that depend on the deployed Pi configuration.
 
 | Symbol | Stage | What it is | Frames | ms @ 48 k |
 |--------|-------|------------|--------|-----------|
 | T_adc  | Codec ADC          | Fixed group delay through the IQaudIO ADC | ~1 | ~0.02 |
-| T_alsa | ALSA capture       | `period_size × nperiods` on the pi ALSA backend (`-p × -n`) | 128 | 2.67 |
-| T_pj   | Pi jackd cycle     | One JACK period on the pi (`P_pi`) | 64 | 1.33 |
-| T_g    | netadapter slip ring | Steady-state fill ≈ G/2 (controller targets midpoint) | 256 | 5.33 |
+| T_alsa | ALSA capture       | `period_size × nperiods` on the pi ALSA backend (`-p × -n`) | discovered | — |
+| T_pj   | Pi jackd cycle     | One JACK period on the pi (`P_pi`) | discovered | — |
 | T_l    | netadapter cycles  | Network latency in cycles (`-l N` → N · P_pi). **jack2 1.9.22 default = 2 cycles, max 30** (verified on-device via `Network latency : N cycles` log). | 128 | 2.67 |
 | T_wire | UDP transit        | LAN one-way, direct cable. Dominated by NIC + switch fabric; sub-millisecond on a direct cable, ~0.5–1 ms through one consumer switch. | ~17 | ~0.35 |
-| T_nm   | Mac netmanager     | One netjack cycle on the master side (≈ P_mac) | 64 | 1.33 |
-| T_mj   | Mac jackd cycle    | One JACK period on the Mac (`PeriodFrames`) | 64 | 1.33 |
+| T_nm   | Mac netmanager     | One netjack cycle on the master side (≈ P_mac) | discovered | — |
+| T_mj   | Mac jackd cycle    | One JACK period on the Mac (equal to P_pi) | discovered | — |
 | T_d    | Daemon shm publish | memcpy + atomic release — nanoseconds, ignore | 0 | 0 |
-| T_jf   | HAL safety lead    | `JitterFrames` — returned from `kAudioDevicePropertySafetyOffset`; CoreAudio schedules the IOProc this many frames earlier in sampleTime so the daemon's write head naturally sits ahead of the HAL's read | 192 | 4.00 |
+| T_jf   | HAL safety lead    | Fixed `JitterFrames=0`, returned as `kAudioDevicePropertySafetyOffset` | 0 | 0 |
 | T_dac  | Codec DAC          | Fixed group delay through the IQaudIO DAC | ~1 | ~0.02 |
-| **Σ**  | **Monitoring trip** | Sum of all rows above                   | **915** | **19.1** |
+| **Σ**  | **Monitoring trip** | Sum of fixed and discovered contributions | **discovered** | **discovered** |
 
 The HAL splits the advertised total across two CoreAudio properties so
 the host can act on each correctly (SA_Device.cpp):
@@ -138,16 +135,16 @@ delta you get per unit of change.
 | Symbol | Knob | Where | Default | Impact on latency (frames per unit) |
 |--------|------|-------|---------|-------------------------------------|
 | G | netadapter ring size (`-g N`) | `jackbridge/pi/bin/jackbridge-pi-up:20` (deployed: `/usr/local/libexec/jackbridge/jackbridge-pi-up`) | `512` (was adaptive) | **0.5** — half a frame steady-state per ring frame; full frame in burst headroom |
-| P_pi | Pi JACK period (`-p N`) | `/etc/default/jack` (`JACK_PERIOD`), seeded by `pistomp-arch/files/pistomp.conf:28` | `64` | T_pj scales 1:1, T_alsa scales N_pi:1, T_l scales L:1 — **the largest knob** |
+| P_pi | Pi JACK period (`-p N`) | Pi image JACK configuration | discovered live from the Pi | T_pj scales 1:1, T_alsa scales N_pi:1 — **the largest knob** |
 | N_pi | ALSA periods (`-n N`) | `pistomp-arch/files/jackdrc:19` (hardcoded `-n 2`) | `2` | P_pi frames per period — biggest non-G one-shot saving if dropped to 1 (but risky) |
 | L | netadapter network latency (`-l N`, cycles, range 0–30) | `jackbridge/pi/bin/jackbridge-pi-up:20` (currently unset → default) | `2` (jack2 1.9.22, verified on-device) | P_pi frames per cycle |
-| P_mac | Mac JACK period (`PeriodFrames`) | `jackbridge/installer/config.plist:38` → `/Library/Application Support/JackBridge/config.plist` | `64` | T_mj scales 1:1; **must match P_pi or netJACK2 resampler chokes** |
-| J | HAL safety lead (`JitterFrames`) | `jackbridge/installer/config.plist:48` | `192` | 1:1 — surfaces as `kAudioDevicePropertySafetyOffset`, no slip-ring effect (single clock domain) |
-| f_s | Sample rate | `pistomp.conf:27` AND `jackbridge/installer/config.plist:31` | `48000` | All times are `frames / f_s`, so doubling f_s halves all ms costs but doubles CPU |
+| P_mac | Mac JACK period | coordinator runtime arguments | equal to discovered P_pi | Must equal P_pi or netJACK2 resampler chokes |
+| J | HAL safety lead (`JitterFrames`) | fixed runtime default in driver and daemon | `0` | 1:1 — surfaces as `kAudioDevicePropertySafetyOffset` |
+| f_s | Sample rate | discovered live from the Pi | `44100`, `48000`, or `96000` | All times are `frames / f_s` |
 | Q | netadapter resampler quality (`-q N`, **0 = lowest, 4 = highest**) | `jackbridge/pi/bin/jackbridge-pi-up:20` | `0` (we set it explicitly) | No latency impact — only CPU/fidelity |
-| MTU | netJACK MTU | `jackbridge/installer/config.plist:63` | `1500` | Affects T_wire only at jumbo-frame scale; only changes packet count, not buffer math |
-| RT prio | jackd realtime priority | Pi: hardcoded `-P 75` in `jackdrc:19`. Mac: `RealtimePriority` in `config.plist:54` | `75` both | No direct latency; affects jitter (variance), not mean |
-| Storm threshold | Auto-restart on xrun storm | `JACKBRIDGE_XRUN_THRESHOLD` env (read by `jackbridge-xrun-watcher`) | `50/s` | Recovers from degraded state; doesn't change steady-state latency |
+| MTU | netJACK MTU | Pi runtime | `1500` | Affects T_wire only at jumbo-frame scale |
+| RT prio | jackd realtime priority | Pi image / Mac launcher | `75` | No direct latency; affects jitter |
+| Storm threshold | Auto-restart on xrun storm | `JACKBRIDGE_XRUN_THRESHOLD` env | `50/s` | Recovers from degraded state |
 
 ### Knobs that DON'T affect latency
 
@@ -210,17 +207,13 @@ Pi CPU helps the netadapter cycle hit its budget under mod-host load.
 
 All Σ figures are **monitoring trip** (pi ADC → Mac → pi DAC).
 
-**Current defaults:**
-- `-g 512`, `-q 0`, `JACK_PERIOD=64`, `PeriodFrames=64`, `JitterFrames=192`.
-- Σ = **915 frames / 19.1 ms**. Advertised to DAW = `Latency (722) + SafetyOffset (JitterFrames=192) = 914`.
+**Current runtime behavior:**
+- Pi sample rate and period are discovered at startup; Mac JACK receives the same values.
+- Supported sample rates are 44100, 48000, and 96000 Hz.
+- `JitterFrames=0`; no persistent timing keys are stored in the home plist.
 
-**One more notch of shave (low-risk, JitterFrames-only):**
-- Same as above but `JitterFrames=128`.
-- Σ = **851 frames / 17.7 ms**. Observed max Mac bunch is ~157 frames, so 128 erodes the margin — fine on a quiet machine, risky under load.
-
-**"Sounds good every time," more latency:**
-- `-g 4096`, `JACK_PERIOD=128`, `PeriodFrames=128`, `JitterFrames=256`, `-q 0`.
-- Σ ≈ **3220 frames / 67 ms**. Storm-restart should never fire.
+Tune the Pi JACK period on the Pi itself. The next Mac startup probe follows
+that value; the settings editor does not expose a period control.
 
 **Diagnose where latency lives in YOUR setup:**
 - Send a known transient (handclap, click track) from DAW to pi headphones, record back.

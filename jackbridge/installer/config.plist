@@ -1,122 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-    JackBridge configuration.
-
-    Installed to /Library/Application Support/JackBridge/config.plist.
-    Both LaunchAgents WatchPaths this file: saving it restarts jackd and the
-    daemon so the new settings take effect. No reload command needed.
-
-    Values shown are the built-in defaults. Removing a key falls back to the
-    default; deleting the whole file is equivalent to all defaults.
--->
+<!-- Persistent user settings. Runtime timing is discovered from the Pi. -->
 <plist version="1.0">
 <dict>
-    <!-- Clock topology. Changes force a jackd restart. -->
-
-    <!-- CoreAudio UID of the device jackd binds as its backend. This device's
-         hardware sample clock paces the entire JackBridge pipeline (see
-         docs/architecture.md — single-clock-domain is load-bearing).
-
-         Empty (default) = auto-detect the Mac's built-in audio output via
-         the jb-detect-builtin helper. Set explicitly to override (e.g. on a
-         headless Mac mini with no built-in audio, or to clock off a stable
-         external interface like a UR22C). Enumerate UIDs with:
-             system_profiler SPAudioDataType
-         or check `jackd -d coreaudio -l` output. -->
+    <!-- Empty means automatic CoreAudio output-device selection. -->
     <key>ClockDeviceUID</key>
-    <string>BuiltInSpeakerDevice</string>
+    <string></string>
 
-    <key>SampleRate</key>
-    <integer>48000</integer>
-
-    <!-- Install prefix of the JACK2 the package was built against. Stamped
-         by build-pkg.sh from its $JACK_PREFIX (default /usr/local; arm64
-         Homebrew builds get /opt/homebrew), so jackd-launch, the route
-         helpers, and the Companion app all drive the same JACK2 rather than
-         each probing and possibly finding a different one.
-
-         Change this only if you moved JACK2 after installing — the daemon
-         links libjack from the build-time prefix, so a mismatch means the
-         CLI tools and the daemon disagree about which server is running.
-         A non-absolute value (an unstamped template) is ignored and the
-         readers fall back to probing /usr/local then /opt/homebrew. -->
-    <key>JackPrefix</key>
-    <string>@JACK_PREFIX@</string>
-
-    <!-- Hostname used by the Companion for Pi reachability, MOD-UI, SSH,
-         and diagnostics. Change this when the Pi uses a different mDNS or
-         DNS name. Missing or invalid values fall back to pistomp.local. -->
+    <!-- Management hostname used for Pi reachability, MOD-UI, SSH, and probes. -->
     <key>PiHostname</key>
     <string>pistomp.local</string>
 
-    <!-- Reported end-to-end latency is split in the HAL across two
-         CoreAudio properties: kAudioDevicePropertyLatency = 722
-         (BASE_LATENCY_FRAMES from docs/LATENCY-MODEL.md at the
-         documented pi-side defaults), and
-         kAudioDevicePropertySafetyOffset = JitterFrames. The DAW sums
-         them. No knob here. -->
-
-    <!-- jackd backend period in frames (`-p`). MUST match the Pi-side jackd
-         period — netJACK2's adaptive resampler chokes on cycle 1 with off-by-
-         one `WriteResample error` when periods differ, then thrashes. pi-stomp
-         ships /etc/jackdrc with `-p 64`. -->
-    <key>PeriodFrames</key>
-    <integer>64</integer>
-
-    <!-- Safety lead in frames. Returned by the HAL from
-         kAudioDevicePropertySafetyOffset: CoreAudio schedules the IOProc
-         that many frames earlier in sampleTime, so the daemon's write
-         head naturally sits JitterFrames ahead of the HAL's read head.
-         In practice, we do not need this; keep it at 0. -->
-    <key>JitterFrames</key>
-    <integer>0</integer>
-
-    <!-- jackd realtime priority. 75 is load-bearing per Spike B; lowering
-         this will cause xruns on any non-idle Mac. Exposed for debugging,
-         not tuning. -->
-    <key>RealtimePriority</key>
-    <integer>75</integer>
-
-    <!-- netJACK2 transport. Discovery is Pi-initiated multicast on the
-         default group (225.3.19.154); the Mac side only advertises. MTU
-         matters for jumbo-frame Ethernet — bump to 9000 only if both ends
-         and every switch in between support it. -->
-    <key>NetJack</key>
-    <dict>
-        <key>MTU</key>
-        <integer>1500</integer>
-    </dict>
-
-    <!-- Interface override for the netJACK2 multicast group pin.
-         Empty (default) = auto-detect (direct-cable 169.254.x preferred,
-         then any wired iface with carrier, then Wi-Fi as a last resort).
-         Set explicitly to e.g. `en7` to lock to a specific Thunderbolt
-         dongle. Enumerate with `networksetup -listallhardwareports`.
-         Editing this file kicks com.jackbridge.route, which re-pins. -->
+    <!-- Empty means automatic wired-interface detection. -->
     <key>NetworkInterface</key>
     <string></string>
-
-    <!-- Auto-wiring inside jackd once the daemon's JACK client is up.
-         ToNetmanager / FromNetmanager connect JackBridged's ports to the
-         netmanager client (i.e. send/receive over the network to the Pi).
-         LocalMonitoring additionally mirrors out_1/2 to system:playback_1/2
-         so DAW output is audible on the Mac's own device. -->
-    <key>AutoConnect</key>
-    <dict>
-        <key>ToNetmanager</key>
-        <true/>
-        <key>FromNetmanager</key>
-        <true/>
-        <key>LocalMonitoring</key>
-        <false/>
-    </dict>
-
-    <!-- Diagnostics -->
-    <key>Logging</key>
-    <dict>
-        <key>Level</key>
-        <string>info</string>
-    </dict>
 </dict>
 </plist>

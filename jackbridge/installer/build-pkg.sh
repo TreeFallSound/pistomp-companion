@@ -101,6 +101,9 @@ install -m 0755 "$INSTALLER/jackbridge-pin-route"     "$STAGING/Library/Applicat
 install -m 0755 "$INSTALLER/jackbridge-route-watcher" "$STAGING/Library/Application Support/JackBridge/jackbridge-route-watcher"
 install -m 0755 "$JACKBRIDGE/tools/jackbridge-ctl" "$STAGING/Library/Application Support/JackBridge/jackbridge-ctl"
 install -m 0755 "$INSTALLER/jackbridge-jackd"       "$STAGING/Library/Application Support/JackBridge/jackbridge-jackd"
+install -m 0755 "$INSTALLER/jackbridge-coordinator" "$STAGING/Library/Application Support/JackBridge/jackbridge-coordinator"
+printf '%s\n' "$JACK_PREFIX" > "$BUILD/jack-prefix"
+install -m 0644 "$BUILD/jack-prefix" "$STAGING/Library/Application Support/JackBridge/jack-prefix"
 install -m 0755 "$INSTALLER/jack-prefix.sh"        "$STAGING/Library/Application Support/JackBridge/jack-prefix.sh"
 # Stamp the prefix this package was built against into the shipped defaults.
 # Runtime readers (jackd-launch via jack-prefix.sh, the Companion via

@@ -34,7 +34,7 @@ LaunchAgents in `/Library/LaunchAgents/` are instantiated per-user-session. Each
 3. **Independent of whatever device the DAW selects** (no circular dependency).
 4. **Independent of what JackBridge presents** (no feedback loop — JackBridge as jackd's backend is the silence/runaway condition documented in `idiosyncrasies.md`).
 
-The built-in audio output meets all four on any Mac that has it. `jackd-launch` reads `ClockDeviceUID` from `/Library/Application Support/JackBridge/config.plist`; when empty, the `jb-detect-builtin` helper (installed alongside the daemon) enumerates CoreAudio devices, filters for transport-type `BuiltIn` with output streams, and prints the first match's UID. Headless Macs (Mac mini / Studio with no built-in codec) must set `ClockDeviceUID` explicitly — enumerate available UIDs with `system_profiler SPAudioDataType` or `jackd -d coreaudio -l`.
+The built-in audio output meets all four on any Mac that has it. `jackd-launch` reads `ClockDeviceUID` from the user's `~/Library/Application Support/JackBridge/config.plist`; when empty, the `jb-detect-builtin` helper (installed alongside the daemon) enumerates CoreAudio devices, filters for transport-type `BuiltIn` with output streams, and prints the first match's UID. Headless Macs (Mac mini / Studio with no built-in codec) set `ClockDeviceUID` in JackBridge Settings — enumerate UIDs with `system_profiler SPAudioDataType` or `jackd -d coreaudio -l`.
 
 We don't use a CoreAudio aggregate wrapper around the built-in: it would add a phantom "JackBridge Clock" device to every DAW's picker for no clock-stability gain (built-in UIDs are stable across reboots). UID-based lookup via `~:<uid>` is what bypasses Spike B's friendly-name-fallback bug; the indirection wasn't buying us that.
 
@@ -110,7 +110,7 @@ log stream --predicate 'subsystem == "com.jackbridge" && category == "jack"'
 jackbridge-ctl logs
 ```
 
-Typical fix: edit `/Library/Application Support/JackBridge/config.plist` to set a sane `ClockDeviceUID` (the daemon's `WatchPaths` triggers an immediate restart when you save). If you genuinely need to stop the loop without fixing config, `jackbridge-ctl stop`.
+Use JackBridge Settings to set `ClockDeviceUID`; changing settings atomically replaces the home plist and launchd restarts the existing agents. If the daemon refuses to start, inspect the coordinator and JACK logs. `jackbridge-ctl stop` disables the stack without changing settings.
 
 ## Codesigning + notarization
 

@@ -1,0 +1,157 @@
+#!/bin/sh
+# Resolve Pi timing and launch JACK with matching rate/period values.
+# This is deliberately argv-based: user configuration is never interpolated
+# into a shell command string.
+set -u
+
+SUPPORT="/Library/Application Support/JackBridge"
+CONFIG="${JACKBRIDGE_CONFIG_PATH:-${HOME:-/var/empty}/Library/Application Support/JackBridge/config.plist}"
+STATE="${JACKBRIDGE_RUNTIME_STATE_FILE:-${HOME:-/var/empty}/Library/Application Support/JackBridge/runtime-state}"
+PROBE_TIMEOUT="${JACKBRIDGE_PROBE_TIMEOUT:-5}"
+SSH="${JACKBRIDGE_SSH_PATH:-/usr/bin/ssh}"
+HW_PARAMS="/proc/asound/card0/pcm0p/sub0/hw_params"
+
+RATE=""
+PERIOD=""
+CLOCK_UID=""
+PROBE_ONLY=0
+
+usage() {
+    echo "usage: $0 [--rate integer] [--period integer] [--clock-device uid] [--probe-only]" >&2
+    exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --rate) [ "$#" -ge 2 ] || usage; RATE="$2"; shift 2 ;;
+        --period) [ "$#" -ge 2 ] || usage; PERIOD="$2"; shift 2 ;;
+        --clock-device) [ "$#" -ge 2 ] || usage; CLOCK_UID="$2"; shift 2 ;;
+        --probe-only) PROBE_ONLY=1; shift ;;
+        --) shift; [ "$#" -eq 0 ] || usage ;;
+        *) usage ;;
+    esac
+done
+
+valid_uint32() {
+    /usr/bin/awk -v n="$1" 'BEGIN {
+        if (n !~ /^[0-9]+$/ || n !~ /[^0]/ || n+0 <= 0 || n+0 > 4294967295) exit 1
+    }'
+}
+
+valid_rate() {
+    valid_uint32 "$1" || return 1
+    [ "$1" = 44100 ] || [ "$1" = 48000 ] || [ "$1" = 96000 ]
+}
+
+read_config() {
+    if [ -r "$CONFIG" ]; then
+        if [ -z "$CLOCK_UID" ]; then
+            CLOCK_UID=$(/usr/libexec/PlistBuddy -c "Print :ClockDeviceUID" "$CONFIG" 2>/dev/null || true)
+        fi
+    fi
+}
+
+read_state_value() {
+    /usr/bin/awk -F= -v key="$1" '$1 == key { print $2; exit }' "$STATE" 2>/dev/null || true
+}
+
+valid_state() {
+    [ -r "$STATE" ] || return 1
+    cached_rate=$(read_state_value rate)
+    cached_period=$(read_state_value period)
+    valid_rate "$cached_rate" && valid_uint32 "$cached_period"
+}
+
+save_state() {
+    dir=$(/usr/bin/dirname "$STATE")
+    /bin/mkdir -p "$dir" || return 1
+    /bin/chmod 700 "$dir" 2>/dev/null || true
+    old_umask=$(umask)
+    umask 077
+    tmp="${STATE}.$$"
+    {
+        printf 'rate=%s\n' "$1"
+        printf 'period=%s\n' "$2"
+        printf 'probed_at=%s\n' "$(/bin/date +%s)"
+    } > "$tmp" || { umask "$old_umask"; /bin/rm -f "$tmp"; return 1; }
+    umask "$old_umask"
+    /bin/chmod 600 "$tmp" || { /bin/rm -f "$tmp"; return 1; }
+    /bin/mv -f "$tmp" "$STATE"
+}
+
+probe() {
+    host=""
+    if [ -r "$CONFIG" ]; then
+        host=$(/usr/libexec/PlistBuddy -c "Print :PiHostname" "$CONFIG" 2>/dev/null || true)
+    fi
+    [ -n "$host" ] || host=pistomp.local
+    case "$host" in
+        *[!A-Za-z0-9._:%-]*) echo "coordinator: invalid PiHostname" >&2; return 1 ;;
+    esac
+    output=$("$SSH" -o BatchMode=yes -o "ConnectTimeout=$PROBE_TIMEOUT" \
+        -o ConnectionAttempts=1 "pistomp@$host" "cat $HW_PARAMS" 2>/dev/null) || return 1
+    echo "$output" | /usr/bin/awk '
+        BEGIN { rate=""; period=""; closed=0 }
+        /(^|[[:space:]])closed([[:space:]]|$)/ { closed=1 }
+        /^[[:space:]]*rate:/ { v=$2; if (v ~ /^[0-9]+$/) rate=v }
+        /^[[:space:]]*period_size:/ { v=$2; if (v ~ /^[0-9]+$/) period=v }
+        END {
+            if (!closed && rate != "" && period != "") print rate, period
+            else exit 1
+        }'
+}
+
+if [ "$PROBE_ONLY" -eq 1 ]; then
+    if values=$(probe); then
+        set -- $values
+        valid_rate "$1" && valid_uint32 "$2" || {
+            echo "coordinator: unsupported Pi timing rate=$1 period=$2" >&2; exit 1;
+        }
+        save_state "$1" "$2" || { echo "coordinator: cannot save runtime state" >&2; exit 1; }
+        echo "rate=$1 period=$2 source=live"
+        exit 0
+    fi
+    echo "coordinator: Pi timing probe unavailable" >&2
+    exit 1
+fi
+
+if [ -z "$RATE" ] || [ -z "$PERIOD" ]; then
+    if values=$(probe); then
+        set -- $values
+        RATE="$1"
+        PERIOD="$2"
+        if valid_rate "$RATE" && valid_uint32 "$PERIOD"; then
+            save_state "$RATE" "$PERIOD" || echo "coordinator: warning: cannot save runtime state" >&2
+            SOURCE=live
+        else
+            echo "coordinator: unsupported live timing rate=$RATE period=$PERIOD" >&2
+            exit 1
+        fi
+    elif valid_state; then
+        RATE=$(read_state_value rate)
+        PERIOD=$(read_state_value period)
+        SOURCE=cached
+        echo "coordinator: Pi probe unavailable; using stale cached timing rate=$RATE period=$PERIOD" >&2
+    else
+        echo "coordinator: no valid live or cached Pi timing; refusing to start JACK" >&2
+        exit 1
+    fi
+fi
+
+valid_rate "$RATE" || { echo "coordinator: invalid rate '$RATE'" >&2; exit 1; }
+valid_uint32 "$PERIOD" || { echo "coordinator: invalid period '$PERIOD'" >&2; exit 1; }
+
+if [ -n "$CLOCK_UID" ]; then
+    case "$CLOCK_UID" in *[!A-Za-z0-9._:%-]*) echo "coordinator: invalid clock device UID" >&2; exit 1 ;; esac
+fi
+
+read_config
+if [ -n "${JACKBRIDGE_COORDINATOR_OUTPUT:-}" ]; then
+    echo "rate=$RATE period=$PERIOD source=${SOURCE:-explicit} clock=${CLOCK_UID:-auto}"
+fi
+
+if [ -n "${JACKBRIDGE_COORDINATOR_SKIP_JACK:-}" ]; then
+    exit 0
+fi
+
+exec "$SUPPORT/jackd-launch" --launch-jack --rate "$RATE" --period "$PERIOD" --clock-device "$CLOCK_UID"

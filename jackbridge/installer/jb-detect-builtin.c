@@ -1,10 +1,9 @@
 // jb-detect-builtin — print the built-in output device's CoreAudio UID to
 // stdout, or exit non-zero with a stderr explanation.
 //
-// Used by installer/jackd-launch when config.plist's ClockDeviceUID is empty.
-// See PLAN.md §3.1 and docs/architecture.md for why jackd's CoreAudio backend
-// must be pinned to a single, stable clock device.
-//
+// Used by jackbridge-coordinator when the home settings leave the clock
+// device on automatic selection. The CoreAudio backend must be pinned to a
+// single, stable clock device; see docs/architecture.md.
 // Filter: kAudioDevicePropertyTransportType == kAudioDeviceTransportTypeBuiltIn
 // AND has at least one output stream. Excludes Bluetooth, USB, HDMI, virtual
 // devices (including, importantly, JackBridge itself).
@@ -102,7 +101,7 @@ int main(void) {
     free(devs);
     fprintf(stderr,
         "jb-detect-builtin: no built-in audio output device found.\n"
-        "Set ClockDeviceUID explicitly in /Library/Application Support/JackBridge/config.plist.\n"
+        "Set ClockDeviceUID in the JackBridge home settings.\n"
         "See docs/macos-setup.md for how to enumerate CoreAudio UIDs.\n");
     return 1;
 }
