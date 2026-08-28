@@ -1,7 +1,7 @@
 import Foundation
 
 /// Snapshot of the /JackBridge shm control region. Field offsets are the
-/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 7.
+/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 8.
 /// Every field is a plain aligned uint64_t (compile-time asserted on the
 /// C++ side), so a read of UInt64 at these offsets is exact.
 struct ShmSnapshot {
@@ -26,9 +26,24 @@ struct ShmSnapshot {
     /// latency model (see docs/LATENCY-MODEL.md).
     var jackPeriodFrames: UInt64 = 0
     var jackSampleRate: UInt64 = 0
+    /// Protocol-8 self-healing fields. See `JB_OFF_*` in `jackbridge/shared/JackBridge.h`.
+    /// How many of the daemon's 6 slave-facing ports currently have a live
+    /// connection. Drops to 0 the moment jackd reaps a departed pi.
+    var slavePortsConnected: UInt64 = 0
+    /// Monotonic daemon xrun count. Watch its *rate*: a fast ramp is netmanager
+    /// stalling ~2 s per cycle against a pi that is no longer there.
+    var daemonXRuns: UInt64 = 0
+    /// Driver fault bitfield. Bit 0 (`JB_FAULT_DEVICE_NOT_ALIVE`) = the DAW is
+    /// being fed bzero silence right now.
+    var driverFault: UInt64 = 0
+    /// Echo of the app's last re-anchor nonce (Phase 4).
+    var resyncRequest: UInt64 = 0
 
-    static let expectedProtocolVersion: UInt64 = 7
+    static let expectedProtocolVersion: UInt64 = 8
     static let driverStatusStarted: UInt64 = 2
+    /// Full complement of daemon slave ports (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS).
+    static let slavePortsFull: UInt64 = 6
+    static let faultDeviceNotAlive: UInt64 = 1 << 0
 }
 
 /// Read-only mapper of the /JackBridge POSIX shm region.
@@ -151,6 +166,10 @@ final class ShmReader {
         s.writeFrameNumber    = [field(0x188), field(0x198)]
         s.jackPeriodFrames    = field(0x1a0)
         s.jackSampleRate      = field(0x1a8)
+        s.slavePortsConnected = field(0x1b0)
+        s.daemonXRuns         = field(0x1b8)
+        s.driverFault         = field(0x1c0)
+        s.resyncRequest       = field(0x1c8)
         return s
     }
 }

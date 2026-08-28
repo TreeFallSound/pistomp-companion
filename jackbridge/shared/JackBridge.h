@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 7
+#define JACKBRIDGE_PROTOCOL_VERSION 8
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -87,6 +87,10 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x0198      :    Current Frame Number(coreAudio write, stream 1)
 // 0x01a0      :    JACK period frames the daemon observed (P, latency model)
 // 0x01a8      :    JACK sample rate the daemon observed (f_s, latency model)
+// 0x01b0      :    slave ports connected to a live peer (daemon, 0..6)
+// 0x01b8      :    daemon xrun counter (monotonic; today only reaches os_log)
+// 0x01c0      :    driver fault bitfield (driver; bit 0 = mDeviceIsAlive false)
+// 0x01c8      :    app -> driver re-anchor request (app increments; driver acts + echoes)
 // 0x0200      :    CoreAudio device name (daemon-published, NUL-terminated UTF-8)
 // 0x10000     : Upstream buffer #0 (Driver -> Application)
 // 0x18000     : Downstream buffer #0 (Application -> Driver)
@@ -125,6 +129,26 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // by the HAL at device open and again at StartIO.
 #define JB_OFF_JACK_PERIOD_FRAMES  (0x1a0)
 #define JB_OFF_JACK_SAMPLE_RATE    (0x1a8)
+
+// Self-healing / honest-status fields (protocol 8). See docs/idiosyncrasies.md.
+//   SLAVE_PORTS_CONNECTED  daemon: how many of its 6 slave ports are connected
+//                          to a live peer right now. 0 while a corpse client
+//                          still has ports registered but nothing services them.
+//   DAEMON_XRUNS           daemon: monotonic xrun count (mXRunCount), published
+//                          so the app can show "audio came back but is glitching"
+//                          without tailing os_log.
+//   DRIVER_FAULT           driver: bitfield. bit 0 = mDeviceIsAlive == false
+//                          (the DAW is being fed bzero silence right now).
+//   RESYNC_REQUEST         app -> driver: the app stores a nonce here; the
+//                          driver re-anchors in GetZeroTimeStamp and echoes the
+//                          nonce back so the app knows the request landed.
+#define JB_OFF_SLAVE_PORTS_CONNECTED (0x1b0)
+#define JB_OFF_DAEMON_XRUNS          (0x1b8)
+#define JB_OFF_DRIVER_FAULT          (0x1c0)
+#define JB_OFF_RESYNC_REQUEST        (0x1c8)
+
+// Bit definitions for JB_OFF_DRIVER_FAULT.
+#define JB_FAULT_DEVICE_NOT_ALIVE   (1u << 0)
 
 // Device display name the HAL reports via kAudioObjectPropertyName (derived
 // from PiHostname in config.plist). Bounded bytes plus a NUL, not a sync field.
@@ -241,7 +265,18 @@ static_assert(JB_OFF_JACK_PERIOD_FRAMES >= JB_OFF_END_FRAME_NUMBERS,
               "JACK timing fields overlap the per-stream frame counters");
 static_assert(JB_OFF_JACK_SAMPLE_RATE >= JB_OFF_JACK_PERIOD_FRAMES + 8,
               "JACK sample rate overlaps the JACK period field");
-static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_JACK_SAMPLE_RATE + 8,
+static_assert(JB_OFF_SLAVE_PORTS_CONNECTED >= JB_OFF_JACK_SAMPLE_RATE + 8,
+              "slave-ports-connected overlaps the JACK sample rate field");
+static_assert(JB_OFF_DAEMON_XRUNS   >= JB_OFF_SLAVE_PORTS_CONNECTED + 8 &&
+              JB_OFF_DRIVER_FAULT    >= JB_OFF_DAEMON_XRUNS + 8 &&
+              JB_OFF_RESYNC_REQUEST  >= JB_OFF_DRIVER_FAULT + 8,
+              "protocol-8 self-healing fields overlap");
+static_assert((JB_OFF_SLAVE_PORTS_CONNECTED % 8) == 0 &&
+              (JB_OFF_DAEMON_XRUNS % 8) == 0 &&
+              (JB_OFF_DRIVER_FAULT % 8) == 0 &&
+              (JB_OFF_RESYNC_REQUEST % 8) == 0,
+              "protocol-8 atomic<uint64_t> fields must be 8-byte aligned");
+static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_RESYNC_REQUEST + 8,
               "device name overlaps the control atomics");
 static_assert(JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX <= STRBUF_U0,
               "device name runs into the first ring buffer");
@@ -288,6 +323,11 @@ protected:
     // Daemon-observed JACK timing, consumed by the HAL's latency model.
     std::atomic<uint64_t> *shmJackPeriodFrames;
     std::atomic<uint64_t> *shmJackSampleRate;
+    // Protocol-8 self-healing fields. See the JB_OFF_* comments above.
+    std::atomic<uint64_t> *shmSlavePortsConnected; // daemon writes
+    std::atomic<uint64_t> *shmDaemonXRuns;         // daemon writes
+    std::atomic<uint64_t> *shmDriverFault;         // driver writes
+    std::atomic<uint64_t> *shmResyncRequest;       // app writes, driver echoes
     std::atomic<uint64_t> *shmReadFrameNumber[MAX_STREAMS];
     std::atomic<uint64_t> *shmWriteFrameNumber[MAX_STREAMS];
 
@@ -369,6 +409,10 @@ protected:
         shmDeviceName          = reinterpret_cast<char(*)[JB_DEVICE_NAME_MAX]>(shm_base+JB_OFF_DEVICE_NAME);
         shmJackPeriodFrames    = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_JACK_PERIOD_FRAMES);
         shmJackSampleRate      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_JACK_SAMPLE_RATE);
+        shmSlavePortsConnected = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_SLAVE_PORTS_CONNECTED);
+        shmDaemonXRuns         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DAEMON_XRUNS);
+        shmDriverFault         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DRIVER_FAULT);
+        shmResyncRequest       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_RESYNC_REQUEST);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

@@ -12,11 +12,27 @@ import Foundation
 final class StatusMonitor {
     enum Health: Equatable {
         case protocolMismatch(UInt64)     // shm protocolVersion != expectedProtocolVersion
-        case streaming(UInt64, UInt64)    // sampleRate, nFrames — audio flowing
+        case noAudioFromPi                // DAW pulling the device, but nothing is arriving from the pi
+        case streaming(UInt64, UInt64)    // sampleRate, nFrames — audio flowing, pi confirmed live
         case startedIdle                  // driverStatus == STARTED but HAL head not advancing
         case linkedIdle                   // ports wired, driverStatus != STARTED
         case piUnreachable                // normal state when cable is out
         case stackDown                    // shm absent, or no daemon heartbeat
+
+        /// Stable identity for "has the situation changed", ignoring the
+        /// sampleRate/nFrames payload on `.streaming` and the version on
+        /// `.protocolMismatch`. Drives `State.healthSince`.
+        var category: Int {
+            switch self {
+            case .protocolMismatch: return 0
+            case .noAudioFromPi:    return 1
+            case .streaming:        return 2
+            case .startedIdle:      return 3
+            case .linkedIdle:       return 4
+            case .piUnreachable:    return 5
+            case .stackDown:        return 6
+            }
+        }
     }
 
     enum JackCondition: Equatable {
@@ -34,6 +50,10 @@ final class StatusMonitor {
     /// need. Value type on purpose: publishing is a copy, not a reference.
     struct State {
         var health: Health = .stackDown
+        /// When `health.category` last changed. Lets the UI (and diagnostics)
+        /// tell 2 s of startup churn from 20 minutes of silent death — there is
+        /// no other duration awareness on the Mac side.
+        var healthSince = Date()
         var detailLine = ""
         var jackCondition: JackCondition = .none
         var piReachable = false
@@ -67,6 +87,15 @@ final class StatusMonitor {
     private var lastReadHead: UInt64 = 0
     private var readHeadAdvancing = false
     private var lastSeed: UInt64 = 0
+    // Daemon xrun rate. netmanager stalling ~2 s per cycle against a departed
+    // pi produces a steady drip of xruns; healthy operation produces none. We
+    // count consecutive 200 ms polls in which the monotonic counter climbed —
+    // one stray xrun never trips it, a second of continuous xruns does.
+    private var lastDaemonXRuns: UInt64 = 0
+    private var xrunPollStreak = 0
+    private var xrunsPathological = false
+    /// Consecutive climbing polls (~1 s) before we call the xrun rate pathological.
+    private static let xrunStreakThreshold = 5
     /// False until we have two consecutive polls off the *same* mapping.
     /// A delta against a zeroed baseline is not evidence of motion — it's
     /// what the first poll after an attach or a remap always looks like.
@@ -137,13 +166,21 @@ final class StatusMonitor {
             // decrease means the region or the daemon behind it was replaced.
             // The old baseline describes something that no longer exists —
             // keep the jump from reading as motion for one poll.
-            if snap.daemonAlive < lastDaemonAlive || snap.halInputReadHead < lastReadHead {
+            if snap.daemonAlive < lastDaemonAlive || snap.halInputReadHead < lastReadHead
+                || snap.daemonXRuns < lastDaemonXRuns {
                 haveBaseline = false
             }
             daemonBeating = haveBaseline && snap.daemonAlive != lastDaemonAlive
             readHeadAdvancing = haveBaseline && snap.halInputReadHead != lastReadHead
+            if haveBaseline && snap.daemonXRuns > lastDaemonXRuns {
+                xrunPollStreak += 1
+            } else {
+                xrunPollStreak = 0
+            }
+            xrunsPathological = xrunPollStreak >= Self.xrunStreakThreshold
             lastDaemonAlive = snap.daemonAlive
             lastReadHead = snap.halInputReadHead
+            lastDaemonXRuns = snap.daemonXRuns
             // Seed churn (HAL re-anchor) noted for diagnostics; not surfaced yet.
             _ = snap.seed != lastSeed
             lastSeed = snap.seed
@@ -155,8 +192,11 @@ final class StatusMonitor {
             haveBaseline = false
             daemonBeating = false
             readHeadAdvancing = false
+            xrunPollStreak = 0
+            xrunsPathological = false
             lastDaemonAlive = 0
             lastReadHead = 0
+            lastDaemonXRuns = 0
             lastSeed = 0
         }
 
@@ -208,6 +248,19 @@ final class StatusMonitor {
         dispatchPrecondition(condition: .onQueue(stateQueue))
         let snap = state.snapshot
 
+        // Is audio actually coming back from the pi right now? Three
+        // independent signals, all of which must agree:
+        //  - every slave port is connected to a live peer (drops to 0 the
+        //    instant jackd reaps a departed pi);
+        //  - the driver is not feeding the DAW bzero silence (fault bit 0);
+        //  - netmanager is not stalling cycle after cycle (xrun rate sane).
+        // `halInputReadHead` — the old sole basis for "streaming" — says only
+        // that a *DAW* is pulling the device. It is deliberately not in this list.
+        let piAudioLive =
+            snap.slavePortsConnected >= ShmSnapshot.slavePortsFull &&
+            (snap.driverFault & ShmSnapshot.faultDeviceNotAlive) == 0 &&
+            !xrunsPathological
+
         let health: Health
         if state.shmAttached, snap.protocolVersion != 0,
            snap.protocolVersion != ShmSnapshot.expectedProtocolVersion {
@@ -218,14 +271,24 @@ final class StatusMonitor {
             // cry red — red is reserved for the protocol mismatch, which
             // actually requires user action.
             health = .stackDown
-        } else if readHeadAdvancing {
-            health = .streaming(snap.halSampleRate, snap.halNFrames)
         } else if snap.driverStatus == ShmSnapshot.driverStatusStarted {
-            health = .startedIdle
+            // A DAW has the device open. This is the only state in which
+            // "streaming" is ever claimed, and it is claimed only with pi-side
+            // evidence — never on `halInputReadHead` alone.
+            if !piAudioLive {
+                health = .noAudioFromPi
+            } else if readHeadAdvancing {
+                health = .streaming(snap.halSampleRate, snap.halNFrames)
+            } else {
+                health = .startedIdle
+            }
         } else if state.piWired {
             health = .linkedIdle
         } else {
             health = .piUnreachable
+        }
+        if health.category != state.health.category {
+            state.healthSince = Date()
         }
         state.health = health
         state.detailLine = detailLine(for: health)
@@ -245,19 +308,34 @@ final class StatusMonitor {
         case .none:
             break
         }
+        // Each string names the single action that fixes the situation, not
+        // just the symptom — the musician should never have to know what a
+        // CoreAudio device switch does.
         switch h {
         case .protocolMismatch(let v):
-            return "Reinstall required — shm protocol \(v) != \(ShmSnapshot.expectedProtocolVersion)"
+            return "Reinstall required — shm protocol \(v) ≠ \(ShmSnapshot.expectedProtocolVersion)"
+        case .noAudioFromPi:
+            let secs = Int(Date().timeIntervalSince(state.healthSince))
+            if secs < 8 {
+                // Could still be startup or a brief reload — say what's happening.
+                return "Waiting for audio from pi-Stomp…"
+            }
+            let cause = state.piReachable
+                ? "pi-Stomp is on Wi-Fi but not sending audio"
+                : "pi-Stomp stopped sending audio"
+            return "\(cause) — turn Ethernet Audio off and on again on the pedal, or check the cable"
         case .streaming(let rate, let nframes):
             return "Streaming — \(rate / 1000) kHz / \(nframes) frames"
         case .startedIdle:
-            return "IO started, idle"
+            return "Ready — no app is using the pi-Stomp device yet"
         case .linkedIdle:
-            return "Linked, idle"
+            return "Linked to pi-Stomp — start playback in your app"
         case .piUnreachable:
-            return state.piReachable ? "pi-Stomp reachable, not in JACK graph" : "pi-Stomp not found"
+            return state.piReachable
+                ? "pi-Stomp reachable over Wi-Fi but not on the audio cable — check the Ethernet connection"
+                : "pi-Stomp not found — check it is powered on and cabled"
         case .stackDown:
-            return "JackBridge stack down"
+            return "JackBridge is not running — use Start JackBridge"
         }
     }
 }

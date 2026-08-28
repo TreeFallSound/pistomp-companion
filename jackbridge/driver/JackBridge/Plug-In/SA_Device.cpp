@@ -1477,6 +1477,7 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
         mLastDaemonAliveHostTime = now;
         if (!mDeviceIsAlive.load(std::memory_order_acquire)) {
             mDeviceIsAlive.store(true, std::memory_order_release);
+            shmDriverFault->store(0, std::memory_order_release);
             JB_LOG_INFO(jb_log_driver(),
                 "daemon heartbeat resumed - flipping DeviceIsAlive=1");
             AudioObjectPropertyAddress addr = {
@@ -1505,6 +1506,7 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
         UInt64 threshold = (UInt64)(5.0 * theHostTicksPerRingBuffer);
         if (now - mLastDaemonAliveHostTime > threshold) {
             mDeviceIsAlive.store(false, std::memory_order_release);
+            shmDriverFault->store(JB_FAULT_DEVICE_NOT_ALIVE, std::memory_order_release);
             JB_LOG_ERR(jb_log_driver(),
                 "daemon heartbeat stalled >%llu host ticks - flipping DeviceIsAlive=0",
                 (unsigned long long)threshold);
@@ -1811,6 +1813,10 @@ void	SA_Device::_HW_Open()
 
     shmSeed->store(1, std::memory_order_relaxed);
     shmSyncMode->store(0, std::memory_order_relaxed);
+    // Protocol-8 fault word — start clean. Bit 0 is raised only when the
+    // daemon-heartbeat watchdog flips mDeviceIsAlive=0 (see GetZeroTimeStamp),
+    // i.e. when the DAW is actively being fed bzero silence.
+    shmDriverFault->store(0, std::memory_order_release);
     mDriverStatus = JB_DRV_STATUS_ACTIVE;
     shmDriverStatus->store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     mRingBufferFrameSize = STRBUFNUM / 2;
@@ -1869,6 +1875,7 @@ kern_return_t	SA_Device::_HW_StartIO()
     mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
     mLastDaemonAliveHostTime = mach_absolute_time();
     mDeviceIsAlive.store(true, std::memory_order_release);
+    shmDriverFault->store(0, std::memory_order_release);
 
     // The Pi's period and sample rate are discovered at startup and can change
     // across a daemon restart, so re-derive the advertised latency here rather

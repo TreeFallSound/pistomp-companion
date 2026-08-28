@@ -163,6 +163,11 @@ public:
         shmJackPeriodFrames->store((uint64_t)BufSize, std::memory_order_relaxed);
         shmJackSampleRate->store((uint64_t)SampleRate, std::memory_order_release);
 
+        // Protocol-8 self-healing fields the daemon owns. Start from a known
+        // zero so the app never reads a stale count out of a reused region.
+        shmSlavePortsConnected->store(0, std::memory_order_relaxed);
+        shmDaemonXRuns->store(0, std::memory_order_release);
+
         config_audio_ports();
 #ifdef _WITH_MIDI_BRIDGE_
         create_midi_ports(name, num_Min, num_Mout);
@@ -176,6 +181,14 @@ public:
         // and re-run auto_wire() so connections survive netmanager reloads or
         // pi restarts.
         jack_set_port_registration_callback(client, _port_registration_callback, this);
+
+        // Departure handling. A slave that goes away — cleanly or by a yanked
+        // cable — surfaces here as a port disconnect or deregistration. We
+        // re-run the wiring pass (harmless if nothing changed) and, more
+        // importantly, recount how many of our slave ports still have a live
+        // connection so the app can tell "streaming" from "feeding the DAW
+        // silence against a corpse".
+        jack_set_port_connect_callback(client, _port_connect_callback, this);
 
         lastTraceFrame = 0;
 
@@ -405,6 +418,11 @@ public:
     // per event.
     int xrun_callback() override {
         mXRunCount.fetch_add(1, std::memory_order_relaxed);
+        // Monotonic mirror for the app. mXRunCount is drained every 5s by
+        // check_progress(), so it can't be published directly. This one only
+        // ever climbs; the app watches its *rate* — a fast ramp is netmanager
+        // stalling ~2s per cycle against a dead pi, i.e. "no audio from pi".
+        shmDaemonXRuns->fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
 
@@ -440,20 +458,55 @@ public:
     }
 
     static void _port_registration_callback(jack_port_id_t port_id, int registered, void* arg) {
-        // Only react to port appearances, not departures — we don't need to
-        // disconnect anything when a slave goes away (jackd handles that).
-        if (!registered) return;
         JackBridge* self = (JackBridge*)arg;
         jack_port_t* port = jack_port_by_id(self->client, port_id);
-        if (!port) return;
+        if (!port) {
+            // A deregistration can race the lookup. Still nudge the main
+            // thread so it recounts live connections.
+            self->mark_wire_dirty();
+            return;
+        }
         const char* shortname = jack_port_short_name(port);
         if (!shortname) return;
         if (strncmp(shortname, "from_slave_", 11) == 0 ||
             strncmp(shortname, "to_slave_", 9)   == 0) {
-            // Defer to main thread — jack_connect is illegal from here.
-            g_wire_dirty.store(true, std::memory_order_release);
-            pthread_kill(g_main_thread, SIGUSR1);
+            // React to departures too now: on a deregistration the main thread
+            // re-runs auto_wire (a no-op) and, crucially, recounts how many of
+            // our slave ports still carry a live connection. jack_connect and
+            // jack_port_connected are both illegal from a notification thread,
+            // so defer via SIGUSR1.
+            (void)registered;
+            self->mark_wire_dirty();
         }
+    }
+
+    static void _port_connect_callback(jack_port_id_t a, jack_port_id_t b,
+                                       int connect, void* arg) {
+        (void)a; (void)b; (void)connect;
+        // Any connect/disconnect anywhere in the graph is cheap to respond to:
+        // just recount our own ports on the main thread.
+        ((JackBridge*)arg)->mark_wire_dirty();
+    }
+
+    void mark_wire_dirty() {
+        g_wire_dirty.store(true, std::memory_order_release);
+        pthread_kill(g_main_thread, SIGUSR1);
+    }
+
+    // Recount how many of our slave-facing ports currently have at least one
+    // connection, and publish the total (0..NUM_INPUT_CHANNELS+NUM_OUTPUT_CHANNELS)
+    // into shm. Main thread only — jack_port_connected is not RT-safe.
+    //
+    // This is a structural signal: it drops to 0 the moment jackd reaps a
+    // departed slave's ports. The fork's reaping fixes (Phase 2) are what make
+    // that reap prompt; until then the app leans on the xrun rate.
+    void publish_slave_health() {
+        int connected = 0;
+        for (int i = 0; i < nAudioIn; i++)
+            if (audioIn[i] && jack_port_connected(audioIn[i]) > 0) connected++;
+        for (int i = 0; i < nAudioOut; i++)
+            if (audioOut[i] && jack_port_connected(audioOut[i]) > 0) connected++;
+        shmSlavePortsConnected->store((uint64_t)connected, std::memory_order_release);
     }
 
 private:
@@ -814,6 +867,7 @@ main(int argc, char** argv)
     // After activation, pick up any slave ports that registered before us.
     // Slaves that connect later are picked up by the port-registration callback.
     jackBridge[0]->auto_wire();
+    jackBridge[0]->publish_slave_health();
 
     // Event loop. SIGUSR1 = slave ports changed, run auto_wire on the main
     // thread (legal context for jack_connect). SIGINT/SIGTERM = teardown.
@@ -823,6 +877,7 @@ main(int argc, char** argv)
         if (sig == SIGUSR1) {
             if (g_wire_dirty.exchange(false, std::memory_order_acq_rel)) {
                 jackBridge[0]->auto_wire();
+                jackBridge[0]->publish_slave_health();
             }
             continue;
         }

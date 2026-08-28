@@ -142,6 +142,20 @@ and `StatusMonitor` additionally treats a *decrease* in `daemonAlive` or
 one region lives, so a drop means the region or the daemon behind it was
 replaced and the previous heartbeat baseline is meaningless.
 
+### "Streaming" requires pi-side evidence, never `halInputReadHead` alone
+`halInputReadHead` is written by the HAL IO proc whenever *any* DAW pulls the
+device (`SA_Device.cpp`), so on its own it says nothing about the pi. Before
+protocol 8 that was the sole basis for the solid-green "Streaming" state, which
+meant a dead `pistomp` client with ports still registered — cable out, pedal
+stopped, netmanager stalling ~2 s per 2.67 ms cycle — showed solid green with
+audible silence. `StatusMonitor.recompute()` now claims `.streaming` only when
+all three protocol-8 signals agree: `slavePortsConnected == 6` (drops to 0 the
+instant jackd reaps a departed pi), `driverFault` bit 0 clear (the driver is
+not feeding the DAW `bzero`), and the `daemonXRuns` rate is sane (not a steady
+netmanager stall). Otherwise it reports `.noAudioFromPi`, whose detail line
+names the fix. Each health state also carries `healthSince` so the UI can tell
+a few seconds of startup from twenty minutes of silent death.
+
 ### `StatusMonitor.State` is owned by one queue and published by copy
 The shm poll, the attach retry, the `jack_lsp` poll, and the reachability
 probe all funnel through `StatusMonitor`'s serial `stateQueue`; the UI never

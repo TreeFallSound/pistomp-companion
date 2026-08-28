@@ -96,6 +96,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         switch state.health {
         case .protocolMismatch:
             badge = .red
+        case .noAudioFromPi:
+            badge = .amber
         case .streaming:
             badge = .solidGreen
         case .startedIdle, .linkedIdle:
