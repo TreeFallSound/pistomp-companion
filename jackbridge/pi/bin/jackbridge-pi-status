@@ -1,49 +1,19 @@
 #!/usr/bin/env bash
-# jackbridge-pi-status — parseable, read-only truth about the JackBridge
-# netadapter slave on the pi.
+# jackbridge-pi-status — read-only status of the JackBridge netadapter slave.
 #
-# Single source of truth for "is the recording link actually wired" for both
-# the Mac (`jackbridge-ctl pi-status`, which shell-scripts this over ssh) and
-# the pi LCD UI (modalapi/ethernet/manager.py reads it instead of the old
-# `systemctl is-active`, whose MAINPID lied about netadapter).
+# Consumed by the Mac (`jackbridge-ctl pi-status` over ssh) and the pi LCD UI
+# (modalapi/ethernet/manager.py), replacing `systemctl is-active` — its
+# MAINPID does not track netadapter, which jack_load runs in-process.
 #
-# Output: key=value, one per line, exit 0 always.
-#
-# Keys (always emitted):
-#   service       systemd state of pi-stomp-jackbridge (active/failed/inactive/#
-# Single source of truth for "is the recording link actually wired" for both
-# the Mac (`jackbridge-ctl pi-status`, which shell-scripts this over ssh) and
-# the pi LCD UI (modalapi/ethernet/manager.py reads it instead of the old
-# `systemctl is-active`, whose MAINPID lied about netadapter).
-#
-# Output: key=value, one per line, exit 0 always. Consumers parse with any
-# key=value mechanism — no shell source, no JSON.
-#
-# Keys (all always emitted):
-#   service       systemd active state of pi-stomp-jackbridge
-#                 (active, failed, inactive, activating, …; "unknown" if systemctl errored)
-#   netadapters   count of jackd clients named netadapter or netadapter-NN;
-#                 >1 means duplicates are fighting (0 or 1 is healthy)
-#   ports_wired   # of netadapter ports that currently have >=1 connection
-#                 (jack_lsp -c "connected to" lines under a netadapter:* header)
-#   route         iface the multicast group 225.3.19.154 routes out of
-#                 ("" if no route); the fork also pins it in-socket, so this is
-#                 the kernel-route view for the plan's Wi-Fi-escape scenario
+# Output: key=value, one per line, always exit 0. Keys, all always emitted:
+#   service       systemd state (active/failed/inactive/…; unknown on error)
+#   netadapters   count of netadapter[-NN] jackd clients; >1 means duplicates
+#   ports_wired   netadapter ports with >=1 connection
+#   route         iface the 225.3.19.154 multicast group routes out of ("" if none)
 #   iface         iface the ExecStartPre pin chose ("" if /run state absent)
-#   xruns_1m      ringbuffer xruns in the last 60 seconds (from xrun-watcher file)
-#   xruns_5m      last 300 seconds
-#   xruns_15m     last 900 seconds
-#)
-#   netadapters   # of jackd clients named netadapter or netadapter-NN; >1 means
-#                 duplicates are fighting over the same stream
-#   ports_wired   # of netadapter ports with >=1 connection (jack_lsp -c
-#                 "connected to:" lines under a netadapter:* header)
-#   route         iface the multicast group 225.3.19.154 routes out of ("" if
-#                 unpinned) — kernel-route view for the Wi-Fi-escape scenario
-#   iface         iface the ExecStartPre pin chose ("" if /run state absent)
-#   xruns_1m/5m/15m  ringbuffer xruns in the last 60/300/900 s
+#   xruns_1m/5m/15m   ringbuffer xruns in the last 60/300/900 s
 #
-# No sudo, no writes, no restarts — read-only by construction.
+# No sudo, no writes, no restarts.
 
 set -u
 
