@@ -174,6 +174,35 @@ The fork's `build-macos-pkg.sh` installs to `/usr/local` as
 `libjack.{dylib,0.1.0.dylib}`. The daemon (`JackBridged`) links there (see
 `otool -L`). The HAL driver does not — it is pure CoreAudio.
 
+#### Verifying the installed fork — `just jack-verify`
+
+**Never judge what is installed by file timestamps, and never compare a
+binary's mtime against a git commit date.** You build before you commit, so
+an artifact that is *older* than the commit is the normal, correct case. This
+reasoning produced a confidently wrong "the rebuild never landed" diagnosis
+that sent a working machine chasing a non-existent install problem.
+
+Check for the code itself instead:
+
+```sh
+just jack-verify     # marker strings + mtimes for the artifacts that matter
+```
+
+netJACK2 lives in jackd's **loadable internal clients**, not in `jackd` and
+not (for the master) in `libjackserver`. Grepping the wrong file is the
+second half of the same mistake:
+
+| Artifact | Source | Carries |
+|----------|--------|---------|
+| `/usr/local/lib/jack/netmanager.so` | `common/JackNetManager.cpp` | **master**: egress pin, ifindex latch, master dedupe/reaping |
+| `/usr/local/lib/jack/netadapter.so` | `common/JackNetAdapter.cpp` | **slave**: reads `JACK_NETJACK_MULTICAST_IF` (runs on the pi, not the Mac) |
+| `libjackserver.dylib`, `libjacknet.dylib` | `posix/JackNetUnixSocket.cpp` | socket layer: `SetMulticastIF`, `JoinMCastGroup` |
+| `/usr/local/bin/jackd` | — | none of it. Its date proves nothing. |
+
+With `JACK_NETJACK_MULTICAST_IF` set (jackd-launch always sets it), the master
+pin takes the env branch and logs **nothing** on success — it logs only on
+failure. Silence in the log is the healthy case, not evidence of no pin.
+
 To install the fork on this machine from a side-by-side clone:
 
 ```sh
@@ -233,6 +262,40 @@ Why the clock-domain rule holds: `docs/CLOCK_WARS.md` and `docs/architecture.md`
 
 ---
 
+## 4b. Who is asking — recovery has two audiences
+
+Every recovery path in this repo exists at two altitudes, and answering at
+the wrong one is worse than useless. Decide which question is being asked
+before answering it.
+
+**"What does a user do?"** — the answer is the menu bar, and nothing else.
+End users have a cable, a pedal, and the Companion's menu. They do not have
+a terminal, do not have `just`, do not have ssh to the pi, and have never
+heard of netmanager, jackd, or shm. The only recovery verbs that exist for
+them are:
+
+| Symptom | User action |
+|---------|-------------|
+| Ports don't come back after a replug | Nothing — it should self-heal. Wait ~10 s. |
+| Still not green | **Repair Audio Link** (light; no restart, no dropout) |
+| Still not green | **Full Repair (restarts audio)** — also restarts the pi slave |
+| DAW silent after any of the above | Re-select the device in the DAW |
+
+That last row is currently unavoidable: a stack bounce flips
+`DeviceIsAlive` → 0, and a host that released the device does not re-acquire
+it. Everything else in that table is a bug if a user ever has to do it after
+a plain cable replug — the fork's self-healing is supposed to cover exactly
+that. Fix it; do not write it up as a workaround.
+
+**"What do I run to debug this?"** — that is the maintainer altitude:
+`just`, `jackbridge-ctl`, ssh, the logs. Use it freely *here*, and never in
+an answer about what a user should do.
+
+Never name an internal shell function (`pi_service`, `bootstrap_agent`,
+`wired_iface`) as though it were a thing anyone can invoke. They are private
+to their scripts. `jackbridge-ctl` subcommands and `just` recipes are real
+commands; the functions inside them are not.
+
 ## 5. Logging and diagnostics
 
 Both engine targets log through `jackbridge/shared/jb_log.hpp` → `os_log`,
@@ -285,3 +348,4 @@ Read these when you touch the matching area, not before:
 | The jack2 fork | `docs/vendor-jack2.md` |
 | Shipping a release | `docs/releases.md` |
 | Walkthrough of the source tree | `docs/codebase-tour.md` |
+| Daemon surviving a jackd restart (plan) | `docs/plan-b-daemon-survives-jackd.md` |

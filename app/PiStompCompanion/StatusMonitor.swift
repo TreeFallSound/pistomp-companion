@@ -84,8 +84,15 @@ final class StatusMonitor {
     // still discriminates a stall. All stateQueue-owned.
     private var lastDaemonAlive: UInt64 = 0
     private var daemonBeating = false
+    // The DAW-is-pulling-the-device signal. Both HAL heads are tracked, and
+    // either one moving counts. Input alone is not enough: the driver publishes
+    // `inIOCycleInfo.mInputTime.mSampleTime`, which CoreAudio leaves at 0 for a
+    // host that is not pulling input, so a playback/monitor session in REAPER
+    // sat at halInputReadHead == 0 forever and could never reach `.streaming`.
+    // The badge was stuck on hollow green with audio audibly playing.
     private var lastReadHead: UInt64 = 0
-    private var readHeadAdvancing = false
+    private var lastWriteHead: UInt64 = 0
+    private var ioHeadsAdvancing = false
     private var lastSeed: UInt64 = 0
     // Daemon xrun rate. netmanager stalling ~2 s per cycle against a departed
     // pi produces a steady drip of xruns; healthy operation produces none. We
@@ -167,11 +174,14 @@ final class StatusMonitor {
             // The old baseline describes something that no longer exists —
             // keep the jump from reading as motion for one poll.
             if snap.daemonAlive < lastDaemonAlive || snap.halInputReadHead < lastReadHead
+                || snap.halOutputWriteHead < lastWriteHead
                 || snap.daemonXRuns < lastDaemonXRuns {
                 haveBaseline = false
             }
             daemonBeating = haveBaseline && snap.daemonAlive != lastDaemonAlive
-            readHeadAdvancing = haveBaseline && snap.halInputReadHead != lastReadHead
+            ioHeadsAdvancing = haveBaseline
+                && (snap.halInputReadHead != lastReadHead
+                    || snap.halOutputWriteHead != lastWriteHead)
             if haveBaseline && snap.daemonXRuns > lastDaemonXRuns {
                 xrunPollStreak += 1
             } else {
@@ -180,6 +190,7 @@ final class StatusMonitor {
             xrunsPathological = xrunPollStreak >= Self.xrunStreakThreshold
             lastDaemonAlive = snap.daemonAlive
             lastReadHead = snap.halInputReadHead
+            lastWriteHead = snap.halOutputWriteHead
             lastDaemonXRuns = snap.daemonXRuns
             // Seed churn (HAL re-anchor) noted for diagnostics; not surfaced yet.
             _ = snap.seed != lastSeed
@@ -191,11 +202,12 @@ final class StatusMonitor {
             state.snapshot = ShmSnapshot()
             haveBaseline = false
             daemonBeating = false
-            readHeadAdvancing = false
+            ioHeadsAdvancing = false
             xrunPollStreak = 0
             xrunsPathological = false
             lastDaemonAlive = 0
             lastReadHead = 0
+            lastWriteHead = 0
             lastDaemonXRuns = 0
             lastSeed = 0
         }
@@ -254,8 +266,8 @@ final class StatusMonitor {
         //    instant jackd reaps a departed pi);
         //  - the driver is not feeding the DAW bzero silence (fault bit 0);
         //  - netmanager is not stalling cycle after cycle (xrun rate sane).
-        // `halInputReadHead` — the old sole basis for "streaming" — says only
-        // that a *DAW* is pulling the device. It is deliberately not in this list.
+        // The HAL heads — the old sole basis for "streaming" — say only that a
+        // *DAW* is pulling the device. They are deliberately not in this list.
         let piAudioLive =
             snap.slavePortsConnected >= ShmSnapshot.slavePortsFull &&
             (snap.driverFault & ShmSnapshot.faultDeviceNotAlive) == 0 &&
@@ -277,7 +289,7 @@ final class StatusMonitor {
             // evidence — never on `halInputReadHead` alone.
             if !piAudioLive {
                 health = .noAudioFromPi
-            } else if readHeadAdvancing {
+            } else if ioHeadsAdvancing {
                 health = .streaming(snap.halSampleRate, snap.halNFrames)
             } else {
                 health = .startedIdle

@@ -31,7 +31,10 @@ active=$(systemctl is-active pi-stomp-jackbridge.service 2>/dev/null)
 [ -n "$active" ] || active=unknown
 
 # One jack_lsp snapshot, one awk pass. Header lines are "<client>:<port>" at
-# column 0; connection lines are indented "connected to: <peer>". Track
+# column 0; connection lines are the indented peer name itself -- jack_lsp -c
+# prints "   <peer_client>:<peer_port>", with no "connected to:" prefix. An
+# earlier pattern matched that prefix and so never fired, pinning ports_wired
+# at 0 forever while the graph was fully wired. Track
 # netadapter-ness of the current header; count distinct clients (awk assoc
 # array) and wired ports (header seen + >=1 connection line) together.
 read -r netadapters ports_wired <<EOF
@@ -43,7 +46,7 @@ $(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -c 2>/dev/null | 
         if (na) clients[client] = 1;
         next
     }
-    /^[ \t]+connected to:/ && na { ports++ }
+    /^[ \t]+[^ \t]/ && na { ports++ }
     END {
         n = 0;
         for (c in clients) n++;

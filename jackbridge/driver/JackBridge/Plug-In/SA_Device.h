@@ -146,6 +146,7 @@ private:
 	// daemon published in shm. Returns true if the value changed, so the
 	// caller can notify the host. Never call from the IO thread.
 	bool						_UpdateAdvertisedLatency();
+	bool						_RefreshDeviceNameFromShm();
 	void						_HW_Open();
 	void						_HW_Close();
 	kern_return_t				_HW_StartIO();
@@ -185,9 +186,11 @@ private:
 	UInt32                  	mDriverStatus;
 
 	// Daemon liveness — see SA_Device.cpp:GetZeroTimeStamp for the staleness
-	// check. mDeviceIsAlive is atomic because Device_GetPropertyData reads it
+	// check. mDaemonLive is atomic because the IO thread writes it and the
+	// non-RT paths read it. It gates the silence memcpy and the shm fault
+	// bit ONLY -- it is deliberately NOT kAudioDevicePropertyDeviceIsAlive.
 	// from arbitrary client threads while the IO thread writes it.
-	std::atomic<bool>			mDeviceIsAlive;
+	std::atomic<bool>			mDaemonLive;
 	uint64_t					mLastDaemonAlive;
 	uint64_t					mLastDaemonAliveHostTime;
 

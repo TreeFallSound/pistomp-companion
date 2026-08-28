@@ -79,13 +79,12 @@ static std::string config_plist_string(const char* key) {
 static std::string device_display_name() {
     std::string host = config_plist_string("PiHostname");
     if (host.empty()) host = "pistomp.local";
-    // Strip a trailing .local for readability — "pi-Stomp (pistomp)", not
-    // "pi-Stomp (pistomp.local)".
-    const std::string suffix = ".local";
-    if (host.size() > suffix.size() &&
-        host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) {
-        host.resize(host.size() - suffix.size());
-    }
+    // Keep the mDNS suffix. The bare label and the .local name are not
+    // interchangeable: a pi on both a direct cable and the LAN answers
+    // "pistomp.local" on the link-local cable address and "pistomp" on the
+    // LAN one. Naming the device "pi-Stomp (pistomp)" pointed at the address
+    // the audio link does *not* use. The name is the one we actually connect
+    // to, verbatim.
     std::string name = config_plist_string("DeviceName");
     if (name.empty()) name = JB_DEVICE_NAME_FALLBACK;
     std::string display = name + " (" + host + ")";
@@ -314,9 +313,11 @@ public:
         }
 
         // Heartbeat — HAL watches this counter; if it stops advancing the HAL
-        // flips DeviceIsAlive=0 so the DAW disconnects instead of getting
-        // forever-silence. relaxed is fine: the staleness check only cares
-        // that the value moves, not what the value is.
+        // feeds the DAW silence and raises the shm fault bit. The HAL no longer
+        // takes the device down with it (see SA_Device.cpp
+        // kAudioDevicePropertyDeviceIsAlive), so a stall costs silence, not a
+        // manual device re-selection. relaxed is fine: the staleness check only
+        // cares that the value moves, not what the value is.
         shmDaemonAlive->fetch_add(1, std::memory_order_relaxed);
 
 #ifdef _WITH_MIDI_BRIDGE_
@@ -447,10 +448,14 @@ public:
 
     void on_shutdown() override {
         // Called by jackd when it goes away (intentional stop, crash, whatever).
-        // Zero the heartbeat so the HAL's staleness watchdog flips DeviceIsAlive
-        // immediately rather than waiting for the 5-cycle threshold, then nudge
-        // main()'s sigwait so we exit cleanly. LaunchAgent KeepAlive brings us
-        // back when jackd is back.
+        // Zero the heartbeat so the HAL starts feeding silence immediately
+        // rather than after the 5-cycle threshold, then nudge main()'s sigwait
+        // so we exit cleanly. LaunchAgent KeepAlive brings us back when jackd
+        // is back.
+        //
+        // Exiting here is what plan-b-daemon-survives-jackd.md removes: the
+        // restart gap is dead air the user hears. The device now survives it,
+        // but the gap itself is still ours to close.
         shmDaemonAlive->store(0, std::memory_order_release);
         shmDriverStatus->store(JB_DRV_STATUS_INIT, std::memory_order_release);
         JB_LOG_DEFAULT(jb_log_jack(), "jackd shut down — exiting for LaunchAgent restart");

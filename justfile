@@ -145,8 +145,20 @@ restart:
     # Then jackd before the daemon: JackBridged exits 1 on a failed
     # jack_client_open, and launchd answers that with ThrottleInterval, not
     # with a useful error.
-    launchctl kickstart -k "{{gui}}/com.treefallsound.companion.jackd" || true
-    launchctl kickstart -k "{{gui}}/com.treefallsound.companion.daemon" || true
+    # kickstart -k only restarts a service that is already bootstrapped, and
+    # the app owns the stack: quitting it runs `jackbridge-ctl stop`, which
+    # boots both agents out of the domain. Running `just reload` with the app
+    # closed then failed with "Could not find service ... in domain for user
+    # gui: 501" and brought nothing up. Bootstrap first when absent — same
+    # rule as jackbridge-ctl's bootstrap_agent.
+    for label in com.treefallsound.companion.jackd com.treefallsound.companion.daemon; do
+        if launchctl print "{{gui}}/$label" >/dev/null 2>&1; then
+            launchctl kickstart -k "{{gui}}/$label" || true
+        else
+            launchctl enable "{{gui}}/$label" 2>/dev/null || true
+            launchctl bootstrap "{{gui}}" "/Library/LaunchAgents/$label.plist" || true
+        fi
+    done
 
 # Unlink the /JackBridge shm region. No restart — see the ordering constraint.
 unlink-shm:
@@ -223,6 +235,29 @@ reload-scripts: install-scripts
 jack-rebuild:
     ./jack-rebuild-mac.sh
     @echo "JACK rebuilt and installed. bring the stack back with: just restart"
+
+# Which fork build is installed? (never judge this by timestamps)
+jack-verify:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # netJACK2 lives in the loadable internal clients. jackd itself carries
+    # none of it, so its mtime is not evidence of anything.
+    printf '%-46s %-22s %s\n' ARTIFACT MTIME MARKERS
+    check() {
+        f="$1"; shift
+        [ -f "$f" ] || { printf '%-46s %-22s %s\n' "$f" "ABSENT" "-"; return; }
+        m=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f")
+        out=""
+        for s in "$@"; do
+            if strings -a "$f" | grep -qF "$s"; then out="$out ok:$s"; else out="$out MISSING:$s"; fi
+        done
+        printf '%-46s %-22s %s\n' "$f" "$m" "$out"
+    }
+    check /usr/local/lib/jack/netmanager.so "pinning masters to ifindex" "JACK_NETJACK_MULTICAST_IF"
+    check /usr/local/lib/libjackserver.0.dylib "SetMulticastIF: if_nametoindex"
+    echo
+    echo "running jackd (loads netmanager.so at jack_load time):"
+    pgrep -lf 'bin/jackd' || echo "  not running"
 
 # Drop a stale shm region and bounce. Recovery after a protocol bump.
 rmshm: unlink-shm

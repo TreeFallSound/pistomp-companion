@@ -81,7 +81,7 @@ SA_Device::SA_Device(AudioObjectID inObjectID, UInt32 instance)
 	mSampleRateShadow(48000),
 	mRingBufferFrameSize(0),
 	mDriverStatus(JB_DRV_STATUS_INIT),
-	mDeviceIsAlive(true),
+	mDaemonLive(true),
 	mLastDaemonAlive(0),
 	mLastDaemonAliveHostTime(0),
 	mLastResyncRequest(0),
@@ -552,7 +552,9 @@ void	SA_Device::Device_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			//	name is runtime config data, not a bundle-localized constant.
 			ThrowIf(inDataSize < sizeof(CFStringRef), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioObjectPropertyName for the device");
 			{
-				CFStringRef name = mDeviceName ? mDeviceName : CFSTR("pi-Stomp");
+				//	Non-RT path, so picking up a late publish is free here.
+				const_cast<SA_Device*>(this)->_RefreshDeviceNameFromShm();
+				CFStringRef name = mDeviceName ? mDeviceName : CFSTR(JB_DEVICE_NAME_FALLBACK);
 				*reinterpret_cast<CFStringRef*>(outData) = (CFStringRef)CFRetain(name);
 			}
 			outDataSize = sizeof(CFStringRef);
@@ -707,11 +709,22 @@ void	SA_Device::Device_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			break;
 
 		case kAudioDevicePropertyDeviceIsAlive:
-			//	Reflects the daemon-heartbeat watchdog in GetZeroTimeStamp -
-			//	flips to 0 when jackd dies so the DAW disconnects cleanly
-			//	instead of getting forever-silence.
+			//	ALWAYS 1. The device object exists for as long as the plug-in is
+			//	loaded; a stalled daemon or an unplugged cable is a transient, not
+			//	the death of the device.
+			//
+			//	This used to mirror the daemon-heartbeat watchdog, on the theory
+			//	that a DAW disconnecting was better than forever-silence. That
+			//	cost the user a manual device re-selection after every cable
+			//	replug -- an unexplainable ritual for someone who knows nothing
+			//	about jackd -- and the reasoning is obsolete: the menu-bar app now
+			//	reports the outage honestly (StatusMonitor.Health.noAudioFromPi)
+			//	off the shm fault bit. The driver feeds silence and stays put;
+			//	audio resumes on its own when the link returns.
+			//
+			//	See CLAUDE.md 4b. Needing a manual step after a replug is a bug.
 			ThrowIf(inDataSize < sizeof(UInt32), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioDevicePropertyDeviceIsAlive for the device");
-			*reinterpret_cast<UInt32*>(outData) = mDeviceIsAlive.load(std::memory_order_acquire) ? 1 : 0;
+			*reinterpret_cast<UInt32*>(outData) = 1;
 			outDataSize = sizeof(UInt32);
 			break;
 
@@ -1437,6 +1450,21 @@ void	SA_Device::StartIO()
 
 		kern_return_t theError = _HW_StartIO();
 		ThrowIfKernelError(theError, CAException(theError), "SA_Device::StartIO: failed to start because of an error calling down to the driver");
+
+		//	By now the daemon has long since published the real device name, which
+		//	_HW_Open could not have seen on a freshly created region. Refresh, and
+		//	tell the host so it re-asks -- without the notification CoreAudio keeps
+		//	serving the name it cached at open time. Legal here: StartIO is not the
+		//	IO thread.
+		if (_RefreshDeviceNameFromShm())
+		{
+			AudioObjectPropertyAddress theNameAddr = {
+				kAudioObjectPropertyName,
+				kAudioObjectPropertyScopeGlobal,
+				kAudioObjectPropertyElementMain
+			};
+			SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 1, &theNameAddr);
+		}
 	}
 	++mStartCount;
 }
@@ -1467,8 +1495,9 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
     Float64 theHostTicksPerRingBuffer = gDevice_HostTicksPerFrame * ((Float64)mRingBufferFrameSize);
 
     // Daemon liveness - compare the heartbeat counter against the previous
-    // sample. If it hasn't advanced within ~5 cycles of host time, declare the
-    // device dead so the DAW disconnects instead of getting forever-silence.
+    // sample. If it hasn't advanced within ~5 cycles of host time, feed the DAW
+    // silence and raise the shm fault bit. The device stays alive; the app is
+    // what tells the user. Do NOT resurrect the DeviceIsAlive flip here.
     // Threshold is in host-time units, not call counts, to stay robust if the
     // IO thread's call rate drifts.
     // Phase-4 app-driven resync. The app (menu-bar Repair) writes a nonce
@@ -1488,7 +1517,7 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
                 gDevice_AnchorHostTime = 0;
                 mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
                 mLastDaemonAliveHostTime = mach_absolute_time();
-                mDeviceIsAlive.store(true, std::memory_order_release);
+                mDaemonLive.store(true, std::memory_order_release);
                 shmDriverFault->store(0, std::memory_order_release);
             }
         }
@@ -1499,19 +1528,13 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
     if (curAlive != mLastDaemonAlive) {
         mLastDaemonAlive = curAlive;
         mLastDaemonAliveHostTime = now;
-        if (!mDeviceIsAlive.load(std::memory_order_acquire)) {
-            mDeviceIsAlive.store(true, std::memory_order_release);
+        if (!mDaemonLive.load(std::memory_order_acquire)) {
+            mDaemonLive.store(true, std::memory_order_release);
             shmDriverFault->store(0, std::memory_order_release);
             JB_LOG_INFO(jb_log_driver(),
-                "daemon heartbeat resumed - flipping DeviceIsAlive=1");
-            AudioObjectPropertyAddress addr = {
-                kAudioDevicePropertyDeviceIsAlive,
-                kAudioObjectPropertyScopeGlobal,
-                kAudioObjectPropertyElementMain
-            };
-            SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 1, &addr);
+                "daemon heartbeat resumed - ending silence");
         }
-    } else if (mDeviceIsAlive.load(std::memory_order_acquire) &&
+    } else if (mDaemonLive.load(std::memory_order_acquire) &&
                mRingBufferFrameSize > 0 &&
                mLastDaemonAliveHostTime != 0 &&
                theHostTicksPerRingBuffer > 0.0) {
@@ -1529,17 +1552,11 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
         // Find out where and fix the ordering instead of guarding here.
         UInt64 threshold = (UInt64)(5.0 * theHostTicksPerRingBuffer);
         if (now - mLastDaemonAliveHostTime > threshold) {
-            mDeviceIsAlive.store(false, std::memory_order_release);
+            mDaemonLive.store(false, std::memory_order_release);
             shmDriverFault->store(JB_FAULT_DEVICE_NOT_ALIVE, std::memory_order_release);
             JB_LOG_ERR(jb_log_driver(),
-                "daemon heartbeat stalled >%llu host ticks - flipping DeviceIsAlive=0",
+                "daemon heartbeat stalled >%llu host ticks - feeding silence",
                 (unsigned long long)threshold);
-            AudioObjectPropertyAddress addr = {
-                kAudioDevicePropertyDeviceIsAlive,
-                kAudioObjectPropertyScopeGlobal,
-                kAudioObjectPropertyElementMain
-            };
-            SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 1, &addr);
         }
     }
     theHostTickOffset = ((Float64)(gDevice_NumberTimeStamps + 1)) * theHostTicksPerRingBuffer;
@@ -1715,10 +1732,10 @@ void	SA_Device::ReadInputData(int streamId, UInt32 inIOBufferFrameSize, Float64 
 
 	//	do the copying (the byte sizes here assume a 16 bit stereo sample format)
     Byte* theDestination = reinterpret_cast<Byte*>(outBuffer);
-    if (!mDeviceIsAlive.load(std::memory_order_acquire)) {
+    if (!mDaemonLive.load(std::memory_order_acquire)) {
         // Daemon stalled - feed silence to the DAW instead of stale ring-buffer
-        // contents. DeviceIsAlive=0 has been published; the host should be
-        // tearing the device down imminently.
+        // contents. The device stays alive and selected, so audio resumes by
+        // itself once the daemon is back. No DAW re-selection, no user ritual.
         bzero(theDestination, inIOBufferFrameSize * 8);
     } else {
         memcpy(theDestination, RingBuffer+theStartFrameOffset*2, theNumberFramesToCopy1 * 8);
@@ -1782,6 +1799,38 @@ static constexpr UInt32 kDefaultJitterFrames = 0;
 // Reported for both input and output scope per CoreAudio semantics; the DAW
 // sums them for its round-trip figure. JitterFrames is surfaced separately via
 // kAudioDevicePropertySafetyOffset.
+//	Re-read the device name the daemon publishes into shm.
+//
+//	_HW_Open cannot get this right on a fresh region. The ordering is fixed by
+//	CoreAudio: the driver creates the shm region in _HW_Open, so on any boot
+//	that starts from no region (every `just reload`, which unlinks it) the name
+//	field is still zeroed when _HW_Open reads it, and we fall back to the bare
+//	"pi-Stomp". The daemon writes the real name seconds later, and nothing used
+//	to re-read it -- so the reload loop always produced the fallback name.
+//
+//	Called from non-RT paths only (property reads and StartIO). Never from the
+//	IO thread: it allocates a CFString.
+//
+//	Returns true when the name actually changed.
+bool	SA_Device::_RefreshDeviceNameFromShm()
+{
+	if (shmDeviceName == NULL) return false;
+	char raw[JB_DEVICE_NAME_MAX + 1];
+	memcpy(raw, *shmDeviceName, JB_DEVICE_NAME_MAX);
+	raw[JB_DEVICE_NAME_MAX] = '\0';
+	if (raw[0] == '\0') return false;			//	daemon has not published yet
+	CFStringRef fresh = CFStringCreateWithCString(kCFAllocatorDefault, raw, kCFStringEncodingUTF8);
+	if (fresh == NULL) return false;
+	if (mDeviceName != NULL && CFStringCompare(mDeviceName, fresh, 0) == kCFCompareEqualTo) {
+		CFRelease(fresh);
+		return false;
+	}
+	if (mDeviceName) CFRelease(mDeviceName);
+	mDeviceName = fresh;
+	JB_LOG_INFO(jb_log_driver(), "device name refreshed from shm: %{public}s", raw);
+	return true;
+}
+
 bool	SA_Device::_UpdateAdvertisedLatency()
 {
     const uint64_t period = shmJackPeriodFrames->load(std::memory_order_relaxed);
@@ -1838,7 +1887,7 @@ void	SA_Device::_HW_Open()
     shmSeed->store(1, std::memory_order_relaxed);
     shmSyncMode->store(0, std::memory_order_relaxed);
     // Protocol-8 fault word — start clean. Bit 0 is raised only when the
-    // daemon-heartbeat watchdog flips mDeviceIsAlive=0 (see GetZeroTimeStamp),
+    // daemon-heartbeat watchdog flips mDaemonLive=0 (see GetZeroTimeStamp),
     // i.e. when the DAW is actively being fed bzero silence.
     shmDriverFault->store(0, std::memory_order_release);
     mDriverStatus = JB_DRV_STATUS_ACTIVE;
@@ -1898,7 +1947,7 @@ kern_return_t	SA_Device::_HW_StartIO()
     // ~5 cycles to come up before we mark the device dead.
     mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
     mLastDaemonAliveHostTime = mach_absolute_time();
-    mDeviceIsAlive.store(true, std::memory_order_release);
+    mDaemonLive.store(true, std::memory_order_release);
     shmDriverFault->store(0, std::memory_order_release);
 
     // The Pi's period and sample rate are discovered at startup and can change
