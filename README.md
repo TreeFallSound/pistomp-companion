@@ -107,13 +107,14 @@ the exact failure mode).
 If you have a development clone of the fork next to this repo:
 
 ```sh
-./jack-rebuild-mac.sh          # installs /usr/local/lib/libjack, restarts the engine
+just jack-rebuild           # rebuilds/installs JACK2 and restarts both ends
 ```
 
-The script requires the fork's working tree to be clean and bakes the current
-HEAD into the build. For a fresh machine, install the fork's `.pkg` from a
-release first; the release install path is the supported one, this script is
-for iteration.
+This builds the current fork, installs directly into `/usr/local`, and then
+restarts the Mac and Pi bridge. It warns if the fork's working tree is dirty;
+uncommitted changes are included in the build. For a fresh machine, install
+the fork's `.pkg` from a release first; the release install path is the
+supported one, this recipe is for iteration.
 
 The command runner is [`just`](https://just.systems). Install it with
 `brew install just`. Run `just --list` to see every command.

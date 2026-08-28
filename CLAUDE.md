@@ -180,8 +180,8 @@ To install the fork on this machine from a side-by-side clone:
 ./jack-rebuild-mac.sh    # sudo; bounces the engine
 ```
 
-The script bails if the fork's working tree is dirty, so commit any local
-fork edits first — the build silently embeds whatever HEAD points at.
+The script warns if the fork's working tree is dirty, then builds the current
+working tree including uncommitted changes.
 
 For a bundled-jackd layout override at package time:
 

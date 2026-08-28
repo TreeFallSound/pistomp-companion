@@ -7,11 +7,11 @@ set -euo pipefail
 XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
 WATCHER=/usr/local/libexec/jackbridge/jackbridge-xrun-watcher
 
-# Serialize start/stop. The ExecStop handler (jackbridge-pi-down) and a
-# Restart=on-failure bounce can overlap this script; without a lock, two
-# jack_loads interleave and produce netadapter-01 duplicates fighting over
-# the same network stream. fd 9 is held on the lock file for the whole
-# script; a concurrent up/down simply blocks until the first completes.
+# Serialize the load/wire portion of start and stop. The ExecStop handler
+# (jackbridge-pi-down) and a Restart=on-failure bounce can overlap this
+# script; without a lock, two jack_loads interleave and produce netadapter-01
+# duplicates fighting over the same network stream. Release fd 9 before the
+# long-running watcher starts so ExecStop can acquire it and finish teardown.
 exec 9>/run/lock/jackbridge.flock
 flock 9
 
@@ -101,8 +101,12 @@ wire_wet() {
 wire_wet netadapter:playback_3 mod-monitor:out_1 mod-host:monitor-out_1
 wire_wet netadapter:playback_4 mod-monitor:out_2 mod-host:monitor-out_2
 
-# Mac return → summed into system:playback alongside mod-host's existing wiring.
 jack_connect netadapter:capture_1 system:playback_1 || true
 jack_connect netadapter:capture_2 system:playback_2 || true
 
+# Do not hold the start/stop lock while the watcher runs. systemd executes
+# ExecStop before terminating this main process; keeping fd 9 locked through
+# the watcher would make jackbridge-pi-down wait forever for its own lock.
+flock -u 9
+exec 9>&-
 exec "$WATCHER" "$XRUN_FILE"

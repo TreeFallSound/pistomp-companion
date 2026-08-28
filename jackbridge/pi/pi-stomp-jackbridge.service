@@ -45,7 +45,7 @@ ExecStop=/usr/local/libexec/jackbridge/jackbridge-pi-down
 ExecStopPost=+/usr/local/libexec/jackbridge/jackbridge-unpin-route
 
 TimeoutStartSec=10
-# on-failure (not always): ExecStop / clean SIGTERM exits must NOT rebound —
+TimeoutStopSec=15
 # the Mac and jackbridge-ctl own start/stop, and a unit that restarts on a
 # deliberate stop would fight jackbridge-pi-down. on-failure fires only on
 # the watcher's liveness exit(1) or a crash, both of which mean "the slave

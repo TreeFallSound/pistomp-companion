@@ -18,15 +18,11 @@ if [ "$(id -u)" -eq 0 ]; then
     exit 1
 fi
 
-echo "==> preflight: fork HEAD should be on the multicast-pin work"
-cd "$JACK_SRC"
-git log --oneline -3
+echo "==> preflight: fork source"
+pushd "$JACK_SRC" >/dev/null
 git status --short
-# Bail if the working tree is dirty — otherwise the rebuild silently
-# bakes in a half-finished edit.
 if [ -n "$(git status --porcelain)" ]; then
-    echo "error: jack2 working tree is dirty; commit or stash first" >&2
-    exit 1
+    echo "warning: jack2 working tree is dirty; building the current working tree, including uncommitted changes" >&2
 fi
 
 echo
@@ -65,6 +61,7 @@ LDFLAGS="-L/opt/homebrew/lib" \
 echo
 echo "==> install (sudo)"
 sudo python3 ./waf install
+popd >/dev/null
 
 echo
 echo "==> deploy the current jackd-launch (sets JACK_NETJACK_MULTICAST_IF)"
