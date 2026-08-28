@@ -7,6 +7,29 @@ export JACK_NO_START_SERVER=1
 SUPPORT="/Library/Application Support/JackBridge"
 OWNER_HELPER="$SUPPORT/jackbridge-jackd"
 STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
+
+# These two must match StandardOutPath / StandardErrorPath in
+# com.treefallsound.companion.jackd.plist.
+LOG_ERR="${JACKBRIDGE_LOG_ERR:-/tmp/com.treefallsound.companion.jackd.err.log}"
+LOG_OUT="${JACKBRIDGE_LOG_OUT:-/tmp/com.treefallsound.companion.jackd.out.log}"
+LOG_MAX_BYTES=8388608
+LOG_KEEP_LINES=20000
+
+# launchd opens the redirect O_APPEND and hands the descriptor down to every
+# child, so the writer holds the inode and not the name. Renaming the file —
+# what newsyslog and logrotate do — leaves jackd writing into the renamed
+# copy while the fresh one stays empty forever. Emptying in place is the only
+# thing that works here, and O_APPEND is what makes it safe: the next write
+# recomputes its offset to EOF instead of leaving a multi-megabyte hole.
+# Nothing else ever resets these files, so without this they only grow.
+cap_log() {
+    [ -f "$1" ] || return 0
+    size=$(/usr/bin/stat -f%z "$1" 2>/dev/null) || return 0
+    [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+    /usr/bin/tail -n "$LOG_KEEP_LINES" "$1" > "$1.prev" 2>/dev/null || true
+    : > "$1"
+    echo "jackd-launch: $1 passed $LOG_MAX_BYTES bytes; tail kept in $1.prev" >&2
+}
 PREFIX_HELPER="$SUPPORT/jack-prefix.sh"
 if [ -r "$PREFIX_HELPER" ]; then
     . "$PREFIX_HELPER"
@@ -32,6 +55,9 @@ while [ "$#" -gt 0 ]; do
         *) echo "jackd-launch: unexpected argument '$1'" >&2; exit 2 ;;
     esac
 done
+
+cap_log "$LOG_ERR"
+cap_log "$LOG_OUT"
 
 export JACKBRIDGE_INSTANCE="$$-$(/bin/date +%s)"
 
@@ -75,10 +101,69 @@ else
     echo "jackd-launch: multicast route not pinned after 10 s" >&2
 fi
 
-"$JACKD" -R -P 75 -d coreaudio -P "$CLOCK_UID" -r "$RATE" -p "$PERIOD" &
-JACKD_PID=$!
 JACKD_PID_FILE=/tmp/jackbridge-jackd.pid
-echo "$JACKD_PID" > "$JACKD_PID_FILE"
+rm -f "$JACKD_PID_FILE"
+
+# fd 3 keeps a handle on the real stdout (the .out.log) before any pipe
+# exists, so that below `2>&1` can send stderr into the filter while
+# `1>&3` puts stdout back where launchd wanted it. Only stderr is noisy;
+# routing both through one pipe would merge two files into one.
+exec 3>&1
+
+# `$!` cannot name jackd here: on a pipeline it names the last element, which
+# is the filter. Killing that would leave jackd running with no parent and no
+# pidfile. So the inner `sh -c` writes its OWN pid and then execs jackd into
+# that same process — the pid stays valid across the exec, and the file names
+# jackd itself.
+#
+# The filter prints each distinct message at most once per window and counts
+# what it drops. It is not a consecutive-duplicate collapse: an xrun storm is
+# a 3-or-4 line stanza per failed cycle (one XRun line per client that missed,
+# plus the graph error, plus CoreAudio's overload notice when it also fired),
+# repeating at the cycle rate — 375 Hz at 48 kHz / 128 frames. Consecutive
+# dedupe collapses none of that. Digits are folded to # so that counters like
+# `val1 = 7` group with `val1 = 8` instead of each looking distinct.
+#
+# This is jackd's stderr, written from its non-realtime logging path. The
+# extra pipe hop touches no audio path and breaks no realtime constraint.
+/bin/sh -c 'echo $$ > "$1"; shift; exec "$@"' _ "$JACKD_PID_FILE" \
+    "$JACKD" -R -P 75 -d coreaudio -P "$CLOCK_UID" -r "$RATE" -p "$PERIOD" \
+    2>&1 1>&3 3>&- \
+  | /usr/bin/perl -e '
+        my $W = 10; my $CAP = 2000; my %s;
+        $| = 1;
+        while (defined(my $l = <STDIN>)) {
+            chomp $l;
+            my $k = $l; $k =~ s/\d+/#/g;
+            %s = () if keys(%s) > $CAP;
+            my $e = $s{$k} ||= [0, 0];
+            my $now = time;
+            if ($now - $e->[0] >= $W) {
+                if ($e->[1]) { printf("%s   [+%d similar suppressed]\n", $l, $e->[1]); }
+                else         { printf("%s\n", $l); }
+                @$e = ($now, 0);
+            } else { $e->[1]++; }
+        }
+        for my $k (sort keys %s) {
+            printf("  [+%d similar suppressed: %s]\n", $s{$k}[1], $k) if $s{$k}[1];
+        }
+    ' >&2 &
+PIPELINE_PID=$!
+
+# The pidfile appears between fork and exec, so wait for it briefly.
+JACKD_PID=""
+_i=0
+while [ "$_i" -lt 40 ]; do
+    if [ -s "$JACKD_PID_FILE" ]; then JACKD_PID=$(cat "$JACKD_PID_FILE"); break; fi
+    _i=$((_i + 1))
+    sleep 0.05
+done
+if [ -z "$JACKD_PID" ]; then
+    echo "jackd-launch: jackd pid file never appeared" >&2
+    kill "$PIPELINE_PID" 2>/dev/null || true
+    exit 1
+fi
+
 trap 'kill "$JACKD_PID" 2>/dev/null || true; rm -f "$JACKD_PID_FILE"' EXIT INT TERM
 
 jackd_ready=0
@@ -97,4 +182,4 @@ if [ "$jackd_ready" = 1 ] && [ -x "$JACK_LOAD" ]; then
 elif [ "$jackd_ready" != 1 ]; then
     echo "jackd-launch: jackd not ready after 15s" >&2
 fi
-wait "$JACKD_PID"
+wait "$PIPELINE_PID"

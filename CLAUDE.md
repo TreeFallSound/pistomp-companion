@@ -15,17 +15,68 @@ Use this file to work on the code. For users, `README.md`. For the design,
 The command runner is [`just`](https://just.systems). Install it with
 `brew install just`. Run `just --list` to see every command.
 
-**Engine loop.** Edit C++ in `jackbridge/`, then:
+### The shape of the justfile
+
+Recipes come in four layers. **Each layer does only its own job.**
+
+| Layer | Does | Recipes |
+|-------|------|---------|
+| build | Compiles into the build tree. Touches nothing else. | `driver`, `daemon`, `engine`, `app` |
+| install | Copies into system paths. Needs sudo. | `install-engine`, `install-scripts`, `install` |
+| control | Acts on the running stack. | `restart`, `unlink-shm`, `status`, `logs`, `device-name` |
+| loop | What you actually type. Composes the layers. | `reload`, `reload-all`, `reload-scripts`, `rmshm` |
+
+One rule makes them composable:
+
+> **install never restarts, and control never installs.**
+
+Chain as many installs as you like, then restart exactly once. Never chain
+two recipes that each restart — and not just for speed. See below.
+
+### The one ordering constraint
+
+    install  →  unlink-shm  →  restart
+
+Always in that order. The HAL driver creates the `/JackBridge` shm region in
+`_HW_Open`, and `_HW_Open` runs only when coreaudiod loads the plug-in. So the
+unlink must land *after* the new binaries are in place and *before* the
+restart that loads them.
+
+Unlink after the restart instead and the name stays gone: nothing recreates
+it, and `JackBridged` crash-loops on ENOENT until the next coreaudiod bounce.
+This is also why chaining two restarting recipes is harmful — the second
+`killall coreaudiod` lands after the region was rebuilt.
+
+`restart` itself has two non-obvious steps for the same reason. It kills the
+plug-in's host process (`Core Audio Driver (JackBridgePlugIn.driver)`), which
+survives a coreaudiod bounce on its own, and it runs `system_profiler
+SPAudioDataType` to force a device enumeration — coreaudiod respawns lazily
+and will not load HAL plug-ins until something asks for a device.
+
+### The loops
+
+**Engine.** Edit C++ in `jackbridge/`, or any shell helper, then:
 
 ```sh
-just reload       # build driver + daemon, swap binaries, bounce the stack
+just reload       # build → install → unlink-shm → restart
 ```
 
-This copies the built binaries over `/Library/...` and restarts `coreaudiod`
-and the two LaunchAgents. It needs sudo for the copy and the `coreaudiod`
-kill. Verify with `just device-name` and `just logs`.
+Needs sudo for the copies and the `coreaudiod` kill. Verify with
+`just device-name` and `just logs`.
 
-**App loop.** Edit Swift in `app/`, then:
+**Shell helpers only.** The helpers in `jackbridge/installer/` ship only in
+the `.pkg`, so changing one otherwise costs a full `just pkg-install` — four
+xcodebuild runs, one of them a `clean build`, to deliver a text file. Instead:
+
+```sh
+just reload-scripts   # install-scripts → restart, no Xcode at all
+```
+
+It syntax-checks every helper with `sh -n` before overwriting anything: these
+run under launchd, where a syntax error surfaces as a service that will not
+stay up rather than as a parse error you can read.
+
+**App.** Edit Swift in `app/`, then:
 
 ```sh
 just app-restart          # kill the running app, rebuild Debug, relaunch
@@ -33,33 +84,45 @@ just app-restart Release  # any xcodebuild configuration
 ```
 
 This wraps `./app-restart.sh`: `pkill` the old copy, rebuild, relaunch
-detached through launchd. The relaunched app survives you closing the
-terminal. Build output is quiet on success and full on failure; on failure
-there is no running app, never the old binary pretending to be new.
+detached through launchd. Build output is quiet on success and full on
+failure; on failure there is no running app, never the old binary pretending
+to be new.
 
-**Individual targets** when you want one piece:
+**Everything.** `just reload-all` is `reload` plus the app, with the app
+quit first (through AppleScript, so `applicationShouldTerminate` runs
+`jackbridge-ctl stop`) and relaunched last.
+
+### Individual pieces
 
 ```sh
-just driver       # HAL driver only
-just daemon       # daemon only
-just app          # app only, no launch
-just run-app      # build the app and open the build-tree copy
+just driver          # HAL driver only
+just daemon          # daemon only
+just app             # app only, no launch
+just install         # install engine + helpers, no restart
+just restart         # bounce the stack, no build, no install
+just unlink-shm      # drop the shm region, no restart
+just run-app         # build the app and open the build-tree copy
 ```
 
-**Observe:**
+### Observe and recover
 
 ```sh
 just device-name  # the CoreAudio device entry (name, channels, transport)
 just status       # LaunchAgent health
 just logs         # os_log stream, subsystem com.treefallsound.companion
+just rmshm        # unlink-shm + restart (after a protocol bump)
 ```
 
-**Recover:**
+### What the loops do *not* cover
 
-```sh
-just restart      # bounce the agents and coreaudiod, no rebuild
-just rmshm        # drop the stale shm region (needed after a protocol bump)
-```
+The `.pkg` generates or templates four things, and no loop recipe touches
+them, because a raw copy would write the wrong content:
+
+- `jack-prefix` and `config.plist` — stamped with `JACK_PREFIX` at package time
+- the two LaunchAgent plists and the LaunchDaemon plist — they carry a
+  per-user path
+
+Change any of those and you need `just pkg-install`.
 
 ---
 
@@ -86,7 +149,7 @@ For a guided read: `docs/codebase-tour.md`.
 
 ## 3. Release builds
 
-`just reload` copies binaries directly. For a real installer:
+`just reload` copies binaries and helpers directly. For a real installer:
 
 ```sh
 just pkg            # build the .pkg (unsigned local build by default)

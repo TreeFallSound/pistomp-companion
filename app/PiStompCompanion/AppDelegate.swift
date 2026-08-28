@@ -35,9 +35,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.render(state)
         }
         monitor.start()
-        // The menu-bar app is the user-facing owner of the stack. Launching
-        // it brings the services up; quitting it tears them down.
-        beginStackOperation(.starting, command: "start")
+        // Launching the app deliberately does NOT start the stack: jackd and
+        // the daemon hold a realtime thread, and the app is a login item, so
+        // an auto-start would put that cost on every boot without the user
+        // asking. "Start JackBridge" in the menu is the only way up. Quitting
+        // still tears the stack down — the app owns what it started.
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -66,7 +68,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         updateStackControls()
-        statusLineItem.title = state.detailLine
+        // An in-flight control command outranks the monitor's reading. The
+        // stack spends the first seconds of a start indistinguishable from a
+        // stopped one — no region, no heartbeat — so `detailLine` would sit
+        // on "JackBridge stack down" through the whole launch and read as a
+        // failure. `pendingStackOperation` is cleared above the moment the
+        // health actually moves, so this never outlives the operation.
+        statusLineItem.title = pendingStackOperation.map(Self.progressLine(for:)) ?? state.detailLine
         moduiItem.action = state.piReachable ? #selector(openModUI(_:)) : nil
         sshItem.action = state.piReachable ? #selector(openSSH(_:)) : nil
 
@@ -74,30 +82,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             confirmExistingJackServer()
         }
 
-        // `live` is the icon's brightness, and it is deliberately NOT
-        // `piReachable`: that probe TCP-connects to the pi over wifi, which
-        // drops out independently of the audio link. Any health that implies
-        // the pi is in the graph — or that demands attention — burns bright.
+        // Brightness answers exactly one question: is JackBridge running and
+        // costing this Mac anything? Every health except `stackDown` means
+        // jackd and the daemon are up and holding a realtime thread, so the
+        // icon is bright — whether or not the pi ever shows up. Where the pi
+        // stands is the badge's job, and the two must not be conflated:
+        // reachability is a wifi TCP probe that answers independently of
+        // whether the local stack is running at all, so feeding it into
+        // brightness made a running stack look off whenever the pi was away.
+        let live = state.health != .stackDown
+
         let badge: StatusItemController.Badge
-        let live: Bool
         switch state.health {
         case .protocolMismatch:
             badge = .red
-            live = true
         case .streaming:
             badge = .solidGreen
-            live = true
         case .startedIdle, .linkedIdle:
             badge = .hollowGreen
-            live = true
         case .piUnreachable:
             badge = state.piReachable ? .amber : .none
-            live = state.piReachable
         case .stackDown:
             badge = .none
-            live = state.piReachable
         }
         statusItem.update(badge: badge, live: live)
+    }
+
+    private static func progressLine(for operation: StackControlOperation) -> String {
+        switch operation {
+        case .starting:   return "Starting JackBridge…"
+        case .stopping:   return "Stopping JackBridge…"
+        case .restarting: return "Restarting JackBridge…"
+        }
     }
 
     private func updateStackControls() {

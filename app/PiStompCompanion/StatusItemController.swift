@@ -60,11 +60,16 @@ final class StatusItemController {
             return base
         }
         // Dim by re-drawing at reduced alpha — NSImage has no alpha property.
-        let out = NSImage(size: NSSize(width: iconSide, height: iconSide))
-        out.lockFocus()
-        NSGraphicsContext.current?.cgContext.setAlpha(0.35)
-        base.draw(in: NSRect(x: 0, y: 0, width: iconSide, height: iconSide))
-        out.unlockFocus()
+        // The alpha has to ride `fraction:`, not the CGContext's global alpha:
+        // `NSImage.draw` composites through its own cached representation and
+        // does not pick up `setAlpha`, so that variant drew fully opaque. And
+        // the wrapper is a `drawingHandler` image rather than a `lockFocus`
+        // bitmap, which would freeze one backing scale into the artwork.
+        let out = NSImage(size: NSSize(width: iconSide, height: iconSide),
+                          flipped: false) { rect in
+            base.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.35)
+            return true
+        }
         out.isTemplate = true
         return out
     }

@@ -96,7 +96,34 @@ Full diagnostics and rare cases: `docs/macos-setup.md`.
 The command runner is [`just`](https://just.systems). Install it with
 `brew install just`. Run `just --list` to see every command.
 
+Recipes come in four layers, and each does only its own job:
+
+| Layer | What it does | Examples |
+|---|---|---|
+| build | Compiles into the build tree. Nothing else. | `driver`, `daemon`, `engine`, `app` |
+| install | Copies into system paths. Needs sudo. | `install-engine`, `install-scripts`, `install` |
+| control | Acts on the running stack. | `restart`, `unlink-shm`, `status`, `logs` |
+| loop | What you actually type. Composes the rest. | `reload`, `reload-all`, `reload-scripts`, `rmshm` |
+
+One rule keeps them composable: **install never restarts, and control never
+installs.** So you can chain any number of installs and then restart exactly
+once. Two recipes that each restart must not be chained.
+
+Day to day:
+
 ```sh
+just                 # build, install, drop the shm, bounce the engine
+just reload-all      # the same, plus the menu-bar app
+just reload-scripts  # shell helpers only, no Xcode build
+just status          # service health
+just logs            # follow the engine logs
+just device-name     # show the audio device entry
+```
+
+For a release package: `just pkg-install` (requires sudo). That is the
+authoritative install path — the loops above are for iteration, and they
+deliberately skip the files the package generates or templates.
+
 # Architecture
 
 JackBridge is the engine inside PiStomp Companion. It is a fork of
@@ -120,16 +147,6 @@ crossing.
   status/stop/start script
 - [jackbridge/installer/build-pkg.sh](jackbridge/installer/build-pkg.sh) —
   build the packages
-
-just              # rebuild the engine and reload it live
-just run-app      # build and run the app
-just app-restart  # kill, rebuild, and relaunch the app
-just device-name  # show the audio device entry
-just status       # show service health
-just logs         # follow the engine logs
-```
-
-For a release package: `just pkg-install` (requires sudo).
 
 The user-facing install, diagnostics, and troubleshooting reference is in
 `docs/macos-setup.md`. The architecture is in `docs/architecture.md`.
