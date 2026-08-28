@@ -190,6 +190,12 @@ private:
 	std::atomic<bool>			mDeviceIsAlive;
 	uint64_t					mLastDaemonAlive;
 	uint64_t					mLastDaemonAliveHostTime;
+
+	// Phase-4 resync nonce — last value of JB_OFF_RESYNC_REQUEST that the
+	// app wrote and we already honoured. GetZeroTimeStamp compares each poll
+	// so a *new* value fires one re-anchor; storing keeps us from re-anchoring
+	// every cycle against the region's current contents.
+	uint64_t					mLastResyncRequest;
 	
 	AudioObjectID				mInputStreamObjectID[NUM_INPUT_STREAMS];
 	bool						mInputStreamIsActive[NUM_INPUT_STREAMS];

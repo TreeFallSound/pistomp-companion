@@ -84,6 +84,7 @@ SA_Device::SA_Device(AudioObjectID inObjectID, UInt32 instance)
 	mDeviceIsAlive(true),
 	mLastDaemonAlive(0),
 	mLastDaemonAliveHostTime(0),
+	mLastResyncRequest(0),
 	mHealthCycleCount(0),
 	mHealthLastHostTime(0),
 	mHealthMaxNFrames(0),
@@ -1470,6 +1471,29 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
     // device dead so the DAW disconnects instead of getting forever-silence.
     // Threshold is in host-time units, not call counts, to stay robust if the
     // IO thread's call rate drifts.
+    // Phase-4 app-driven resync. The app (menu-bar Repair) writes a nonce
+    // here; we honour it inline by re-anchoring gDevice and re-arming
+    // liveness the same way _HW_StartIO does (:1863-1871), minus the
+    // SampleRate / host notify, which isn't legal on the IO thread. Compare
+    // against our last-observed value so a write fires exactly once even if
+    // the region keeps the nonce visible forever.
+    {
+        uint64_t curResync = shmResyncRequest->load(std::memory_order_acquire);
+        if (curResync != mLastResyncRequest) {
+            mLastResyncRequest = curResync;
+            if (curResync != 0) {
+                JB_LOG_INFO(jb_log_driver(),
+                    "resync request %llu honoured — re-anchoring + re-arming liveness",
+                    (unsigned long long)curResync);
+                gDevice_AnchorHostTime = 0;
+                mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
+                mLastDaemonAliveHostTime = mach_absolute_time();
+                mDeviceIsAlive.store(true, std::memory_order_release);
+                shmDriverFault->store(0, std::memory_order_release);
+            }
+        }
+    }
+
     uint64_t now = mach_absolute_time();
     uint64_t curAlive = shmDaemonAlive->load(std::memory_order_acquire);
     if (curAlive != mLastDaemonAlive) {

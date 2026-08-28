@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# jackbridge-pi-status — parseable, read-only truth about the JackBridge
+# netadapter slave on the pi.
+#
+# Single source of truth for "is the recording link actually wired" for both
+# the Mac (`jackbridge-ctl pi-status`, which shell-scripts this over ssh) and
+# the pi LCD UI (modalapi/ethernet/manager.py reads it instead of the old
+# `systemctl is-active`, whose MAINPID lied about netadapter).
+#
+# Output: key=value, one per line, exit 0 always.
+#
+# Keys (always emitted):
+#   service       systemd state of pi-stomp-jackbridge (active/failed/inactive/#
+# Single source of truth for "is the recording link actually wired" for both
+# the Mac (`jackbridge-ctl pi-status`, which shell-scripts this over ssh) and
+# the pi LCD UI (modalapi/ethernet/manager.py reads it instead of the old
+# `systemctl is-active`, whose MAINPID lied about netadapter).
+#
+# Output: key=value, one per line, exit 0 always. Consumers parse with any
+# key=value mechanism — no shell source, no JSON.
+#
+# Keys (all always emitted):
+#   service       systemd active state of pi-stomp-jackbridge
+#                 (active, failed, inactive, activating, …; "unknown" if systemctl errored)
+#   netadapters   count of jackd clients named netadapter or netadapter-NN;
+#                 >1 means duplicates are fighting (0 or 1 is healthy)
+#   ports_wired   # of netadapter ports that currently have >=1 connection
+#                 (jack_lsp -c "connected to" lines under a netadapter:* header)
+#   route         iface the multicast group 225.3.19.154 routes out of
+#                 ("" if no route); the fork also pins it in-socket, so this is
+#                 the kernel-route view for the plan's Wi-Fi-escape scenario
+#   iface         iface the ExecStartPre pin chose ("" if /run state absent)
+#   xruns_1m      ringbuffer xruns in the last 60 seconds (from xrun-watcher file)
+#   xruns_5m      last 300 seconds
+#   xruns_15m     last 900 seconds
+#)
+#   netadapters   # of jackd clients named netadapter or netadapter-NN; >1 means
+#                 duplicates are fighting over the same stream
+#   ports_wired   # of netadapter ports with >=1 connection (jack_lsp -c
+#                 "connected to:" lines under a netadapter:* header)
+#   route         iface the multicast group 225.3.19.154 routes out of ("" if
+#                 unpinned) — kernel-route view for the Wi-Fi-escape scenario
+#   iface         iface the ExecStartPre pin chose ("" if /run state absent)
+#   xruns_1m/5m/15m  ringbuffer xruns in the last 60/300/900 s
+#
+# No sudo, no writes, no restarts — read-only by construction.
+
+set -u
+
+STATE=/run/jackbridge.iface
+GROUP=225.3.19.154
+XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
+
+iface=""
+[ -r "$STATE" ] && iface=$(cat "$STATE" 2>/dev/null) || true
+
+route_dev=$(ip -o route get "$GROUP" 2>/dev/null \
+    | awk '{ for (i=1; i<=NF; i++) if ($i=="dev") { print $(i+1); exit } }')
+
+active=$(systemctl is-active pi-stomp-jackbridge.service 2>/dev/null)
+[ -n "$active" ] || active=unknown
+
+# One jack_lsp snapshot, one awk pass. Header lines are "<client>:<port>" at
+# column 0; connection lines are indented "connected to: <peer>". Track
+# netadapter-ness of the current header; count distinct clients (awk assoc
+# array) and wired ports (header seen + >=1 connection line) together.
+read -r netadapters ports_wired <<EOF
+$(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -c 2>/dev/null | awk '
+    /^[^ \t]/ {
+        split($0, a, ":");
+        client = a[1];
+        na = (client == "netadapter" || client ~ /^netadapter-[0-9]+$/);
+        if (na) clients[client] = 1;
+        next
+    }
+    /^[ \t]+connected to:/ && na { ports++ }
+    END {
+        n = 0;
+        for (c in clients) n++;
+        print n + 0, ports + 0;
+    }'
+)
+EOF
+netadapters=${netadapters:-0}
+ports_wired=${ports_wired:-0}
+
+# xrun buckets, mirroring jackbridge-xrun-watcher's "epoch_min count" lines; a
+# bucket counts if its END (ts+60) falls within the window.
+x1=0; x5=0; x15=0
+if [ -r "$XRUN_FILE" ]; then
+    now=$(date +%s)
+    while read -r ts count; do
+        case "$ts$count" in (*[!0-9]*|"") continue;; esac
+        dt=$((now - (ts + 60)))
+        [ "$dt" -lt 900 ] && x15=$((x15 + count))
+        [ "$dt" -lt 300 ] && x5=$((x5 + count))
+        [ "$dt" -lt 60 ]  && x1=$((x1 + count))
+    done < "$XRUN_FILE"
+fi
+
+printf 'service=%s\n'     "$active"
+printf 'netadapters=%s\n' "$netadapters"
+printf 'ports_wired=%s\n' "$ports_wired"
+printf 'route=%s\n'       "$route_dev"
+printf 'iface=%s\n'       "$iface"
+printf 'xruns_1m=%s\n'    "$x1"
+printf 'xruns_5m=%s\n'    "$x5"
+printf 'xruns_15m=%s\n'   "$x15"
+exit 0

@@ -14,6 +14,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var restartItem: NSMenuItem!
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
+    private var repairItem: NSMenuItem!
+    private var fullRepairItem: NSMenuItem!
+    /// Monotonic nonce for JB_OFF_RESYNC_REQUEST (driver compares new-vs-last
+    /// and re-anchors on a different value). Local-memory counter is enough —
+    /// we only ever need "a different integer".
+    private var resyncNonce: UInt64 = 0
+    /// Whether we've already offered SSH key setup this launch. The probe
+    /// fires on reachability state transitions, which can flap; the user
+    /// sees the dialog once per app run, not on each flap.
+    private var sshPromptShown = false
     private var launchAtLoginItem: NSMenuItem!
     private var diagnosticsProgress: ProgressWindowController?
     private var settingsWindow: SettingsWindowController?
@@ -55,6 +65,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - rendering
 
     private func render(_ state: StatusMonitor.State) {
+        // Offer guided key install the first time we spot a pi-shaped ssh
+        // refusal this launch. Key: the pi answers TCP (state.piReachable)
+        // but BatchMode ssh is refused — that's exactly the "no authorized
+        // key" signature, as opposed to "pi's off" (no TCP) or "key exists
+        // but wrong" (stays refused after install; we don't loop).
+        if !sshPromptShown && state.piReachable && state.health == .piUnreachable {
+            sshPromptShown = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                if SSHKeyInstaller.diagnose() == .keyRejected ||
+                   SSHKeyInstaller.diagnose() == .noKeyOrNoOffer {
+                    DispatchQueue.main.async {
+                        _ = SSHKeyInstaller.offerInstall()
+                    }
+                }
+            }
+        }
+
         let previousJackCondition = lastState.jackCondition
         lastState = state
         if let operation = pendingStackOperation, controlCommandFinished {
@@ -175,6 +202,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(sshItem)
         m.addItem(.separator())
 
+        // Phase-4 recovery pair. "Repair" is the cheap re-anchor: it writes a
+        // nonce to JB_OFF_RESYNC_REQUEST and the driver honours it in
+        // GetZeroTimeStamp, so a REAPER session stays open and the device
+        // never enumerates away. "Full Repair" is the sure-fire bounce —
+        // a coreaudiod restart via jackbridge-ctl repair, used when light
+        // repair didn't take. Expose both until each has been exercised
+        // enough to know which one a musician should hit first.
+        repairItem = item("Repair Audio Link", #selector(repairLight(_:)))
+        fullRepairItem = item("Full Repair (restarts audio)", #selector(repairFull(_:)))
+        m.addItem(repairItem)
+        m.addItem(fullRepairItem)
+        m.addItem(.separator())
+
         m.addItem(item("Network Diagnostics…", #selector(runDiagnostics(_:))))
         m.addItem(item("Open Logs", #selector(openLogs(_:))))
         m.addItem(item("Settings…", #selector(openSettings(_:))))
@@ -254,6 +294,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(succeeded)
             }
         }
+    }
+
+    // MARK: - repair
+
+    @objc private func repairLight(_ s: Any?) {
+        resyncNonce &+= 1
+        let nonce = resyncNonce
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try ShmWriter().pokeResync(nonce: nonce)
+                NSLog("repair(light): wrote JB_OFF_RESYNC_REQUEST=%llu", nonce)
+            } catch {
+                NSLog("repair(light) failed: \(error.localizedDescription)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.repairLightFailed(error)
+                }
+            }
+        }
+    }
+
+    @objc private func repairFull(_ s: Any?) {
+        // Same code path as the terminal `jackbridge-ctl repair` — bounce
+        // coreaudiod, reload the plug-in, kickstart the two agents. This is
+        // the "sure-fire" option; the menu wording warns it restarts audio.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = ProcessRunner.run(Self.ctl, args: ["repair"], timeout: 60)
+            if r.launchError == nil && !r.timedOut && r.status == 0 {
+                NSLog("repair(full): jackbridge-ctl repair ok")
+            } else {
+                NSLog("repair(full) failed: status=%s timeout=%d err=%s: %s",
+                    String(describing: r.status), r.timedOut ? 1 : 0,
+                    String(describing: r.launchError), r.combined)
+            }
+        }
+    }
+
+    private func repairLightFailed(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn't reach the driver"
+        alert.informativeText = """
+            The light Repair couldn't write to the shared region: \(error.localizedDescription)
+
+            Try "Full Repair (restarts audio)" — that rebuilds the driver from scratch.
+            """
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     @objc private func openModUI(_ s: Any?) {

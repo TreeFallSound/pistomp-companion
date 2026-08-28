@@ -95,7 +95,7 @@ again; the only failure mode is a silent no-op, not a crash.
 - **jack2 fork forward-port**: the fork is 4 commits ahead of
   upstream `v1.9.22-waf`. If a future pi-stomp / JackRouter change
   needs a newer jack2 base, the fork needs to rebase. Track via the
-  commit-count past `v1.9.22` in `sastraxi/jack2/ChangeLog.rst` —
+  commit-count past `v1.9.22` in `TreefallSound/jack2/ChangeLog.rst` —
   nothing in this repo needs to change unless that drift crosses a
   breaking change in upstream's WAF or driver structure.
 

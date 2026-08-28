@@ -12,7 +12,9 @@ notarized PiStomp Companion package. Install JACK2 first.
 
 ```bash
 # 1. Build the jack2 fork package if the fork moved.
-cd ../jack2 && ./build-macos-pkg.sh 1.9.22-sastraxi.N
+#    (Version suffix is fork-owner; v0.2.0 era tagged it "sastraxi",
+#    newer releases tag "tfs" since the fork moved to TreefallSound.)
+cd ../jack2 && ./build-macos-pkg.sh 1.9.22-tfs.N
 
 # 2. Install JACK2 so the Companion package build can link against it.
 sudo installer -pkg ../jack2/build/jack2-*.pkg -target /
@@ -51,7 +53,7 @@ Required for the direct-cable pi-stomp setup.
 
 Download and install both `.pkg` files, **jack2 first**:
 
-1. **`jack2-1.9.22+sastraxi.5.pkg`** — JACK2 fork we depend on. Stock `jackaudio/jack2` 1.9.22 is missing the multicast-interface pin; without this fork, netJACK2's discovery times out on hosts with both wifi and a direct-cable NIC. Installs to `/usr/local`.
+1. **`jack2-1.9.22+sastraxi.5.pkg`** (named for the fork's earlier `sastraxi/` location; now at `TreefallSound/jack2`) — JACK2 fork we depend on. Stock `jackaudio/jack2` 1.9.22 is missing the multicast-interface pin; without this fork, netJACK2's discovery times out on hosts with both wifi and a direct-cable NIC. Installs to `/usr/local`.
 2. **`JackBridge-0.2.0.pkg`** — the HAL driver, the `JackBridged` daemon, the LaunchAgents, the route watcher, and the `jackd-launch` wrapper. Double-click and run. Trust the unsigned package (Right-click > Open) on first install.
 
 Re-running the same `JackBridge-*.pkg` is safe — the postinstall preserves a
@@ -66,7 +68,7 @@ until the Companion GUI starts it.
 - `719d833a` — `IP_ADD_MEMBERSHIP` / `IP_BOUND_IF` pin on the master's multicast group join via `JACK_NETJACK_MULTICAST_IF`
 - `b3bfc408` — mirror pin on the slave's outgoing multicast `sendto()`
 
-Built with `sastraxi/jack2/build-macos-pkg.sh`. Source at <https://github.com/sastraxi/jack2>.
+Built with `TreefallSound/jack2/build-macos-pkg.sh`. Source at <https://github.com/TreefallSound/jack2>.
 
 #### JackBridge (v0.1.x → v0.2.0)
 

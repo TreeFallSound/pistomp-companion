@@ -32,7 +32,12 @@ LimitRTPRIO=infinity
 ExecStartPre=+/usr/local/libexec/jackbridge/jackbridge-pin-route
 
 # Loads netadapter into the stock jackd, wires the graph, then execs the
-# xrun watcher as the long-running foreground process.
+# xrun watcher as the long-running foreground process. The watcher doubles
+# as the liveness supervisor: it polls the jack graph for a `netadapter`
+# client and exits NON-ZERO if it's absent (jackd has no netadapter PID to
+# track — jack_load makes it an in-process client), which trips the restart
+# below. MAINPID is therefore truthful: the unit is "failed" precisely when
+# the slave is gone or telemetry has stopped.
 ExecStart=/usr/local/libexec/jackbridge/jackbridge-pi-up
 
 # Best-effort unload on stop; the watcher is killed by systemd's normal SIGTERM.
@@ -40,7 +45,17 @@ ExecStop=/usr/local/libexec/jackbridge/jackbridge-pi-down
 ExecStopPost=+/usr/local/libexec/jackbridge/jackbridge-unpin-route
 
 TimeoutStartSec=10
-Restart=no
+# on-failure (not always): ExecStop / clean SIGTERM exits must NOT rebound —
+# the Mac and jackbridge-ctl own start/stop, and a unit that restarts on a
+# deliberate stop would fight jackbridge-pi-down. on-failure fires only on
+# the watcher's liveness exit(1) or a crash, both of which mean "the slave
+# is gone but should not be", i.e. exactly the self-heal case.
+Restart=on-failure
+# 3 s: long enough for jackd to settle and for the Mac netmanager's master
+# dedupe to see the old slave gone before the fresh SLAVE_AVAILABLE arrives;
+# short enough that a hard kill (verification scenario 2) self-heals without
+# the user noticing a gap.
+RestartSec=3
 
 [Install]
 # Intentionally no WantedBy — this is on-demand only.

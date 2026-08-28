@@ -173,3 +173,56 @@ final class ShmReader {
         return s
     }
 }
+
+/// Read-WRITE mapper used for exactly one thing: the app's Repair (light)
+/// item writes a nonce into JB_OFF_RESYNC_REQUEST to ask the driver to
+/// re-anchor without a coreaudiod bounce.
+///
+/// Deliberately a *separate* class from ShmReader. ShmReader is strictly
+/// read-only so status polling can never contend with daemon/HAL writes,
+/// and that contract is worth protecting — if a read/write `attach()` ever
+/// appeared on it, a careless caller could corrupt live fields. The writer
+/// only ever touches one word (offset 0x1c8), which the driver consumes
+/// and clears.
+final class ShmWriter {
+    enum WriteError: Error, CustomStringConvertible {
+        case openFailed(Int32)
+        case wrongSize(Int)
+        case mapFailed(Int32)
+
+        var description: String {
+            switch self {
+            case .openFailed(let e): return "shm_open (rw) failed: \(String(cString: strerror(e)))"
+            case .wrongSize(let s): return "shm size \(s) != expected \(ShmReader.regionsSize)"
+            case .mapFailed(let e): return "mmap (rw) failed: \(String(cString: strerror(e)))"
+            }
+        }
+    }
+
+    private let name: String
+    init(name: String = "/JackBridge") { self.name = name }
+
+    /// Store `nonce` at JB_OFF_RESYNC_REQUEST. The driver compares against
+    /// its last-observed value each GetZeroTimeStamp; a different value
+    /// triggers one re-anchor, then the driver clears its copy.
+    ///
+    /// The read-modify-write semantics live entirely on the driver side —
+    /// this function only stores. The nonce space is just "any new value",
+    /// so callers pass a counter or UInt64.random(in:).
+    func pokeResync(nonce: UInt64) throws {
+        // Same variadic-shm_open constraint as the reader: go through the
+        // C shim so Swift never calls the varargs builtin.
+        let fd = jb_shm_open_rw(name)
+        if fd < 0 { throw WriteError.openFailed(errno) }
+        defer { close(fd) }
+
+        var st = stat()
+        guard fstat(fd, &st) == 0, st.st_size == ShmReader.regionsSize else {
+            throw WriteError.wrongSize(Int(st.st_size))
+        }
+        let map = mmap(nil, ShmReader.regionSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+        guard map != MAP_FAILED else { throw WriteError.mapFailed(errno) }
+        defer { munmap(map, ShmReader.regionSize) }
+        map!.storeBytes(of: nonce.littleEndian, toByteOffset: 0x1c8, as: UInt64.self)
+    }
+}

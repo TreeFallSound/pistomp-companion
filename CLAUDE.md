@@ -160,15 +160,36 @@ Signing and notarization gate on `SIGN_APP_IDENTITY`,
 `SIGN_INSTALLER_IDENTITY`, and `NOTARY_PROFILE`. Unset means an unsigned
 local build.
 
-The engine links against the [`sastraxi/jack2`](https://github.com/sastraxi/jack2)
-fork, not upstream `jackaudio/jack2`. The fork's `build-macos-pkg.sh`
-installs to `/usr/local`. Override the prefix:
+### jack2 fork (machine prerequisite)
+
+The engine builds against, and at run time dynamically loads, the
+[`TreefallSound/jack2`](https://github.com/TreefallSound/jack2) fork — not
+upstream `jackaudio/jack2`. The fork carries the netJACK2 slave reaping fix
+(dead slave no longer freezes the audio thread permanently), the KillMaster
+use-after-free fix, slave-name deduplication, and the multicast interface
+pin. Without them, a pi-Stomp restart or unplug leaves the engine stuck:
+each `_HW_GetZeroTimeStamp` waits for the netadapter that no longer exists.
+
+The fork's `build-macos-pkg.sh` installs to `/usr/local` as
+`libjack.{dylib,0.1.0.dylib}`. The daemon (`JackBridged`) links there (see
+`otool -L`). The HAL driver does not — it is pure CoreAudio.
+
+To install the fork on this machine from a side-by-side clone:
+
+```sh
+./jack-rebuild-mac.sh    # sudo; bounces the engine
+```
+
+The script bails if the fork's working tree is dirty, so commit any local
+fork edits first — the build silently embeds whatever HEAD points at.
+
+For a bundled-jackd layout override at package time:
 
 ```sh
 just --set jack_prefix /opt/homebrew engine
 ```
 
-Why the fork is required, and how to build it: `docs/vendor-jack2.md`.
+Why the fork exists and how to vendor it: `docs/vendor-jack2.md`.
 How to ship a release: `docs/releases.md`.
 
 ---

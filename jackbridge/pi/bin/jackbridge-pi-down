@@ -12,6 +12,12 @@
 # single audio thread, which is what caused the massive-xrun symptom we
 # saw when 5 stale instances piled up across testing).
 #
+# Serialize against jackbridge-pi-up: an overlapping stop/start pair must
+# never interleave its jack_unload/jack_load calls (that's what mints
+# netadapter-01 duplicates). Take the same fd-9 lock the up script holds.
+exec 9>/run/lock/jackbridge.flock
+flock 9
+
 # jack_lsp -l format is one "<client>:<port>" line followed by indented
 # per-port metadata. Filter for our client name pattern, drop the :port
 # suffix, and sort -u so we unload each client exactly once.

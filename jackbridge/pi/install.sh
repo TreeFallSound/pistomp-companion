@@ -18,6 +18,7 @@ install -m 0755 "$SRC_DIR/bin/jackbridge-xrun-watcher" "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jb-detect-net-iface"     "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jackbridge-pin-route"    "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jackbridge-unpin-route"  "$LIBEXEC/"
+install -m 0755 "$SRC_DIR/bin/jackbridge-pi-status"    "$LIBEXEC/"
 install -m 0644 "$SRC_DIR/pi-stomp-jackbridge.service" "$UNIT_DIR/"
 
 if command -v systemctl >/dev/null 2>&1; then
@@ -25,4 +26,4 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 echo "pi-stomp-jackbridge installed under $LIBEXEC + $UNIT_DIR."
-echo "The LCD UI enables/disables it on demand — no systemctl enable here."
+echo "jackbridge-pi-status for details."

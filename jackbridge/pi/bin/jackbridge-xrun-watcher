@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Tails `journalctl -u jack` for netadapter ringbuffer xrun events and
-maintains a bounded per-minute count file at argv[1].
+maintains a bounded per-minute count file at argv[1]. ALSO the service's
+netadapter liveness supervisor: polls the jack graph for a `netadapter`
+client and exits non-zero if it disappears, so systemd (`Restart=on-failure`)
+bounces the whole unit and re-wires the graph.
+
+Why two jobs in one process: `jack_load netadapter` makes netadapter an
+*in-process* client of jackd — there is no netadapter PID for MAINPID to
+track. The graph is the only ground truth for "is the slave still loaded",
+and the graph is cheap to poll from the same event loop that already runs
+here. Making this file the unit's long-running foreground process keeps
+MAINPID truthful: process alive ⇔ slave loaded + xrun telemetry flowing.
 
 File format: 15 lines, oldest first, each "<epoch_sec_of_minute> <count>".
 Consumer (pi-stomp modalapi/ethernet/manager.py read_xrun_buckets) sums the
@@ -20,6 +30,37 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# How often to check the jack graph for a live `netadapter` client. jack_lsp
+# joins and leaves the RT graph per call, so 5 Hz would be obnoxious; 0.5 Hz
+# detects an unload within ~2 s while adding < 1% CPU. Worst-case time-to-
+# restart is bounded by systemd's RestartSec, not by this interval.
+LIVENESS_INTERVAL_S = 2.0
+
+_LSP_ENV = {
+    **os.environ,
+    "JACK_PROMISCUOUS_SERVER": "jack",
+    "JACK_NO_START_SERVER": "1",
+}
+
+
+def netadapter_present() -> bool:
+    """True if any client named netadapter (or netadapter-NN) is in the graph."""
+    try:
+        out = subprocess.check_output(
+            ["jack_lsp", "-l"], env=_LSP_ENV, text=True, timeout=5
+        )
+    except Exception:
+        # jackd unreachable / busy — treat as "gone" so the unit restarts and
+        # re-wires once jackd is healthy, rather than supervising a dead graph.
+        return False
+    for line in out.splitlines():
+        # Lines are "<client>:<port>" at column 0; port metadata is indented.
+        if line and not line[:1].isspace():
+            client = line.split(":", 1)[0]
+            if client == "netadapter" or re.fullmatch(r"netadapter-\d+", client):
+                return True
+    return False
 
 N_BUCKETS = 15  # 15 one-minute buckets = 15-minute window
 
@@ -61,6 +102,7 @@ def main() -> int:
     cur_min = int(time.time()) // 60
     dirty = True
     last_flush = 0.0
+    last_liveness = 0.0  # force a graph check on the first loop iteration
 
     try:
         assert proc.stdout is not None
@@ -68,6 +110,20 @@ def main() -> int:
             ready, _, _ = select.select([proc.stdout], [], [], 1.0)
             now = time.time()
             now_min = int(now) // 60
+
+            # Liveness supervision. Runs on the same 1 Hz loop tick; the
+            # interval check keeps us off the RT graph except twice a minute.
+            if now - last_liveness >= LIVENESS_INTERVAL_S:
+                last_liveness = now
+                if not netadapter_present():
+                    print(
+                        "jackbridge-xrun-watcher: netadapter client absent — "
+                        "exiting non-zero so systemd restarts the unit",
+                        file=sys.stderr,
+                    )
+                    # Exit code 1 (not 0) so Restart=on-failure fires; plain
+                    # clean exits (0/SUCCESS) would not trigger a bounce.
+                    return 1
 
             # Advance the window; zero out any minute buckets we've crossed.
             if now_min != cur_min:

@@ -7,6 +7,14 @@ set -euo pipefail
 XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
 WATCHER=/usr/local/libexec/jackbridge/jackbridge-xrun-watcher
 
+# Serialize start/stop. The ExecStop handler (jackbridge-pi-down) and a
+# Restart=on-failure bounce can overlap this script; without a lock, two
+# jack_loads interleave and produce netadapter-01 duplicates fighting over
+# the same network stream. fd 9 is held on the lock file for the whole
+# script; a concurrent up/down simply blocks until the first completes.
+exec 9>/run/lock/jackbridge.flock
+flock 9
+
 # Fresh file on every service start (contract documented in
 # ../pi-stomp/JACKBRIDGE_RECORDING.md).
 : > "$XRUN_FILE"
@@ -54,14 +62,11 @@ while read -r client; do
 done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/null | \
          awk '/^netadapter(-[0-9]+)?:/ { sub(/:.*/, ""); print }' | sort -u)
 
-# Wait for the Mac's netmanager to detect the socket error from the
-# just-unloaded netadapter and clean up the stale JackNetMaster entry.
-# Without this delay, the Mac's netmanager still holds the old slave
-# name (e.g. "pistomp") when the new SLAVE_AVAILABLE arrives, so
-# jack_client_open fails and JACK appends "-01" — creating a duplicate
-# slave that fights the original for the same network stream and
-# produces WriteResample / ringbuffer failure errors.
-sleep 3
+# (The old "sleep 3" here — waiting for the Mac's netmanager to reap the
+# stale master before re-announcing — was removed with the fork's fix 3
+# (name-based dedupe in InitMaster). A fresh SLAVE_AVAILABLE now reaps the
+# still-present same-name master instead of minting pistomp-01, so we can
+# re-load immediately. See NETJACK-REAPING.md in the jack2 fork.)
 
 # netadapter port labels are slave-local (see pi-stomp.md:77):
 #   playback_* = TO master  (audio we send to the Mac)  → -P

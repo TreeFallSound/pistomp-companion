@@ -62,7 +62,7 @@ XCBUILD_ARGS=(
     CONFIGURATION_BUILD_DIR="$BUILD/xcode"
     "JACK_PREFIX=$JACK_PREFIX"
 )
-# Default ARCHS is arm64-only because the sastraxi/jack2 fork's
+# Default ARCHS is arm64-only because the TreefallSound/jack2 fork's
 # build-macos-pkg.sh produces a single-arch libjack. Override with
 # ARCHS="arm64 x86_64" for a universal build (requires a universal
 # libjack at $JACK_PREFIX).

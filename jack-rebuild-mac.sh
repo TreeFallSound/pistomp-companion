@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild jack2 from /Users/cam/dev/jack2 (the sastraxi/jack2 fork) and
+# Rebuild jack2 from /Users/cam/dev/jack2 (the TreefallSound/jack2 fork) and
 # install it over the /usr/local jackd. Then deploy the current
 # jackd-launch (which sources JACK_NETJACK_MULTICAST_IF from the route
 # daemon's state file) and re-bootstrap the LaunchAgents.

@@ -3,18 +3,21 @@
 #
 # Wraps `launchctl` against /Library/LaunchAgents/com.treefallsound.companion.{jackd,daemon}.
 # Both agents move together (stopping only one leaves either the audio device
-# orphaned or the daemon crash-looping).
+# orphaned or the daemon crash-looping). Also drives the pi-side
+# pi-stomp-jackbridge.service over ssh, so a single `start`/`stop` brings the
+# whole recording link up/down on both ends.
 #
 # Usage:
 #   jackbridge-ctl start
 #   jackbridge-ctl stop
 #   jackbridge-ctl restart
 #   jackbridge-ctl status
+#   jackbridge-ctl pi-status       # key=value truth from the pi (jackbridge-pi-status)
 #   jackbridge-ctl logs            # tail -f the agent log files
 #
 # Runs as the logged-in user (no sudo needed). LaunchAgent disabled-state
 # persists across reboots via /var/db/com.apple.xpc.launchd/disabled.<uid>.plist
-# so `stop` survives a restart and `start` re-enables.
+# so `stop` survives a reboot and `start` re-enables.
 
 set -e
 
@@ -27,6 +30,11 @@ SUPPORT="/Library/Application Support/JackBridge"
 OWNER_HELPER="$SUPPORT/jackbridge-jackd"
 STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
 PREFIX_HELPER="$SUPPORT/jack-prefix.sh"
+SSH="${JACKBRIDGE_SSH_PATH:-/usr/bin/ssh}"
+PI_HOST="${JACKBRIDGE_PI_HOST:-pistomp.local}"
+PI_USER="pistomp"
+PI_SERVICE="pi-stomp-jackbridge"
+PI_STATUS_BIN="/usr/local/libexec/jackbridge/jackbridge-pi-status"
 if [ -r "$PREFIX_HELPER" ]; then
     . "$PREFIX_HELPER"
 else
@@ -49,6 +57,46 @@ refresh_jack_status() {
         *) /bin/rm -f "$STATUS_FILE" ;;
     esac
 }
+# Run a command on the pi over ssh. Same BatchMode/timeout discipline the
+# app's probe (SettingsWindowController.swift:375-381) and the coordinator
+# (jackbridge-coordinator:91) already use — the guided first-run key setup on
+# the Mac is what makes all three work. Non-zero return = any failure.
+pi_ssh() {
+    "$SSH" -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 \
+        "$PI_USER@$PI_HOST" "$@"
+}
+
+# True when the pi answers ssh and has the status script. Cheap; the ~5 s
+# ConnectTimeout only fires on a genuinely dead pi, and the verbs that call
+# this already take seconds.
+pi_reachable() {
+    pi_ssh "test -x $PI_STATUS_BIN" >/dev/null 2>&1
+}
+
+# Drive the pi's service in the given direction. Best-effort with a warning:
+# the Mac jackd works recording nothing, and an unreachable pi must never
+# block a local restart (e.g. cable temporarily out).
+pi_service() {
+    verb="$1"  # start | stop
+    if pi_reachable; then
+        if pi_ssh "sudo systemctl $verb $PI_SERVICE" >/dev/null 2>&1; then
+            echo "pi: systemctl $verb $PI_SERVICE ok"
+        else
+            echo "warning: pi $verb of $PI_SERVICE failed (pi reachable, systemctl returned non-zero)" >&2
+        fi
+    else
+        echo "warning: pi unreachable at $PI_USER@$PI_HOST — skipping pi-side $verb" >&2
+    fi
+}
+
+cmd_pi_status() {
+    if ! pi_reachable; then
+        echo "pi unreachable: ssh $PI_USER@$PI_HOST (key install? cable? wifi?)" >&2
+        exit 1
+    fi
+    pi_ssh "$PI_STATUS_BIN"
+}
+
 agent_loaded() {
     /bin/launchctl print "$DOMAIN/$1" >/dev/null 2>&1
 }
@@ -86,10 +134,20 @@ cmd_start() {
         fi
         bootstrap_agent "$label"
     done
+
+    # The Mac owns the bridge lifecycle end to end — bring the pi slave up in
+    # the same verb so the user sees one success, not "Mac up, pi forgot".
+    pi_service start
+
     echo "started: $LABELS"
 }
 
 cmd_stop() {
+    # Tear the slave down first. The fork's master-dedupe would reap a leaked
+    # netadapter anyway, but there is no reason to keep the pi sending into a
+    # Mac that is going away. Best-effort; unreachable pi must not block stop.
+    pi_service stop
+
     started=0
     for label in $LABELS; do
         if agent_loaded "$label"; then started=1; fi
@@ -134,6 +192,32 @@ cmd_status() {
     done
 }
 
+# `repair` is the heavy, sure-fire re-anchor: bounce coreaudiod (the only
+# place the plug-in's shm region is created / device name rebuilt), then the
+# two agents. The app's "Repair" menu item does the *light* version (writes a
+# nonce the driver honours in GetZeroTimeStamp — no process bounce) and falls
+# back to this if light didn't restore audio.
+#
+# Order matters: coreaudiod first. The plug-in creates the shm region in
+# _HW_Open, which only runs when the plug-in loads — a bare `killall` leaves
+# the region absent until something enumerates devices, which is the
+# system_profiler call below. Then jackd before daemon because JackBridged
+# exits 1 on a failed jack_client_open and launchd answers with
+# ThrottleInterval, not a useful error. Mirrors the justfile restart recipe
+# (which is also what `just reload` composes).
+cmd_repair() {
+    echo "repair: bouncing coreaudiod + JackBridge agents"
+    /usr/bin/sudo /usr/bin/killall coreaudiod || true
+    /usr/bin/sudo /usr/bin/killall "Core Audio Driver (JackBridgePlugIn.driver)" || true
+    /bin/sleep 2
+    # Force the plug-in to load so the shm region exists again.
+    /usr/sbin/system_profiler SPAudioDataType >/dev/null 2>&1 || true
+    /bin/launchctl kickstart -k "$DOMAIN/com.treefallsound.companion.jackd"   || true
+    /bin/launchctl kickstart -k "$DOMAIN/com.treefallsound.companion.daemon" || true
+    pi_service start   # bring the slave up too; repair implies "want audio"
+    echo "repair: agents kicked; give it a few seconds, then check: jackbridge-ctl status && jackbridge-ctl pi-status"
+}
+
 cmd_logs() {
     files="$LOG_DIR/com.treefallsound.companion.jackd.err.log $LOG_DIR/com.treefallsound.companion.jackd.out.log \
            $LOG_DIR/com.treefallsound.companion.daemon.err.log $LOG_DIR/com.treefallsound.companion.daemon.out.log"
@@ -143,10 +227,12 @@ cmd_logs() {
 }
 
 case "${1:-}" in
-    start)   cmd_start ;;
-    stop)    cmd_stop ;;
-    restart) cmd_stop; cmd_start ;;
-    status)  cmd_status ;;
-    logs)    cmd_logs ;;
-    *)       usage ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_stop; cmd_start ;;
+    status)    cmd_status ;;
+    pi-status) cmd_pi_status ;;
+    repair)    cmd_repair ;;
+    logs)      cmd_logs ;;
+    *)         usage ;;
 esac

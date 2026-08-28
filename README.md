@@ -93,6 +93,28 @@ Full diagnostics and rare cases: `docs/macos-setup.md`.
 
 ## Development
 
+### One-time machine setup
+
+Building the engine needs jack2 development files on the build machine, and
+the daemon at run time loads `/usr/local/lib/libjack.dylib`. Both come from
+the [`TreefallSound/jack2`](https://github.com/TreefallSound/jack2) fork —
+**stock jack2 is not sufficient.** The fork carries the netJACK2 slave
+reaping, KillMaster UAF fix, and the multicast interface pin; without them
+the engine permanently freezes its audio thread whenever the pi-Stomp side
+restarts or disconnects (see `jackbridge/…` and `docs/idiosyncrasies.md` for
+the exact failure mode).
+
+If you have a development clone of the fork next to this repo:
+
+```sh
+./jack-rebuild-mac.sh          # installs /usr/local/lib/libjack, restarts the engine
+```
+
+The script requires the fork's working tree to be clean and bakes the current
+HEAD into the build. For a fresh machine, install the fork's `.pkg` from a
+release first; the release install path is the supported one, this script is
+for iteration.
+
 The command runner is [`just`](https://just.systems). Install it with
 `brew install just`. Run `just --list` to see every command.
 

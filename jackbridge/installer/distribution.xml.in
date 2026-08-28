@@ -15,7 +15,7 @@
 // made a JACK_PREFIX=/opt/homebrew build refuse to install on a machine that
 // had JACK2 -- see the "One JACK prefix, stamped at build time" rule.
 //
-// Note this can only check presence and version: the sastraxi/jack2 fork
+// Note this can only check presence and version: the TreefallSound/jack2 fork
 // reports the same 'jackdmp version 1.9.22' as stock upstream, so a user who
 // installed stock JACK2 passes this check and then hits a silent netJACK2
 // discovery timeout for want of the multicast pin.

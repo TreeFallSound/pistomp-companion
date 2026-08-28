@@ -11,7 +11,7 @@ The installer installs jack2 and PiStomp Companion together.
 
 ## 2. Description
 
-PiStomp Companion needs the sastraxi fork of jack2.
+PiStomp Companion needs the TreefallSound fork of jack2.
 The stock jack2 does not have the multicast pin.
 Discovery stops if the multicast pin is not in the build.
 
@@ -36,7 +36,7 @@ You cannot find the difference at run time.
 
 1. Add the submodule.
 
-       git submodule add https://github.com/sastraxi/jack2.git vendor/jack2
+       git submodule add https://github.com/TreefallSound/jack2.git vendor/jack2
 
 2. Set the submodule to the correct commit.
 3. Commit the submodule and the .gitmodules file.
@@ -49,7 +49,7 @@ You cannot find the difference at run time.
 
 2. Build the jack2 package.
 
-       ./vendor/jack2/build-macos-pkg.sh 1.9.22-sastraxi.5
+       ./vendor/jack2/build-macos-pkg.sh 1.9.22-tfs.5
 
 3. Find the package in vendor/jack2/build/.
 
