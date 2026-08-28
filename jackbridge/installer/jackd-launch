@@ -7,6 +7,29 @@ export JACK_NO_START_SERVER=1
 SUPPORT="/Library/Application Support/JackBridge"
 OWNER_HELPER="$SUPPORT/jackbridge-jackd"
 STATUS_FILE="${JACKBRIDGE_STATUS_FILE:-/tmp/jackbridge-jackd.status}"
+ROUTE_STATE=/var/run/jackbridge-route.iface
+ETHERNET_SENTINEL=/var/run/jackbridge-ethernet.up
+
+write_status() {
+    tmp="${STATUS_FILE}.$$"
+    printf '%s\n' "$1" > "$tmp"
+    /bin/mv -f "$tmp" "$STATUS_FILE"
+}
+clear_status() { /bin/rm -f "$STATUS_FILE"; }
+
+# The wired interface the netJACK2 multicast group is pinned to, or failure
+# when there is not one. Both files are written by jackbridge-route-watcher:
+# it touches the sentinel only for a wired or direct-cable interface and
+# removes it on wifi-only or no-network, so the sentinel is already the
+# watcher's own "not Wi-Fi" verdict and this script does not repeat the
+# heuristic. Together they are the one predicate for "netJACK2 can reach
+# the pi at all".
+wired_iface() {
+    [ -f "$ETHERNET_SENTINEL" ] || return 1
+    _iface=$(/bin/cat "$ROUTE_STATE" 2>/dev/null) || return 1
+    [ -n "$_iface" ] || return 1
+    printf '%s\n' "$_iface"
+}
 
 # These two must match StandardOutPath / StandardErrorPath in
 # com.treefallsound.companion.jackd.plist.
@@ -40,6 +63,26 @@ else
     JACK_LSP="$JACK_PREFIX/bin/jack_lsp"
 fi
 
+# Gate. netJACK2 does not reach the pi over Wi-Fi, and netmanager binds
+# JACK_NETJACK_MULTICAST_IF once, when it loads. Starting before the route
+# watcher has pinned a wired interface therefore yields a JACK server that
+# looks entirely healthy and silently never sees the pi -- the ports never
+# appear and the menu just says "not in JACK graph". Waiting is the honest
+# behaviour, and it must happen before the coordinator too: that probes the
+# pi over the network for its timing and falls back to stale cached values
+# when the link is not up yet.
+WIRED_IFACE=$(wired_iface || true)
+if [ -z "$WIRED_IFACE" ]; then
+    write_status waiting-network
+    echo "jackd-launch: waiting for a wired connection to the pi" >&2
+    while [ -z "$WIRED_IFACE" ]; do
+        sleep 2
+        WIRED_IFACE=$(wired_iface || true)
+    done
+    clear_status
+    echo "jackd-launch: wired connection up on $WIRED_IFACE" >&2
+fi
+
 if [ "${1:-}" != --launch-jack ]; then
     exec "$SUPPORT/jackbridge-coordinator" "$@"
 fi
@@ -61,12 +104,6 @@ cap_log "$LOG_OUT"
 
 export JACKBRIDGE_INSTANCE="$$-$(/bin/date +%s)"
 
-write_status() {
-    tmp="${STATUS_FILE}.$$"
-    printf '%s\n' "$1" > "$tmp"
-    /bin/mv -f "$tmp" "$STATUS_FILE"
-}
-clear_status() { /bin/rm -f "$STATUS_FILE"; }
 [ -x "$OWNER_HELPER" ] || { echo "jackd-launch: $OWNER_HELPER missing" >&2; exit 1; }
 
 while :; do
@@ -88,18 +125,8 @@ fi
 [ -n "$PERIOD" ] || { echo "jackd-launch: period was not supplied by coordinator" >&2; exit 1; }
 echo "jackd-launch: using ClockDeviceUID=$CLOCK_UID rate=$RATE period=$PERIOD" >&2
 
-ROUTE_STATE=/var/run/jackbridge-route.iface
-for i in $(seq 1 20); do
-    [ -f "$ROUTE_STATE" ] && break
-    sleep 0.5
-done
-if [ -f "$ROUTE_STATE" ]; then
-    WIRED_IFACE=$(cat "$ROUTE_STATE")
-    export JACK_NETJACK_MULTICAST_IF="$WIRED_IFACE"
-    echo "jackd-launch: multicast route pinned to $WIRED_IFACE" >&2
-else
-    echo "jackd-launch: multicast route not pinned after 10 s" >&2
-fi
+export JACK_NETJACK_MULTICAST_IF="$WIRED_IFACE"
+echo "jackd-launch: multicast route pinned to $WIRED_IFACE" >&2
 
 JACKD_PID_FILE=/tmp/jackbridge-jackd.pid
 rm -f "$JACKD_PID_FILE"
@@ -182,4 +209,32 @@ if [ "$jackd_ready" = 1 ] && [ -x "$JACK_LOAD" ]; then
 elif [ "$jackd_ready" != 1 ]; then
     echo "jackd-launch: jackd not ready after 15s" >&2
 fi
+# Self-heal. netmanager cannot rebind its multicast interface live, so when
+# the watcher re-pins the group somewhere else -- cable moved, pi rebooted,
+# Wi-Fi rejoined -- the only repair is a fresh jackd. Exiting is that repair:
+# KeepAlive in com.treefallsound.companion.jackd.plist restarts the agent,
+# which re-enters the gate above and re-runs the coordinator's pi probe,
+# stale for exactly the same reason. The EXIT trap takes jackd with us.
+#
+# Compare contents, not mtime: jackbridge-pin-route is idempotent and
+# rewrites the same value on every network-change notification.
+#
+# A change has to survive a second look before we act on it. Bringing a link
+# up arrives as a burst -- link, then DHCP, then route -- and every restart
+# here is an audible dropout.
+while kill -0 "$JACKD_PID" 2>/dev/null; do
+    sleep 2
+    now_iface=$(wired_iface || true)
+    [ "$now_iface" = "$WIRED_IFACE" ] && continue
+    sleep 2
+    now_iface=$(wired_iface || true)
+    [ "$now_iface" = "$WIRED_IFACE" ] && continue
+    if [ -n "$now_iface" ]; then
+        echo "jackd-launch: wired interface moved $WIRED_IFACE -> $now_iface; restarting" >&2
+    else
+        echo "jackd-launch: wired connection lost (was $WIRED_IFACE); restarting" >&2
+    fi
+    exit 0
+done
+
 wait "$PIPELINE_PID"

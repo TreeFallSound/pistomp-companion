@@ -23,6 +23,11 @@ final class StatusMonitor {
         case none
         case ourServer
         case differentProgram
+        /// jackd-launch is holding before it starts JACK, because the route
+        /// watcher has not pinned a wired interface yet. netJACK2 cannot
+        /// reach the pi over Wi-Fi, so starting anyway would look healthy
+        /// and never find the pi.
+        case waitingForNetwork
     }
 
     /// A consistent snapshot of everything the UI and the diagnostics dump
@@ -171,6 +176,8 @@ final class StatusMonitor {
             state.jackCondition = .ourServer
         case "foreign":
             state.jackCondition = .differentProgram
+        case "waiting-network":
+            state.jackCondition = .waitingForNetwork
         default:
             state.jackCondition = .none
         }
@@ -233,6 +240,8 @@ final class StatusMonitor {
             return "JackBridge waits for JACK"
         case .differentProgram:
             return "A different program uses JACK"
+        case .waitingForNetwork:
+            return "Waiting for wired connection to pi-Stomp"
         case .none:
             break
         }
