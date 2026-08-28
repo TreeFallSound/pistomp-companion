@@ -58,6 +58,32 @@ reload: engine
     launchctl kickstart -k "{{gui}}/com.treefallsound.companion.jackd" || true
     @echo "stack reloaded. give it ~3s, then: just device-name"
 
+# Force-reload the whole stack including the menu-bar app. Use after a
+# protocol bump, when `just reload` alone leaves a stale shm region behind.
+# Does NOT refresh jackbridge-ctl or the LaunchAgent plists — those ship only
+# in the .pkg, so a change to either still needs `just pkg-install`.
+reload-all config="Release":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Quit through AppleScript, not pkill: applicationShouldTerminate shells
+    # out to `jackbridge-ctl stop` and defers termination until it returns,
+    # and SIGTERM does not reliably reach that path. The app is also what
+    # brings the stack back up (`jackbridge-ctl start` on launch), so it goes
+    # down first and comes up last.
+    if pgrep -x PiStompCompanion >/dev/null; then
+        echo "==> quitting PiStompCompanion"
+        osascript -e 'quit app "PiStompCompanion"' || true
+        for _ in $(seq 30); do
+            pgrep -x PiStompCompanion >/dev/null || break
+            sleep 0.2
+        done
+        pkill -9 -x PiStompCompanion 2>/dev/null || true
+    fi
+    just reload
+    # Order matters: new binaries first, then unlink — see the rmshm recipe.
+    just rmshm
+    just app-restart "{{config}}"
+
 # Bounce the two agents + coreaudiod without rebuilding (config change).
 restart:
     launchctl kickstart -k "{{gui}}/com.treefallsound.companion.daemon" || true
