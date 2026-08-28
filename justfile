@@ -212,14 +212,17 @@ reload-scripts: install-scripts
     just restart
 
 
-# Rebuild the current ../jack2 fork, install it directly into /usr/local, and
-# restart the Mac and Pi bridge together. The helper warns before building a
-# dirty fork tree, so uncommitted changes are included deliberately.
-# Rebuild and reinstall JACK2, then restart the Mac/Pi bridge.
+# Rebuild the current ../jack2 fork and install it directly into /usr/local.
+# The helper warns before building a dirty fork tree, so uncommitted changes
+# are included deliberately.
+#
+# Build + install only, per the layering rule. The helper boots the agents out
+# first (libjackserver.so is "text file busy" otherwise), so the stack is down
+# when this returns — bring it back with `just restart` or by launching the
+# Companion.
 jack-rebuild:
     ./jack-rebuild-mac.sh
-    "{{sys_support}}/jackbridge-ctl" restart
-    @echo "JACK rebuilt and bridge restarted. verify with: just status"
+    @echo "JACK rebuilt and installed. bring the stack back with: just restart"
 
 # Drop a stale shm region and bounce. Recovery after a protocol bump.
 rmshm: unlink-shm
