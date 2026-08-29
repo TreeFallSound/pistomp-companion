@@ -10,6 +10,8 @@
 #   netadapters   count of netadapter[-NN] jackd clients; >1 means duplicates
 #   ports_wired   netadapter ports with >=1 connection
 #   route         iface the 225.3.19.154 multicast group routes out of ("" if none)
+#   link          up | resyncing | unknown -- see LINK_STALE_S below
+#   net_restarts  netadapter link restarts since the service started
 #   iface         iface the ExecStartPre pin chose ("" if /run state absent)
 #   xruns_1m/5m/15m   ringbuffer xruns in the last 60/300/900 s
 #
@@ -20,6 +22,13 @@ set -u
 STATE=/run/jackbridge.iface
 GROUP=225.3.19.154
 XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
+LINK_FILE=/tmp/pi-stomp-jackbridge.link
+
+# A netadapter restart cycle repeats every few seconds while the master
+# refuses the data socket. A link with no restart for this long carries
+# audio again. Keep it above the retry period and below the patience of a
+# user who is looking at the screen.
+LINK_STALE_S=20
 
 iface=""
 [ -r "$STATE" ] && iface=$(cat "$STATE" 2>/dev/null) || true
@@ -71,10 +80,31 @@ if [ -r "$XRUN_FILE" ]; then
     done < "$XRUN_FILE"
 fi
 
+# The graph, the port count and the xrun rate all stay healthy while
+# netadapter restarts its network layer in process. This is the one field
+# that reports the fault.
+link=unknown
+net_restarts=0
+if [ -r "$LINK_FILE" ]; then
+    read -r last_restart net_restarts < "$LINK_FILE" || true
+    case "${last_restart:-}${net_restarts:-}" in
+        (*[!0-9]*|"") last_restart=""; net_restarts=0;;
+    esac
+    if [ -n "$last_restart" ]; then
+        if [ "$last_restart" -gt 0 ] && [ $(( $(date +%s) - last_restart )) -lt "$LINK_STALE_S" ]; then
+            link=resyncing
+        else
+            link=up
+        fi
+    fi
+fi
+
 printf 'service=%s\n'     "$active"
 printf 'netadapters=%s\n' "$netadapters"
 printf 'ports_wired=%s\n' "$ports_wired"
 printf 'route=%s\n'       "$route_dev"
+printf 'link=%s\n'        "$link"
+printf 'net_restarts=%s\n' "$net_restarts"
 printf 'iface=%s\n'       "$iface"
 printf 'xruns_1m=%s\n'    "$x1"
 printf 'xruns_5m=%s\n'    "$x5"

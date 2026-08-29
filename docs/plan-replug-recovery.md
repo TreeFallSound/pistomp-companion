@@ -16,6 +16,7 @@ and is not yet tested on hardware. Task C is done.
 | Fault 1 — the daemon writes a driver field | corrected, tested |
 | Fault 2 — the netJACK2 master does not start again | corrected in code, hardware test open |
 | Task C — reduce the menu to one recovery verb | done |
+| Correction 2c — the pi reports the fault | done in code, hardware test open |
 
 ## Fault 1 — the daemon wrote a field that the driver owns — CORRECTED
 
@@ -175,6 +176,26 @@ client that it made but did not make active.
 While in this code, chase the `jack_port_set_latency_range ... incorrect port`
 message from "Also seen". It is in the same failed-Init path and can be a
 use-after-free.
+
+### Correction 2c — the pi tells the user (this repository and `../pi-stomp`)
+
+While fault 2 continues, the pi looks correct to each signal that the LCD
+reads. netadapter restarts its network layer in the same process. Thus the
+JACK client and its ports stay. `jackbridge-pi-status` gave `service=active`,
+`netadapters=1`, `ports_wired=6`, the correct route and no xruns, and the LCD
+showed a clean screen while there was no audio.
+
+The one pi-side evidence is the jack journal line `NetAdapter is restarted`.
+`jackbridge-xrun-watcher` reads that journal for xruns. It now also counts
+that line and writes `/tmp/pi-stomp-jackbridge.link`
+(`<epoch_of_last_restart> <restarts>`). `jackbridge-pi-status` gives
+`link=up|resyncing|unknown` from the age of that value (`resyncing` = a
+restart in the last 20 s) and `net_restarts`.
+
+`../pi-stomp` shows `Link: ⚠ resyncing (xN)` and `Restart JackBridge on Host`
+in place of the port count, because the port count reads correct in
+exactly the condition that is not. The pi does no recovery: the plan shows
+that a restart of the pi service does not correct fault 2.
 
 Correction 2a hides fault 2 for the common case. Correction 2b removes it. Do
 2a first, because 2a is in this repository and a test is possible immediately.

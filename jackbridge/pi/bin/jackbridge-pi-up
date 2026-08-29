@@ -5,6 +5,7 @@
 set -euo pipefail
 
 XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
+LINK_FILE=/tmp/pi-stomp-jackbridge.link
 WATCHER=/usr/local/libexec/jackbridge/jackbridge-xrun-watcher
 
 # Serialize the load/wire portion of start and stop. The ExecStop handler
@@ -18,6 +19,7 @@ flock 9
 # Fresh file on every service start (contract documented in
 # ../pi-stomp/JACKBRIDGE_RECORDING.md).
 : > "$XRUN_FILE"
+: > "$LINK_FILE"
 
 # Pin the netJACK2 multicast group (225.3.19.154) to the JackBridge
 # interface. Without this, the slave's sendto() and the master's
@@ -109,4 +111,4 @@ jack_connect netadapter:capture_2 system:playback_2 || true
 # the watcher would make jackbridge-pi-down wait forever for its own lock.
 flock -u 9
 exec 9>&-
-exec "$WATCHER" "$XRUN_FILE"
+exec "$WATCHER" "$XRUN_FILE" "$LINK_FILE"

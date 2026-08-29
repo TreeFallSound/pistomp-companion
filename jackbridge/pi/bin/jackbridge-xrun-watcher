@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tails `journalctl -u jack` for netadapter ringbuffer xrun events and
-maintains a bounded per-minute count file at argv[1]. ALSO the service's
+maintains a bounded per-minute count file at argv[1]. It also records
+netadapter link restarts to the file at argv[2]. ALSO the service's
 netadapter liveness supervisor: polls the jack graph for a `netadapter`
 client and exits non-zero if it disappears, so systemd (`Restart=on-failure`)
 bounces the whole unit and re-wires the graph.
@@ -12,7 +13,14 @@ and the graph is cheap to poll from the same event loop that already runs
 here. Making this file the unit's long-running foreground process keeps
 MAINPID truthful: process alive ⇔ slave loaded + xrun telemetry flowing.
 
+Why the link file: netadapter restarts its network layer *in process* on a
+lost stream. The JACK client and its ports survive, so the graph, the port
+count, the route and the xrun rate all still say "healthy" while no audio
+crosses the wire. This journal line is the only pi-side evidence.
+
 File format: 15 lines, oldest first, each "<epoch_sec_of_minute> <count>".
+The link file is one line, "<epoch_of_last_restart> <restarts_since_start>",
+with 0 0 until the first restart.
 Consumer (pi-stomp modalapi/ethernet/manager.py read_xrun_buckets) sums the
 count column over the slice whose epoch is within 60/300/900s of now.
 
@@ -66,6 +74,10 @@ N_BUCKETS = 15  # 15 one-minute buckets = 15-minute window
 
 PATTERN = re.compile(r"JackRingBuffer::(Read|Write)\b.*\b(producer|consumer) too slow")
 
+# One line per restart cycle. The "connection lost" lines that precede it are
+# not counted -- a cycle emits several of them and one restart.
+LINK_PATTERN = re.compile(r"NetAdapter is restarted")
+
 
 def write_file(path: str, buckets: list[int], cur_min: int) -> None:
     """Atomic rewrite: 15 lines, oldest minute first."""
@@ -85,11 +97,31 @@ def write_file(path: str, buckets: list[int], cur_min: int) -> None:
         raise
 
 
+def write_link(path: str, last_restart: int, restarts: int) -> None:
+    """Atomic rewrite: one line, "<epoch_of_last_restart> <restarts>"."""
+    dirpath = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=".link-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{last_restart} {restarts}\n")
+        os.rename(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: jackbridge-xrun-watcher <path-to-xrun-file>", file=sys.stderr)
+    if len(sys.argv) != 3:
+        print(
+            "usage: jackbridge-xrun-watcher <path-to-xrun-file> <path-to-link-file>",
+            file=sys.stderr,
+        )
         return 2
     path = sys.argv[1]
+    link_path = sys.argv[2]
 
     proc = subprocess.Popen(
         ["journalctl", "-u", "jack", "-f", "-o", "cat", "-n", "0"],
@@ -97,6 +129,11 @@ def main() -> int:
         text=True,
         bufsize=1,
     )
+
+    # A restart total that survived a watcher crash would read as a fault
+    # that is over. Start from zero and say so.
+    restarts = 0
+    write_link(link_path, 0, 0)
 
     buckets = [0] * N_BUCKETS
     cur_min = int(time.time()) // 60
@@ -139,6 +176,11 @@ def main() -> int:
                 if PATTERN.search(line):
                     buckets[cur_min % N_BUCKETS] += 1
                     dirty = True
+                elif LINK_PATTERN.search(line):
+                    # Restarts arrive at most every few seconds, so this write
+                    # needs no rate limit of its own.
+                    restarts += 1
+                    write_link(link_path, int(now), restarts)
 
             # Flush at most once per second. Bounds filesystem work no matter
             # how fast xruns arrive — the bug this script's previous version

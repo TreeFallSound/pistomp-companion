@@ -40,6 +40,19 @@ xrun history (the LCD's 1m/5m/15m counters read this — one Unix-epoch timestam
 cat /tmp/pi-stomp-jackbridge.xruns
 ```
 
+Link restarts (`<epoch_of_last_restart> <restarts_since_service_start>`, `0 0`
+until the first one). netadapter restarts its network layer *in process* when
+the stream dies, so the graph, the port count and the xrun rate all stay
+healthy while no audio crosses the wire. This file is the only pi-side
+evidence; `jackbridge-pi-status` turns it into `link=up|resyncing|unknown`
+(resyncing = a restart in the last 20 s) and the LCD renders that instead of
+the port count:
+
+```sh
+cat /tmp/pi-stomp-jackbridge.link
+journalctl -u jack -n 40 -o cat | grep "NetAdapter is restarted"
+```
+
 Expected JACK graph once up: `netadapter:capture_{1,2}` (Mac → pi), `netadapter:playback_{1..4}` (pi → Mac), wired to `system:*` + `mod-monitor:*`.
 
 If the Mac doesn't see the pi: it's almost always the multicast pin landing on the wrong NIC. Check `/run/jackbridge.iface`.
