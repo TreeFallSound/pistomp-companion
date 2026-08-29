@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # jackbridge-pi-status — read-only status of the JackBridge netadapter slave.
 #
-# Consumed by the Mac (`jackbridge-ctl pi-status` over ssh) and the pi LCD UI
-# (modalapi/ethernet/manager.py), replacing `systemctl is-active` — its
-# MAINPID does not track netadapter, which jack_load runs in-process.
+# Consumed by the Mac (`jackbridge-ctl pi-status` over ssh) and by the pi's own
+# LCD status display (modalapi/ethernet/manager.py), replacing
+# `systemctl is-active` — its MAINPID does not track netadapter, which
+# jack_load runs in-process. Read-only on both paths: start/stop is the Mac's.
 #
 # Output: key=value, one per line, always exit 0. Keys, all always emitted:
 #   service       systemd state (active/failed/inactive/…; unknown on error)

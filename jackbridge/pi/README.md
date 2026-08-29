@@ -4,15 +4,24 @@ Turns the pi-stomp into a 4-in / 2-out audio interface for a Mac DAW over Ethern
 
 ## Turning it on and off
 
-The LCD UI is the supported control path: open the menu, find "Ethernet Audio Interface", toggle it. Same flow from a shell:
+**The Mac is the source of truth.** `jackbridge-ctl start` / `stop` on the Mac
+drives this unit over ssh, and the Companion *keeps* driving it: whenever the
+Mac stack is up and this slave is not, the Companion retries `jackbridge-ctl
+pi-start` until the ports wire (`PiSlaveHealer.swift`). That is what makes a
+pedal power-cycle, or a Mac that started before the pi finished booting,
+recover on their own instead of needing **Restart JackBridge**.
+
+The corollary: stopping the unit *on the pi* does not stick while the
+Companion is running — it will be started again within ~10 s. Stop it from the
+Mac. A shell here is for looking, not for deciding:
 
 ```sh
+systemctl is-active   pi-stomp-jackbridge.service
 sudo systemctl start  pi-stomp-jackbridge.service   # recording mode on
 sudo systemctl stop   pi-stomp-jackbridge.service   # off (default state)
-systemctl is-active   pi-stomp-jackbridge.service
 ```
 
-Intentionally **not** enabled at boot — netadapter's encode/decode is real CPU cost and isn't free for a performance pedal. Start it only when you want to record.
+Intentionally **not** enabled at boot — netadapter's encode/decode is real CPU cost and isn't free for a performance pedal. It is started on demand, by the Mac.
 
 ## What the DAW sees
 

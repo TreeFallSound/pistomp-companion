@@ -48,6 +48,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationPending = false
     private static let support = "/Library/Application Support/JackBridge"
     private static let ctl = "\(support)/jackbridge-ctl"
+    /// Retries the pi-side start that `jackbridge-ctl start` was allowed to
+    /// skip. Lazy so it can capture `runCtl` — every subprocess the Companion
+    /// spawns goes through that one bounded path.
+    private lazy var piHealer = PiSlaveHealer { [weak self] sub, done in
+        guard let self else { return done(false) }
+        self.runCtl(sub, completion: done)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = StatusItemController()
@@ -76,6 +83,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - rendering
 
     private func render(_ state: StatusMonitor.State) {
+        // Before anything visual: a slave that is down while the stack is up
+        // is a bug we can fix, not a status to draw. Cheap and idempotent —
+        // the healer is a pure state machine until it decides to act.
+        //
+        // Not while the user's own start/stop/restart is in flight: `stop`
+        // tears the slave down deliberately, and a heal racing it would ask
+        // the pi to start the unit that `stop` is in the middle of stopping —
+        // leaving a slave running against a Mac that has gone away. Pausing
+        // costs nothing, because the state that follows the operation is the
+        // one worth acting on anyway.
+        if pendingStackOperation == nil {
+            piHealer.note(state)
+        }
         // Offer guided key install the first time we spot a pi-shaped ssh
         // refusal this launch. Key: the pi answers TCP (state.piReachable)
         // but BatchMode ssh is refused — that's exactly the "no authorized

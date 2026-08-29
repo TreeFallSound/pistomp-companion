@@ -13,6 +13,7 @@
 #   jackbridge-ctl restart
 #   jackbridge-ctl status
 #   jackbridge-ctl pi-status       # key=value truth from the pi (jackbridge-pi-status)
+#   jackbridge-ctl pi-start        # start the pi slave only; idempotent, no Mac bounce
 #   jackbridge-ctl logs            # tail -f the agent log files
 #
 # Maintainer only (not in the Companion menu):
@@ -122,7 +123,7 @@ bootstrap_agent() {
     }
 }
 usage() {
-    sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
@@ -196,6 +197,29 @@ cmd_status() {
         printf "%-30s %s\n" "$label" "$line"
     done
 }
+# `pi-start` is the self-healing verb: bring the slave up on a pi that is
+# reachable now but was not when the Mac last asked. It is deliberately the
+# narrowest possible action -- no launchctl, no coreaudiod, nothing that
+# touches the Mac stack -- because the healer calls it while a DAW may be
+# holding the device, and any agent bounce flips DeviceIsAlive to 0 and costs
+# the user a re-select (see CLAUDE.md 4b). `systemctl start` on an already
+# active unit exits 0, so repeated calls are free.
+#
+# Unlike `pi_service`, this reports failure: it is driven by a retry loop with
+# backoff, and a loop that cannot tell success from failure either hammers the
+# pi forever or gives up on a pi that was merely slow to boot.
+cmd_pi_start() {
+    if ! pi_reachable; then
+        echo "pi unreachable at $PI_USER@$PI_HOST — slave not started" >&2
+        exit 1
+    fi
+    if ! pi_ssh "sudo systemctl start $PI_SERVICE" >/dev/null 2>&1; then
+        echo "pi: systemctl start $PI_SERVICE failed (pi reachable)" >&2
+        exit 1
+    fi
+    echo "pi: systemctl start $PI_SERVICE ok"
+}
+
 # `repair` is the heavy, sure-fire re-anchor: bounce coreaudiod (the only
 # place the plug-in's shm region is created / device name rebuilt), then the
 # two agents. Maintainer-only since Task C (docs/plan-replug-recovery.md):
@@ -237,6 +261,7 @@ case "${1:-}" in
     restart)   cmd_stop; cmd_start ;;
     status)    cmd_status ;;
     pi-status) cmd_pi_status ;;
+    pi-start)  cmd_pi_start ;;
     repair)    cmd_repair ;;
     logs)      cmd_logs ;;
     *)         usage ;;

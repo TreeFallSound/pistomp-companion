@@ -296,6 +296,7 @@ them are:
 | Symptom | User action |
 |---------|-------------|
 | Ports don't come back after a replug | Nothing — it should self-heal. Wait ~10 s. |
+| Pedal turned on (or rebooted) after the Mac | Nothing — the Companion re-asks the pi. Wait ~10 s. |
 | Still not green | **Restart JackBridge** |
 | DAW silent after any of the above | Re-select the device in the DAW |
 
@@ -305,9 +306,31 @@ it. Everything else in that table is a bug if a user ever has to do it after
 a plain cable replug — the fork's self-healing is supposed to cover exactly
 that. Fix it; do not write it up as a workaround.
 
+Row 2 is `PiSlaveHealer` (`app/PiStompCompanion/PiSlaveHealer.swift`).
+**The Mac is the source of truth for the pi's slave, always.** The pi's unit is
+not enabled at boot and nothing on the pi starts it; `jackbridge-ctl start`
+does, best-effort — and best-effort means it is allowed to silently skip an
+unreachable pi, which is why a pedal switched on after the Mac used to sit
+yellow forever. The healer makes that skip temporary: stack up, pi reachable,
+`slavePortsConnected == 0` for 10 s → `jackbridge-ctl pi-start`, with backoff.
+A live daemon heartbeat *is* the intent, so there is no separate flag to keep
+in sync, and `stop` ends healing by definition.
+
+`pi-start` is narrow on purpose — `systemctl start` over ssh, nothing else.
+Never heal by kicking the agents: that flips `DeviceIsAlive` → 0 and bills the
+user the device re-select in row 4 for a repair they never asked for.
+
 **"What do I run to debug this?"** — that is the maintainer altitude:
 `just`, `jackbridge-ctl`, ssh, the logs. Use it freely *here*, and never in
 an answer about what a user should do.
+
+The pi's ssh login is **`pistomp@pistomp.local`** — key-based, `BatchMode`
+works. `cam@` does not exist; it fails with `Permission denied (publickey)`,
+which reads like a missing key rather than a wrong user and will send you
+chasing the wrong thing. `PI_USER` in `jackbridge/tools/jackbridge-ctl` is
+the source of truth; `JACKBRIDGE_PI_HOST` overrides the host.
+The systemd unit on the pi is `pi-stomp-jackbridge.service` (system, not
+`--user`, so its journal needs `sudo journalctl -u`).
 
 Never name an internal shell function (`pi_service`, `bootstrap_agent`,
 `wired_iface`) as though it were a thing anyone can invoke. They are private

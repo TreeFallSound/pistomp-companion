@@ -4,7 +4,7 @@ Documentation=https://github.com/treefallsound/pistomp-companion
 # Attaches as a client to the stock pi-stomp jack stack. We don't replace it.
 Requires=jack.service
 After=jack.service mod-host.service
-# Not WantedBy anything — the LCD UI enables/disables on demand.
+# Not WantedBy anything — the Mac starts it on demand over ssh.
 
 [Service]
 Type=simple
@@ -58,4 +58,7 @@ Restart=on-failure
 RestartSec=3
 
 [Install]
-# Intentionally no WantedBy — this is on-demand only.
+# Intentionally no WantedBy — this is on-demand only. Nothing local starts it:
+# the Mac is the source of truth, and the Companion's healer re-asks whenever
+# the Mac stack is up and this unit is not (see jackbridge-ctl pi-start). That
+# is why a boot with the Mac already running still ends up connected.
