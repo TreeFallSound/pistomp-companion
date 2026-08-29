@@ -183,7 +183,10 @@ private:
 	UInt64						mStartCount;
 	UInt64						mSampleRateShadow;
 	UInt32						mRingBufferFrameSize;
-	UInt32                  	mDriverStatus;
+	//	Read on the IO thread (GetZeroTimeStamp reconciles shmDriverStatus
+	//	against it), written on the control threads by _HW_Open / _HW_StartIO /
+	//	_HW_StopIO / _HW_Close. Atomic so that read is not a data race.
+	std::atomic<UInt32>     	mDriverStatus;
 
 	// Daemon liveness — see SA_Device.cpp:GetZeroTimeStamp for the staleness
 	// check. mDaemonLive is atomic because the IO thread writes it and the

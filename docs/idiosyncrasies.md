@@ -119,6 +119,39 @@ pi-side client gives the Mac time to clean it up.
 **Mitigation in `jackbridge/pi/bin/jackbridge-pi-up:57-64`:** a delay between
 `jack_unload` and `jack_load` handles this jack2/netJACK2 integration edge case.
 
+
+## netJACK2 supersede livelock — the replug wedge
+
+When the Mac netmanager kills a *live* netmaster on an incoming
+SLAVE_AVAILABLE announce, the pi's netadapter socket stays `connect()`ed to
+the dead master's port. Linux connected-UDP then refuses every replacement
+master's SETUP with ICMP port-unreachable (the Mac sees `Recv fd = N err =
+Connection refused`), until the pi's own recv timeout restarts it — after
+which the next master succeeds, and the next announce kills it again.
+
+This is a **wedge**, not a crash: every process stays alive, the pi keeps
+announcing (~1/s), the Mac keeps building masters, and the graph never
+stabilizes. Measured live: 478 master recreations in one session
+(`New NetMaster started` → `superseding the live one` → refused SETUPs →
+repeat), ~9,000 xruns/min on the pi from starved ring buffers, zero audio.
+Each side's recovery action re-arms the other side's failure, so waiting
+never converges.
+
+Visible signature in the unfiltered log
+(`/tmp/com.treefallsound.companion.jackd.out.log`): master `ID : N`
+climbing every cycle, `NetMaster 'pistomp' already present — superseding the
+live one` between each `New NetMaster started`. A `tcpdump -i en7 -n 'udp
+port 19000 or icmp'` shows the pi answer exactly one SETUP per cycle then
+ICMP-refuse the rest.
+
+**Fix (2026-08-28):** `InitMaster` in `../jack2/common/JackNetManager.cpp`
+now ignores announces from a slave whose existing master `IsSynched()` (RT
+sync exchange completed, `std::atomic<bool> fSynched`); it only supersedes
+masters that never synched. `ReapDeadMasters()` remains the death path.
+Correction 2b's socket-close-on-failed-Init in the same file is related but
+insufficient alone — it tidies each iteration without breaking the cycle.
+See `docs/plan-replug-recovery.md`, fault 2.
+
 ## Proxy-ARP poisoning on link-local unicast
 
 The Mac's kernel can resolve a pi link-local address through the wrong

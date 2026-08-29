@@ -80,9 +80,35 @@ app:
 # makes them safe to chain. Follow with `just restart` (or use a loop recipe).
 
 # Copy the built driver, daemon and jb-rmshm into place. No restart.
+#
+# Replace the inode; never write through it. `cp` onto an existing Mach-O
+# overwrites the file's contents in place and keeps the inode, and when that
+# inode is still mapped by the running plug-in host the kernel's cached
+# code-signing mtime for the vnode goes stale against the new file mtime.
+# Every page then fails validation:
+#
+#   CODE SIGNING: rejecting invalid page ... (cs_mtime:… != mtime:…) tainted:1
+#   Error loading driver bundle JackBridgePlugIn.driver
+#     Couldn't communicate with a helper application.
+#
+# The helper is killed the instant it maps the binary, so coreaudiod comes up
+# with no JackBridge plug-in at all: no _HW_Open, no /JackBridge region, no
+# device, and JackBridged crash-looping on ENOENT. The state looks exactly
+# like a botched unlink-shm ordering and is not that.
+#
+# rm-then-copy gives the new binary a fresh inode, which carries no stale
+# cs_mtime. The gap where the bundle is absent is harmless: nothing loads it
+# until `restart`, which is a separate recipe by design.
 install-engine: engine
+    sudo rm -rf "{{sys_hal}}/JackBridgePlugIn.driver"
     sudo cp -R "{{engine_out}}/JackBridgePlugIn.driver" "{{sys_hal}}/"
-    sudo cp "{{engine_out}}/JackBridged" "{{engine_out}}/jb-rmshm" "{{sys_support}}/"
+    # Same hazard, and here mv makes it atomic: unlink the old name, install
+    # under a temp name on the same filesystem, rename over. A running
+    # JackBridged keeps its own (now unlinked) inode until it exits.
+    for f in JackBridged jb-rmshm; do \
+        sudo cp "{{engine_out}}/$f" "{{sys_support}}/.$f.new"; \
+        sudo mv -f "{{sys_support}}/.$f.new" "{{sys_support}}/$f"; \
+    done
 
 # These ship only in the .pkg, so a one-line change to any of them otherwise
 # costs a full `just pkg-install`: four xcodebuild runs (one a `clean build`)
@@ -145,20 +171,25 @@ restart:
     # Then jackd before the daemon: JackBridged exits 1 on a failed
     # jack_client_open, and launchd answers that with ThrottleInterval, not
     # with a useful error.
-    # kickstart -k only restarts a service that is already bootstrapped, and
-    # the app owns the stack: quitting it runs `jackbridge-ctl stop`, which
-    # boots both agents out of the domain. Running `just reload` with the app
-    # closed then failed with "Could not find service ... in domain for user
-    # gui: 501" and brought nothing up. Bootstrap first when absent — same
-    # rule as jackbridge-ctl's bootstrap_agent.
-    for label in com.treefallsound.companion.jackd com.treefallsound.companion.daemon; do
-        if launchctl print "{{gui}}/$label" >/dev/null 2>&1; then
-            launchctl kickstart -k "{{gui}}/$label" || true
-        else
-            launchctl enable "{{gui}}/$label" 2>/dev/null || true
-            launchctl bootstrap "{{gui}}" "/Library/LaunchAgents/$label.plist" || true
-        fi
-    done
+    # Delegate to jackbridge-ctl rather than driving launchctl here. The stack
+    # has two halves -- the Mac agents and the pi's netadapter -- and only
+    # jackbridge-ctl knows about both. An earlier version of this recipe
+    # kickstarted the two LaunchAgents directly. That had two faults, in
+    # sequence:
+    #
+    #   1. `kickstart -k` only restarts an already-bootstrapped service, so
+    #      running this with the app quit (which boots both agents out) failed
+    #      with "Could not find service ... in domain for user gui: 501".
+    #   2. Bootstrapping them here instead fixed that message and made it
+    #      worse: the Mac half came up, the pi was never told to start, and the
+    #      result LOOKS healthy -- agents running, netmanager loaded, ports
+    #      registered -- with nothing on the far end to answer. Silent half-up
+    #      beats a loud failure only in the sense that you stop noticing it.
+    #
+    # `jackbridge-ctl restart` is cmd_stop + cmd_start: it bootstraps the
+    # agents idempotently AND runs pi_service on both edges. One code path,
+    # both halves.
+    "{{sys_support}}/jackbridge-ctl" restart
 
 # Unlink the /JackBridge shm region. No restart — see the ordering constraint.
 unlink-shm:
@@ -185,6 +216,19 @@ device-name:
 # Tail engine logs (ctrl-C to stop).
 logs:
     log stream --predicate 'subsystem == "com.treefallsound.companion"' --info
+
+# Print the shm control fields: who owns the timeline, is the driver STARTED,
+# is the heartbeat advancing, how many slave ports are live. Read-only and safe
+# while audio runs -- it maps the region PROT_READ and touches nothing.
+#
+# Reach for this when the link is up, the ports are wired, and there is still
+# silence. `just status` and the menu bar both render an interpretation; this
+# shows the values they are interpreting. Offsets come from JackBridge.h, so a
+# protocol bump cannot silently desync it.
+shm instance="0":
+    @clang++ -std=c++17 -O2 -I jackbridge/shared \
+        -o "{{justfile_directory()}}/build/jbdump" jackbridge/tools/jbdump.cpp
+    @"{{justfile_directory()}}/build/jbdump" {{instance}}
 
 # One-line stack health from the installed ctl tool.
 status:

@@ -456,8 +456,18 @@ public:
         // Exiting here is what plan-b-daemon-survives-jackd.md removes: the
         // restart gap is dead air the user hears. The device now survives it,
         // but the gap itself is still ours to close.
+        //
+        // We write the heartbeat and NOT shmDriverStatus. That field belongs
+        // to the driver, and writing INIT here was a self-inflicted deadlock:
+        // nothing but _HW_StartIO ever writes STARTED back, so the daemon that
+        // LaunchAgent started next read INIT, took its own "driver isn't
+        // working" early return in process(), and zeroed the output buffers
+        // for good -- 6/6 ports wired, packets flowing, and silence, until the
+        // user re-selected the device in the DAW. That was the whole of the
+        // post-replug failure. The driver now also re-asserts the field on
+        // every GetZeroTimeStamp, so an older daemon cannot wedge a newer
+        // driver either.
         shmDaemonAlive->store(0, std::memory_order_release);
-        shmDriverStatus->store(JB_DRV_STATUS_INIT, std::memory_order_release);
         JB_LOG_DEFAULT(jb_log_jack(), "jackd shut down — exiting for LaunchAgent restart");
         kill(getpid(), SIGTERM);
     }

@@ -15,6 +15,11 @@
 #   jackbridge-ctl pi-status       # key=value truth from the pi (jackbridge-pi-status)
 #   jackbridge-ctl logs            # tail -f the agent log files
 #
+# Maintainer only (not in the Companion menu):
+#   jackbridge-ctl repair          # bounce coreaudiod + the plug-in host + both agents.
+#                                 # Runs `sudo killall`; needs a real terminal for the
+#                                 # password — never invoke it from a GUI context.
+#
 # Runs as the logged-in user (no sudo needed). LaunchAgent disabled-state
 # persists across reboots via /var/db/com.apple.xpc.launchd/disabled.<uid>.plist
 # so `stop` survives a reboot and `start` re-enables.
@@ -117,7 +122,7 @@ bootstrap_agent() {
     }
 }
 usage() {
-    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
@@ -191,12 +196,12 @@ cmd_status() {
         printf "%-30s %s\n" "$label" "$line"
     done
 }
-
 # `repair` is the heavy, sure-fire re-anchor: bounce coreaudiod (the only
 # place the plug-in's shm region is created / device name rebuilt), then the
-# two agents. The app's "Repair" menu item does the *light* version (writes a
-# nonce the driver honours in GetZeroTimeStamp — no process bounce) and falls
-# back to this if light didn't restore audio.
+# two agents. Maintainer-only since Task C (docs/plan-replug-recovery.md):
+# the Companion menu no longer offers it, because its `sudo killall` calls
+# fail without a terminal for the password and what remains — kickstart the
+# two agents, start the pi service — is exactly `jackbridge-ctl restart`.
 #
 # Order matters: coreaudiod first. The plug-in creates the shm region in
 # _HW_Open, which only runs when the plug-in loads — a bare `killall` leaves

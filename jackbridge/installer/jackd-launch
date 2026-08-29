@@ -71,6 +71,65 @@ fi
 # behaviour, and it must happen before the coordinator too: that probes the
 # pi over the network for its timing and falls back to stale cached values
 # when the link is not up yet.
+#
+# A second layer was added for the replug fault (docs/plan-replug-recovery.md,
+# Correction 2a): the sentinel and the route file both become true the moment
+# the link comes up, but a freshly plugged link-local interface cannot carry
+# data yet -- no address, or an ARP cache still pointing at the pre-unplug
+# entry. Starting jackd in that window loads netmanager against an interface
+# whose unicast path is dead, and every later handshake then fails with
+# ECONNREFUSED on the master side (fault 2). The fix is to make the gate wait
+# until the pi actually answers, with a bound: a jackd that records nothing is
+# worse than one that starts and fails loudly.
+#
+# Probe choice: one ICMP echo, 2 s timeout, via the configured pi hostname
+# (the same name netJACK2 and the daemon connect to). Ping is cheap, needs no
+# privileges, and exercises exactly the unicast path the handshake uses. It
+# cannot use jackbridge-coordinator's ssh probe: that runs *after* this gate,
+# and a failed probe there silently falls back to stale cached timing.
+
+# The configured pi hostname, or the shipped default. Mirrors the reader in
+# jackbridge-coordinator (PlistBuddy against the user config, then the
+# system default) and pi-hostname.sh.
+pi_hostname() {
+    _user_home=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+    _config=""
+    if [ -n "$_user_home" ] && [ "$_user_home" != root ]; then
+        _home=$(/usr/bin/dscl . -read "/Users/$_user_home" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+        [ -n "$_home" ] && _config="$_home/Library/Application Support/JackBridge/config.plist"
+    fi
+    [ -r "$_config" ] || _config="$HOME/Library/Application Support/JackBridge/config.plist"
+    if [ -r "$_config" ]; then
+        _host=$(/usr/libexec/PlistBuddy -c "Print :PiHostname" "$_config" 2>/dev/null) || _host=""
+        case "$_host" in
+            *[!A-Za-z0-9._:%-]*|"") ;;
+            *) printf '%s\n' "$_host"; return 0 ;;
+        esac
+    fi
+    printf '%s\n' "pistomp.local"
+}
+
+# Bounded wait: up to LINK_WAIT_LIMIT seconds total for the pi to answer one
+# 2 s ping. Reaching the limit is logged and the gate proceeds anyway — the
+# failure is then visible in jackd's own output instead of an agent that
+# records nothing.
+LINK_WAIT_LIMIT="${JACKBRIDGE_LINK_WAIT_LIMIT:-60}"
+
+wait_for_pi() {
+    _host=$(pi_hostname)
+    _deadline=$(( $(/bin/date +%s) + LINK_WAIT_LIMIT ))
+    while :; do
+        if /sbin/ping -c 1 -t 2 -n "$_host" >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$( /bin/date +%s )" -lt "$_deadline" ] || {
+            echo "jackd-launch: pi did not answer ping on $_host within ${LINK_WAIT_LIMIT}s; starting anyway" >&2
+            return 1
+        }
+        sleep 2
+    done
+}
+
 WIRED_IFACE=$(wired_iface || true)
 if [ -z "$WIRED_IFACE" ]; then
     write_status waiting-network
@@ -82,6 +141,16 @@ if [ -z "$WIRED_IFACE" ]; then
     clear_status
     echo "jackd-launch: wired connection up on $WIRED_IFACE" >&2
 fi
+
+# The link-local handshake needs the pi's unicast path alive, not merely the
+# interface present. Wait (bounded) for the pi to answer.
+write_status waiting-network
+if wait_for_pi; then
+    echo "jackd-launch: pi answers on $(pi_hostname); link is usable" >&2
+else
+    echo "jackd-launch: proceeding with link unverified" >&2
+fi
+clear_status
 
 if [ "${1:-}" != --launch-jack ]; then
     exec "$SUPPORT/jackbridge-coordinator" "$@"

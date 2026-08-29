@@ -59,6 +59,32 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 /******************************************************************************
  Audio functions (Generic/CoreAudio)
 ******************************************************************************/
+// FIELD OWNERSHIP. Every control field below has exactly one writer. Everyone
+// else reads it. This is not a style rule -- it is load-bearing, and breaking
+// it cost a permanent-silence bug: the daemon wrote DRIVER_STATUS = INIT from
+// on_shutdown, nothing but _HW_StartIO ever writes STARTED back, and so the
+// replacement daemon read INIT and zeroed its output buffers forever while the
+// link, the ports and the packets all looked healthy.
+//
+//   Driver (HAL) owns : DRIVER_STATUS, DRIVER_FAULT, HAL_ANCHOR_*,
+//                       HAL_INPUT_READ_HEAD, HAL_OUTPUT_WRITE_HEAD,
+//                       HAL_NFRAMES, HAL_SAMPLE_RATE,
+//                       READ/WRITE_FRAME_NUMBER(i)
+//   Daemon owns       : DAEMON_ALIVE, SLAVE_PORTS_CONNECTED, DAEMON_XRUNS,
+//                       JACK_PERIOD_FRAMES, JACK_SAMPLE_RATE, DEVICE_NAME,
+//                       BUFFER_SIZE, PROTOCOL_VERSION, SYNC_MODE
+//   App owns          : RESYNC_REQUEST (write-only; the driver only reads it)
+//   Mode-dependent    : NUMBER_TIMESTAMPS, ZERO_HOST_TIME, SEED. SYNC_MODE
+//                       picks the writer: 1 (the only mode shipped -- the
+//                       daemon sets it unconditionally) means the daemon
+//                       publishes the timeline and GetZeroTimeStamp just
+//                       relays it; 0 means the HAL free-runs and writes them
+//                       itself. Never both.
+//
+// The app is a reader everywhere else. If you need to signal across the
+// boundary, add a request field owned by the sender -- do not write the
+// receiver's state for it.
+
 // Shared memory map: (mapped every 1MB boundary for each instance)
 // 0x0000      : Control Registers (Read/Write Pointers)
 // 0x0000      :    upstream write pointer

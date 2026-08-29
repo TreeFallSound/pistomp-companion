@@ -109,9 +109,19 @@ just run-app         # build the app and open the build-tree copy
 ```sh
 just device-name  # the CoreAudio device entry (name, channels, transport)
 just status       # LaunchAgent health
+just shm          # the shm control fields, raw (read-only, safe while live)
 just logs         # os_log stream, subsystem com.treefallsound.companion
 just rmshm        # unlink-shm + restart (after a protocol bump)
 ```
+
+`just shm` is the one to reach for when the link is up, the ports are wired,
+and there is still silence. `status` and the menu bar both render an
+*interpretation* of the shm state as a single colour; `shm` prints the values
+they are interpreting — `driverStatus`, `syncMode`, the daemon heartbeat,
+`slavePortsConnected`, the fault bits. A stack that looks entirely healthy and
+is silent is usually one field disagreeing with another, and this is how you
+see which. Note `syncMode`: it is 1, meaning the daemon owns the timeline and
+the driver's `gDevice_*` anchor globals are dead code on that path.
 
 ### What the loops do *not* cover
 
@@ -257,6 +267,15 @@ Full design and constraints: `docs/architecture.md`.
    `static_assert`s pin size, alignment, and `is_always_lock_free`. Do not
    reintroduce `volatile`-as-synchronization.
 
+6. **Every shm control field has exactly one writer.** The ownership table
+   is at the top of `jackbridge/shared/JackBridge.h`. Writing another
+   component's state field is how you get a stack that looks entirely
+   healthy — link up, ports wired, packets flowing — and is silent: the
+   daemon wrote `driverStatus = INIT` on its way out, and since only
+   `_HW_StartIO` ever writes `STARTED` back, its own replacement then took
+   the "driver isn't working" early return forever. To signal across the
+   boundary, add a request field owned by the sender.
+
 The full list with file/line citations: `docs/idiosyncrasies.md`.
 Why the clock-domain rule holds: `docs/CLOCK_WARS.md` and `docs/architecture.md`.
 
@@ -277,8 +296,7 @@ them are:
 | Symptom | User action |
 |---------|-------------|
 | Ports don't come back after a replug | Nothing — it should self-heal. Wait ~10 s. |
-| Still not green | **Repair Audio Link** (light; no restart, no dropout) |
-| Still not green | **Full Repair (restarts audio)** — also restarts the pi slave |
+| Still not green | **Restart JackBridge** |
 | DAW silent after any of the above | Re-select the device in the DAW |
 
 That last row is currently unavoidable: a stack bounce flips
@@ -348,4 +366,5 @@ Read these when you touch the matching area, not before:
 | The jack2 fork | `docs/vendor-jack2.md` |
 | Shipping a release | `docs/releases.md` |
 | Walkthrough of the source tree | `docs/codebase-tour.md` |
+| Replug recovery, driver re-anchor (plan) | `docs/plan-replug-recovery.md` |
 | Daemon surviving a jackd restart (plan) | `docs/plan-b-daemon-survives-jackd.md` |

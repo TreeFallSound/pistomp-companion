@@ -14,12 +14,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var restartItem: NSMenuItem!
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
-    private var repairItem: NSMenuItem!
-    private var fullRepairItem: NSMenuItem!
-    /// Monotonic nonce for JB_OFF_RESYNC_REQUEST (driver compares new-vs-last
-    /// and re-anchors on a different value). Local-memory counter is enough —
-    /// we only ever need "a different integer".
-    private var resyncNonce: UInt64 = 0
+
+    /// Monotonic nonce for JB_OFF_RESYNC_REQUEST. The driver compares the
+    /// value against the last one it saw and acts only on a change, and the
+    /// value it saw survives us: the shm region and the loaded plug-in both
+    /// outlive the app. An in-memory counter restarting at 0 on every launch
+    /// therefore hands the driver a value it may already have latched, and a
+    /// resync request would silently do nothing on the first use of a run.
+    /// Derive it from the clock instead, which is monotonic across launches.
+    ///
+    /// Currently unused: Task C (docs/plan-replug-recovery.md) removed the
+    /// menu item that wrote the nonce. Keep the machinery — ShmWriter
+    /// .pokeResync, the driver's answer in SA_Device.cpp — for a future
+    /// automatic re-anchor; the driver honours a *change* in the value, so
+    /// mach_absolute_time() guarantees freshness whenever that caller lands.
+    @available(*, deprecated, message: "reserved for future automatic re-anchor")
+    private func nextResyncNonce() -> UInt64 { mach_absolute_time() }
+
     /// Whether we've already offered SSH key setup this launch. The probe
     /// fires on reachability state transitions, which can flap; the user
     /// sees the dialog once per app run, not on each flap.
@@ -202,19 +213,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(sshItem)
         m.addItem(.separator())
 
-        // Phase-4 recovery pair. "Repair" is the cheap re-anchor: it writes a
-        // nonce to JB_OFF_RESYNC_REQUEST and the driver honours it in
-        // GetZeroTimeStamp, so a REAPER session stays open and the device
-        // never enumerates away. "Full Repair" is the sure-fire bounce —
-        // a coreaudiod restart via jackbridge-ctl repair, used when light
-        // repair didn't take. Expose both until each has been exercised
-        // enough to know which one a musician should hit first.
-        repairItem = item("Repair Audio Link", #selector(repairLight(_:)))
-        fullRepairItem = item("Full Repair (restarts audio)", #selector(repairFull(_:)))
-        m.addItem(repairItem)
-        m.addItem(fullRepairItem)
-        m.addItem(.separator())
-
         m.addItem(item("Network Diagnostics…", #selector(runDiagnostics(_:))))
         m.addItem(item("Open Logs", #selector(openLogs(_:))))
         m.addItem(item("Settings…", #selector(openSettings(_:))))
@@ -294,53 +292,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(succeeded)
             }
         }
-    }
-
-    // MARK: - repair
-
-    @objc private func repairLight(_ s: Any?) {
-        resyncNonce &+= 1
-        let nonce = resyncNonce
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try ShmWriter().pokeResync(nonce: nonce)
-                NSLog("repair(light): wrote JB_OFF_RESYNC_REQUEST=%llu", nonce)
-            } catch {
-                NSLog("repair(light) failed: \(error.localizedDescription)")
-                DispatchQueue.main.async { [weak self] in
-                    self?.repairLightFailed(error)
-                }
-            }
-        }
-    }
-
-    @objc private func repairFull(_ s: Any?) {
-        // Same code path as the terminal `jackbridge-ctl repair` — bounce
-        // coreaudiod, reload the plug-in, kickstart the two agents. This is
-        // the "sure-fire" option; the menu wording warns it restarts audio.
-        DispatchQueue.global(qos: .userInitiated).async {
-            let r = ProcessRunner.run(Self.ctl, args: ["repair"], timeout: 60)
-            if r.launchError == nil && !r.timedOut && r.status == 0 {
-                NSLog("repair(full): jackbridge-ctl repair ok")
-            } else {
-                NSLog("repair(full) failed: status=%s timeout=%d err=%s: %s",
-                    String(describing: r.status), r.timedOut ? 1 : 0,
-                    String(describing: r.launchError), r.combined)
-            }
-        }
-    }
-
-    private func repairLightFailed(_ error: Error) {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Couldn't reach the driver"
-        alert.informativeText = """
-            The light Repair couldn't write to the shared region: \(error.localizedDescription)
-
-            Try "Full Repair (restarts audio)" — that rebuilds the driver from scratch.
-            """
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
     }
 
     @objc private func openModUI(_ s: Any?) {

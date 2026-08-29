@@ -1523,6 +1523,25 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
         }
     }
 
+    // Reconcile the driver-owned status word. `shmDriverStatus` is ours: only
+    // _HW_Open, _HW_StartIO and _HW_StopIO have any business writing it. A
+    // daemon that shut down used to write INIT here on its way out, and since
+    // nothing but _HW_StartIO ever writes STARTED again, its replacement then
+    // read INIT, took its own "driver isn't working" early return, and zeroed
+    // the output buffers forever -- ports wired, packets moving, and silence,
+    // until the user re-selected the device in the DAW and forced a StartIO.
+    // The daemon no longer does that (JackBridge.cpp on_shutdown), but an
+    // older daemon build against the same protocol version still can, so
+    // re-assert rather than trust. Load-compare-store, no allocation and no
+    // lock: RT-safe on this thread.
+    {
+        uint64_t shmStatus = shmDriverStatus->load(std::memory_order_relaxed);
+        uint64_t ownStatus = mDriverStatus.load(std::memory_order_relaxed);
+        if (shmStatus != ownStatus) {
+            shmDriverStatus->store(ownStatus, std::memory_order_release);
+        }
+    }
+
     uint64_t now = mach_absolute_time();
     uint64_t curAlive = shmDaemonAlive->load(std::memory_order_acquire);
     if (curAlive != mLastDaemonAlive) {
@@ -1890,7 +1909,7 @@ void	SA_Device::_HW_Open()
     // daemon-heartbeat watchdog flips mDaemonLive=0 (see GetZeroTimeStamp),
     // i.e. when the DAW is actively being fed bzero silence.
     shmDriverFault->store(0, std::memory_order_release);
-    mDriverStatus = JB_DRV_STATUS_ACTIVE;
+    mDriverStatus.store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     shmDriverStatus->store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     mRingBufferFrameSize = STRBUFNUM / 2;
 
@@ -1927,17 +1946,17 @@ void	SA_Device::_HW_Open()
 
 void	SA_Device::_HW_Close()
 {
-    mDriverStatus = JB_DRV_STATUS_INIT;
+    mDriverStatus.store(JB_DRV_STATUS_INIT, std::memory_order_release);
     return;
 }
 
 kern_return_t	SA_Device::_HW_StartIO()
 {
     JB_LOG_INFO(jb_log_driver(), "StartIO");
-    if (mDriverStatus == JB_DRV_STATUS_INIT) {
+    if (mDriverStatus.load(std::memory_order_acquire) == JB_DRV_STATUS_INIT) {
         return kAudioHardwareNotRunningError;
     }
-    mDriverStatus = JB_DRV_STATUS_STARTED;
+    mDriverStatus.store(JB_DRV_STATUS_STARTED, std::memory_order_release);
     shmDriverStatus->store(JB_DRV_STATUS_STARTED, std::memory_order_release);
     gDevice_AnchorHostTime = 0;
 
@@ -1967,7 +1986,7 @@ kern_return_t	SA_Device::_HW_StartIO()
 void	SA_Device::_HW_StopIO()
 {
     JB_LOG_INFO(jb_log_driver(), "StopIO");
-    mDriverStatus = JB_DRV_STATUS_ACTIVE;
+    mDriverStatus.store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     shmDriverStatus->store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
 	return;
 }

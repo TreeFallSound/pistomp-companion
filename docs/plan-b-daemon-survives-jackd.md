@@ -17,7 +17,7 @@ means no heartbeat. The heartbeat stops for the full restart time.
 
 The user hears silence for this time. The silence is longer than the cable
 fault. Each restart can also fail. A failed restart makes the user click
-**Repair Audio Link**.
+**Restart JackBridge**.
 
 ## The goal
 
