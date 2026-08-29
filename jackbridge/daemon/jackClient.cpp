@@ -81,6 +81,22 @@ void JackClient::_on_shutdown(void *arg) {
 JackClient::JackClient(const char* name, uint32_t flags) {
     jack_status_t jst;
 
+    // Opt this process out of libjack's automatic CoreAudio workgroup join.
+    //
+    // The fork makes every JACK client's realtime thread join the workgroup of
+    // jackd's *backend* device (ClockDeviceUID), which is what finally protects
+    // netmanager's client from preemption. We are the one client that must not
+    // take it: our process callback already joins the JackBridge HAL device's
+    // workgroup (see JackBridge.cpp process_callback), because with syncMode 1
+    // we publish that device's timeline -- the HAL returns our zeroHostTime
+    // straight out of GetZeroTimeStamp. We are scheduled by the backend but we
+    // *define* the HAL device's clock, so the two memberships are not
+    // interchangeable, and a thread cannot be assumed to hold both.
+    //
+    // Must be set before jack_client_open: libjack reads it when the realtime
+    // thread starts, which happens inside activate().
+    setenv("JACK_NO_WORKGROUP", "1", 1);
+
     client = jack_client_open(name, JackNoStartServer, &jst);
     if (!client) {
         JB_LOG_ERR(jb_log_jack(),
