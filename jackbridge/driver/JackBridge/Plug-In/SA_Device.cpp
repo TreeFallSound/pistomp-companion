@@ -90,6 +90,7 @@ SA_Device::SA_Device(AudioObjectID inObjectID, UInt32 instance)
 	mHealthMaxNFrames(0),
 	mHealthNearMiss(0),
 	mHealthLeadJitter(0),
+	mHealthPrevDaemonXRuns(0),
 	mSafetyOffsetFrames(0),
 	mDeviceName(NULL)
 {
@@ -1632,18 +1633,16 @@ void	SA_Device::BeginIOOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSiz
 	// mInputTime (capture time), mOutputTime (playback time), mCurrentTime
 	// (callback fire time). lead = |mCurrentTime - mInput/OutputTime| in
 	// frames. Nominal lead at a P-frame period is P-1 (fence-post): the
-	// IOProc fires when the buffer is just complete. Deviations are
+	// IOProc fires when the buffer is just complete. Deviations indicate
 	// CoreAudio scheduling stress; near-zero leads risk torn reads.
 	//
-	// mInputTime is only meaningful during ReadInput, mOutputTime only
-	// during WriteMix — sample each side only when its op fires.
+	// SafetyOffset is NOT included in nominal: it is a hint to CoreAudio
+	// clients about available processing window, but does not change when
+	// the IOProc fires or what the hardware timestamps contain.
 	if (gDevice_HostTicksPerFrame <= 0.0) return;
 
 	const SInt64 nowTicks = (SInt64)inIOCycleInfo.mCurrentTime.mHostTime;
-	// SafetyOffset shifts mInputTime back / mOutputTime forward by that many
-	// frames, so the nominal lead grows from (nframes-1) to
-	// (nframes-1 + SafetyOffset). leadJitter stays ≈0 in healthy steady state.
-	const SInt64 nominal  = (SInt64)inIOBufferFrameSize - 1 + (SInt64)mSafetyOffsetFrames;
+	const SInt64 nominal  = (SInt64)inIOBufferFrameSize - 1;
 	bool inNearMiss = false, outNearMiss = false;
 	if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
 		SInt64 inLead = (SInt64)((Float64)(nowTicks - (SInt64)inIOCycleInfo.mInputTime.mHostTime)
@@ -1693,16 +1692,28 @@ void	SA_Device::BeginIOOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSiz
 	                   : 0;
 	if (cyclesPer5s == 0 || mHealthCycleCount < cyclesPer5s) return;
 
+	// Δ daemon xruns over this window: cross-reference with maxBurst to
+	// determine whether JACK and HAL stalls are correlated. If daemonXrunsΔ
+	// is non-zero in the same window as a large maxBurst, the two are
+	// correlated and JB_JITTER_FRAMES must cover the full maxBurst value.
+	// If daemonXrunsΔ is always 0 during maxBurst events, the stalls are
+	// independent and JF can shrink to (maxBurst − stall_cycles×P).
+	UInt64 daemonXrunsNow = shmDaemonXRuns
+	    ? shmDaemonXRuns->load(std::memory_order_relaxed) : 0;
+	UInt64 daemonXrunsDelta = daemonXrunsNow - mHealthPrevDaemonXRuns;
+	mHealthPrevDaemonXRuns = daemonXrunsNow;
+
 	JB_LOG_INFO(jb_log_driver(),
-		"health cycles=%llu maxBurst=%u nearMiss=%u leadJitter=%llu",
-		(unsigned long long)mHealthCycleCount,
-		(unsigned)mHealthMaxNFrames,
-		(unsigned)mHealthNearMiss,
-		(unsigned long long)mHealthLeadJitter);
+	    "health cycles=%llu maxBurst=%u nearMiss=%u leadJitter=%llu daemonXruns=%llu",
+	    (unsigned long long)mHealthCycleCount,
+	    (unsigned)mHealthMaxNFrames,
+	    (unsigned)mHealthNearMiss,
+	    (unsigned long long)mHealthLeadJitter,
+	    (unsigned long long)daemonXrunsDelta);
 
 	mHealthCycleCount = 0;
 	mHealthMaxNFrames = 0;
-	mHealthNearMiss = 0;
+	mHealthNearMiss   = 0;
 	mHealthLeadJitter = 0;
 }
 

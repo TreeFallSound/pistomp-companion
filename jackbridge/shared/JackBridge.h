@@ -226,7 +226,15 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // unset in jackbridge-pi-up, so the default is what runs.
 #define JB_NET_LATENCY_CYCLES       2
 // netadapter -g, in frames. Set explicitly in jackbridge-pi-up's jack_load.
-#define JB_NETADAPTER_RING_FRAMES   512
+// G=512 caused resampler instability under mod-host load (2026-08-30);
+// G=1024 is the stable floor with the current pi image.
+#define JB_NETADAPTER_RING_FRAMES   1024
+// Daemon write-ahead safety margin in frames. Reported via
+// kAudioDevicePropertySafetyOffset; the DAW adds it on top of the one-way
+// latency, so it must NOT be included in jb_one_way_latency_frames().
+// Sized to cover the maximum observed CoreAudio IOProc burst (maxBurst=272
+// in a 2-hour live session 2026-08-30); 320 = next 5×P above that.
+#define JB_JITTER_FRAMES            320
 // IQaudIO ADC/DAC group delay (datasheet, low ms -> ~1 frame).
 #define JB_CODEC_GROUP_DELAY_FRAMES 1
 // LAN one-way transit on a direct cable. A consumer switch in the path costs

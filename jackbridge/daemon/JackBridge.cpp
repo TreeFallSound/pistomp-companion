@@ -149,7 +149,7 @@ static std::atomic<bool> g_wire_dirty{false};
 
 // Frames the daemon stays ahead of the HAL's read head. Published to shm so
 // the HAL reports the same number as SafetyOffset; see JB_OFF_JITTER_FRAMES.
-static constexpr long kDefaultJitterFrames = 0;
+static constexpr long kDefaultJitterFrames = JB_JITTER_FRAMES;
 static constexpr long kMaxJitterFrames = 2048;
 static long g_jitter_frames = kDefaultJitterFrames;
 static constexpr int64_t kSnapThresholdFrames = 512;
@@ -637,24 +637,32 @@ private:
     bool mWorkgroupJoined;
     int  mWorkgroupAcquireBackoff;
 
-    // RT-safe event counters drained by check_progress() every 5s. xruns come
-    // from jackd's xrun_callback; snaps are cycles where the FrameNumber-vs-
-    // halReadHead margin drifted >kSnapThresholdFrames from JitterFrames.
+    // RT-safe event counters drained by check_progress() every 5s.
     std::atomic<uint32_t> mXRunCount{0};
 
-    // Health-window accumulators, single-writer (JACK process thread via
-    // check_progress). All zero in healthy steady state.
-    uint64_t mHealthDeficit{0};        // Σ max(0, JitterFrames - margin) per cycle
-    uint64_t mHealthMarginAbsDev{0};   // Σ |margin - JitterFrames| per cycle
+    // Health-window accumulators, single-writer (JACK process thread).
+    // deltaMax: peak stall depth (FrameNumber - mLastSyncedFrame) in the window.
+    // Zero in steady state; grows when the HAL IOProc stalls and stops advancing
+    // halInputReadHead. Snap fires when a stall exceeds kSnapThresholdFrames.
+    uint64_t mHealthDeltaMax{0};
     std::atomic<uint32_t> mSnapCount{0};
 
+    // HAL head cache — written by check_progress() every JACK cycle (before
+    // send/recv), read by sendToCoreAudio/receiveFromCoreAudio in the same
+    // cycle. Single-writer (JACK process thread), no atomic needed.
+    uint64_t mCachedHalInputReadHead{0};   // HAL mInputTime.mSampleTime
+    uint64_t mCachedHalOutputWriteHead{0}; // HAL mOutputTime.mSampleTime
+    // frame_cursor value at the last time halInputReadHead advanced. Used by
+    // RingProjector::send_offset() to compute the daemon's delta during a
+    // HAL stall, so it keeps writing sequentially rather than overwriting.
+    uint64_t mLastSyncedFrame{0};
+
     int sendToCoreAudio(float** in, int nframes) {
-        // FIXME: should be consider buffer overwrapping
-        // Offset arithmetic lives in RingProjector (testable in isolation).
-        // Today this is open-loop: frame_cursor % ring_frames, with no
-        // reference to the HAL's read head. See investigation-bug1.md and
-        // the TODO in RingProjector::send_offset.
-        const RingProjector proj{ (uint32_t)FramesPerBuffer, FrameNumber };
+        const RingProjector proj{
+            (uint32_t)FramesPerBuffer, FrameNumber,
+            mCachedHalInputReadHead, mCachedHalOutputWriteHead,
+            mLastSyncedFrame, (int32_t)g_jitter_frames
+        };
         const uint32_t offset = proj.send_offset();
         for (int j = 0; j < NUM_INPUT_STREAMS; j++) {
             ring_write_stereo_interleaved(
@@ -665,13 +673,12 @@ private:
     }
 
     int receiveFromCoreAudio(float** out, int nframes) {
-        // FIXME: should be consider buffer overwrapping
-        // Offset arithmetic lives in RingProjector (testable in isolation).
-        // The (frame_cursor - nframes) expression is unsigned-arithmetic
-        // underflow-by-design on the first cycle after activation — preserved
-        // bug-for-bug from the inline code. See RingProjector::recv_offset.
-        const RingProjector proj{ (uint32_t)FramesPerBuffer, FrameNumber };
-        const uint32_t offset = proj.recv_offset(nframes);
+        const RingProjector proj{
+            (uint32_t)FramesPerBuffer, FrameNumber,
+            mCachedHalInputReadHead, mCachedHalOutputWriteHead,
+            mLastSyncedFrame, (int32_t)g_jitter_frames
+        };
+        const uint32_t offset = proj.recv_offset();
         for (int j = 0; j < NUM_OUTPUT_STREAMS; j++) {
             ring_consume_stereo_interleaved(
                 buf_up[j], (uint32_t)FramesPerBuffer, offset,
@@ -835,23 +842,38 @@ private:
     // Tail with:
     //   log stream --predicate 'subsystem == "com.treefallsound.companion" && category == "shm"'
     void check_progress() {
-        uint64_t halReadHead = 0;
+        // Snapshot HAL anchor under seqlock. Also captures the output write
+        // head, which the old code omitted (it was unused). Single retry loop
+        // — the HAL writer is fast (a few atomic stores), so contention is
+        // bounded and this is RT-safe.
+        uint64_t halReadHead = 0, halWriteHead = 0;
         uint64_t s1, s2;
         do {
             s1 = shmHalAnchorSeq->load(std::memory_order_acquire);
-            halReadHead = shmHalInputReadHead->load(std::memory_order_relaxed);
+            halReadHead  = shmHalInputReadHead->load(std::memory_order_relaxed);
+            halWriteHead = shmHalOutputWriteHead->load(std::memory_order_relaxed);
             s2 = shmHalAnchorSeq->load(std::memory_order_acquire);
         } while ((s1 & 1) || s1 != s2);
 
-        if (halReadHead > 0 && isActive) {
-            int64_t margin = (int64_t)FrameNumber - (int64_t)halReadHead;
-            int64_t delta  = margin - (int64_t)g_jitter_frames;
-            uint64_t adelta = (uint64_t)(delta < 0 ? -delta : delta);
-            mHealthMarginAbsDev += adelta;
-            if (delta < 0) mHealthDeficit += (uint64_t)(-delta);
-            if (adelta > (uint64_t)kSnapThresholdFrames) {
+        // Update cached heads before send/recv use them this cycle. Track when
+        // the downstream read head advances so send_offset() can apply the
+        // daemon's open-loop delta during a HAL stall.
+        if (halReadHead != mCachedHalInputReadHead) {
+            mLastSyncedFrame = FrameNumber;
+            mCachedHalInputReadHead = halReadHead;
+        }
+        mCachedHalOutputWriteHead = halWriteHead;
+
+        if (isActive) {
+            // delta = how far the daemon has advanced since halReadHead last moved.
+            // Steady state: halReadHead advances every CoreAudio cycle, mLastSyncedFrame
+            // is updated each cycle → delta ≈ 0. During a HAL stall, delta grows by
+            // nframes per JACK cycle. If it exceeds kSnapThresholdFrames the ring is
+            // at risk of a write-ahead collision.
+            uint64_t delta = FrameNumber - mLastSyncedFrame;
+            if (delta > mHealthDeltaMax) mHealthDeltaMax = delta;
+            if (delta > (uint64_t)kSnapThresholdFrames)
                 mSnapCount.fetch_add(1, std::memory_order_relaxed);
-            }
         }
 
         uint64_t period = (uint64_t)SampleRate * 5;
@@ -859,13 +881,11 @@ private:
             uint32_t xruns = mXRunCount.exchange(0, std::memory_order_relaxed);
             uint32_t snaps = mSnapCount.exchange(0, std::memory_order_relaxed);
             JB_LOG_INFO(jb_log_shm(),
-                "health xruns=%u deficit=%llu marginAbsDev=%llu snaps=%u",
+                "health xruns=%u deltaMax=%llu snaps=%u",
                 (unsigned)xruns,
-                (unsigned long long)mHealthDeficit,
-                (unsigned long long)mHealthMarginAbsDev,
+                (unsigned long long)mHealthDeltaMax,
                 (unsigned)snaps);
-            mHealthDeficit = 0;
-            mHealthMarginAbsDev = 0;
+            mHealthDeltaMax = 0;
         }
         lastTraceFrame = FrameNumber;
     }

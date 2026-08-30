@@ -22,8 +22,10 @@
     <string>backend</string>
 
     <!-- Frames the daemon stays ahead of the HAL read head, reported to the
-         DAW as SafetyOffset. See docs/JITTER.md before changing. -->
+         DAW as SafetyOffset. Sized to cover maxBurst=272 observed in a live
+         session (2026-08-30); 320 = 5×P. See docs/investigation-bug1.md
+         before changing. -->
     <key>JitterFrames</key>
-    <integer>0</integer>
+    <integer>320</integer>
 </dict>
 </plist>

@@ -225,6 +225,7 @@ private:
     UInt32                   mHealthMaxNFrames;       // 64 nominal; spikes = CoreAudio bunching
     UInt32                   mHealthNearMiss;         // cycles with inLead OR outLead < 16
     UInt64                   mHealthLeadJitter;       // Σ |lead - nominal| over in+out samples
+    UInt64                   mHealthPrevDaemonXRuns;  // for Δ xruns in health log
 
     // Reported one-way latency in frames, computed by
     // _UpdateAdvertisedLatency() from the period and sample rate the daemon
