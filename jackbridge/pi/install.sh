@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Idempotent installer for the pi-stomp-jackbridge service.
+# Idempotent installer for the pi-stomp-jackbridge service, for developing
+# against a live device by hand.
 #
-# Intended to be invoked during the pistomp-arch image build, but safe to run
-# by hand on a live device (just doesn't restart anything — the LCD UI owns
-# enable/disable, and we explicitly don't `systemctl enable` here).
+# NOT the image path. Images install the jackbridge .deb, which picks its own
+# helpers out of bin/ (see pi-gen-pistomp debpkgs/jackbridge/debian/rules) --
+# that list is the image's call, not ours, so it may be a subset of what this
+# script installs. Deploy a matched set or none: bin/jackbridge-pi-up and
+# bin/jackbridge-xrun-watcher agree on an argv contract, and copying one
+# without the other leaves the unit crash-looping on a usage error.
+#
+# Restarts nothing -- the LCD UI owns enable/disable, and we deliberately do
+# not `systemctl enable` here.
 set -euo pipefail
 
 PREFIX=${PREFIX:-/usr/local}

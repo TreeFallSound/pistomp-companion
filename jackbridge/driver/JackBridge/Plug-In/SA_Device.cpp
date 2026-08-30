@@ -1806,8 +1806,10 @@ CFStringRef	SA_Device::HW_CopyDeviceUID()
 }
 
 
-// Keep aligned with the daemon's fixed runtime default.
+// Fallback only, for a region the daemon has not published to yet. The live
+// value comes from shm — see _RefreshSafetyOffset.
 static constexpr UInt32 kDefaultJitterFrames = 0;
+static constexpr UInt32 kMaxJitterFrames = 2048;
 
 // The one-way latency leg is computed at runtime from the JACK period and
 // sample rate the daemon discovered from the Pi — see jb_one_way_latency_frames
@@ -1848,6 +1850,19 @@ bool	SA_Device::_RefreshDeviceNameFromShm()
 	mDeviceName = fresh;
 	JB_LOG_INFO(jb_log_driver(), "device name refreshed from shm: %{public}s", raw);
 	return true;
+}
+
+// Adopt the daemon's JitterFrames as SafetyOffset. Returns true when it moved,
+// so the caller knows whether the host needs telling.
+bool	SA_Device::_RefreshSafetyOffset()
+{
+    UInt32 published = (UInt32)shmJitterFrames->load(std::memory_order_acquire);
+    if (published > kMaxJitterFrames) published = kDefaultJitterFrames;
+    if (published == mSafetyOffsetFrames) return false;
+    JB_LOG_INFO(jb_log_driver(), "safetyOffset %u -> %u frames",
+        (unsigned)mSafetyOffsetFrames, (unsigned)published);
+    mSafetyOffsetFrames = published;
+    return true;
 }
 
 bool	SA_Device::_UpdateAdvertisedLatency()
@@ -1921,7 +1936,7 @@ void	SA_Device::_HW_Open()
     mReportedLatencyInput  = 0;
     mReportedLatencyOutput = 0;
     _UpdateAdvertisedLatency();
-    mSafetyOffsetFrames    = kDefaultJitterFrames;
+    _RefreshSafetyOffset();
     // Device display name, published by the daemon at attach. Copy it out of
     // shm into a retained CFString — the shm region can be torn down and
     // recreated by a daemon restart while we hold the name.
@@ -1977,6 +1992,16 @@ kern_return_t	SA_Device::_HW_StartIO()
         AudioObjectPropertyAddress addrs[2] = {
             { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput,  kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain }
+        };
+        SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 2, addrs);
+    }
+
+    // The daemon may have attached after _HW_Open, or come back with a new
+    // JitterFrames. Same reasoning as the latency refresh above.
+    if (_RefreshSafetyOffset()) {
+        AudioObjectPropertyAddress addrs[2] = {
+            { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeInput,  kAudioObjectPropertyElementMain },
+            { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain }
         };
         SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 2, addrs);
     }

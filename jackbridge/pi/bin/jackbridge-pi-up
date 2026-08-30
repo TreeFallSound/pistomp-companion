@@ -74,7 +74,45 @@ done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/
 #   playback_* = TO master  (audio we send to the Mac)  → -P
 #   capture_*  = FROM master (audio we receive from the Mac) → -C
 # We want 4 channels pi→Mac (HW caps + mod-host wet) and 2 channels Mac→pi.
-jack_load netadapter -i "-C 2 -P 4 -q 0 -g 512"
+# -l is the master/slave loop budget: the Mac's netmanager consumes slave data
+# JACKBRIDGE_NET_LATENCY cycles old (JackNetInterface.cpp fMaxCycleOffset), so
+# it must exceed the worst round trip or the master's client blocks past its
+# deadline every time the link spikes. netadapter's own default is 2 (~2.7 ms
+# at 48k/64), which a USB NIC does not reliably beat. Override in
+# /etc/default/jackbridge.
+NET_LATENCY="${JACKBRIDGE_NET_LATENCY:-2}"
+case "$NET_LATENCY" in
+    ''|*[!0-9]*|0) NET_LATENCY=2 ;;
+esac
+[ "$NET_LATENCY" -le 30 ] || NET_LATENCY=30
+
+# -g sizes the slip ring. It is NOT independent of -l: the resampler drives
+# ring occupancy toward the midpoint (g/2), and -l demands NET_LATENCY * period
+# frames of cushion inside that same ring. Ask for more cushion than the
+# midpoint holds and the pi overruns -- g=512 with l=6 at period 64 wants 384
+# frames against a 256-frame target, which xruns at roughly 2/second while the
+# Mac side looks perfectly healthy.
+#
+#     required:  (NET_RING / 2)  >  NET_LATENCY * period
+#
+# Raise them together. JB_NETADAPTER_RING_FRAMES and JB_NET_LATENCY_CYCLES in
+# pistomp-companion shared/JackBridge.h mirror both for the advertised-latency
+# model, and do not track these -- change one here, change it there.
+NET_RING="${JACKBRIDGE_NET_RING:-512}"
+case "$NET_RING" in
+    ''|*[!0-9]*|0) NET_RING=512 ;;
+esac
+
+PERIOD=$(jack_bufsize 2>/dev/null | tr -cd '0-9') || PERIOD=""
+if [ -n "$PERIOD" ] && [ "$PERIOD" -gt 0 ] 2>/dev/null; then
+    need=$(( NET_LATENCY * PERIOD ))
+    if [ "$(( NET_RING / 2 ))" -le "$need" ]; then
+        echo "jackbridge-pi-up: WARNING -g $NET_RING (midpoint $(( NET_RING / 2 ))) cannot hold" \
+             "-l $NET_LATENCY at period $PERIOD (needs > $need frames); expect pi-side xruns" >&2
+    fi
+fi
+
+jack_load netadapter -i "-C 2 -P 4 -q 0 -g $NET_RING -l $NET_LATENCY"
 
 # Beat for port registration to settle before we connect.
 sleep 0.5

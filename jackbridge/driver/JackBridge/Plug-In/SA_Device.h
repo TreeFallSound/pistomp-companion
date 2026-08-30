@@ -146,6 +146,7 @@ private:
 	// daemon published in shm. Returns true if the value changed, so the
 	// caller can notify the host. Never call from the IO thread.
 	bool						_UpdateAdvertisedLatency();
+	bool						_RefreshSafetyOffset();
 	bool						_RefreshDeviceNameFromShm();
 	void						_HW_Open();
 	void						_HW_Close();
@@ -240,11 +241,12 @@ private:
     CFStringRef                mDeviceName;
 
     // Fixed runtime safety margin; intentionally not user configurable.
-    // Advertised via kAudioDevicePropertySafetyOffset, but note that the
-    // daemon does not consume it as a write lead (docs/investigation-bug1.md)
-    // and raising it had no measurable effect on jitter (docs/JITTER.md), so
-    // at 0 it is inert by design rather than by accident.
-    // Must remain aligned with kDefaultJitterFrames in JackBridge.cpp.
+    // Advertised via kAudioDevicePropertySafetyOffset. Adopted from the
+    // daemon's JitterFrames via shm (_RefreshSafetyOffset), not a constant.
+    // Note the prior result before spending time here: sweeping it 0 -> 4096
+    // changed the click rate not at all, and nearMiss stayed 0 across the
+    // whole range (docs/JITTER.md:54). It is configurable so that experiment
+    // is cheap to repeat, not because 0 is known to be wrong.
     UInt32                   mSafetyOffsetFrames;
 };
 

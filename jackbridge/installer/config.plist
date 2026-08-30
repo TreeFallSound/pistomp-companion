@@ -14,5 +14,16 @@
     <!-- Empty means automatic wired-interface detection. -->
     <key>NetworkInterface</key>
     <string></string>
+
+    <!-- Which CoreAudio workgroup the daemon's JACK realtime thread joins:
+         backend (jackd's clock device), hal (the JackBridge virtual device),
+         or none. A thread can hold exactly one. -->
+    <key>Workgroup</key>
+    <string>backend</string>
+
+    <!-- Frames the daemon stays ahead of the HAL read head, reported to the
+         DAW as SafetyOffset. See docs/JITTER.md before changing. -->
+    <key>JitterFrames</key>
+    <integer>0</integer>
 </dict>
 </plist>

@@ -1,5 +1,188 @@
 # Jitter / crackle investigation
 
+## Status update 2026-08-29 — netJACK2 loop budget, and a warning about the metric
+
+Short version: the 2026-06-02 conclusion below (Mac `pistomp` misses its
+deadline) is **confirmed and re-explained**. It is not primarily preemption.
+The netJACK2 loop budget is smaller than the cable's worst-case round trip, so
+in sync mode the master blocks in `recv()` past its deadline. Sizing the budget
+drops Mac xruns ~20x. **It did not stop the audible clicks**, and that gap is
+the most important thing on this page.
+
+### The metric and the symptom disagree
+
+Measured within minutes of each other, same rig:
+
+| Config | Mac xruns / 5 s | Pi `xruns_1m` | Audible |
+|---|---|---|---|
+| `-l 6 -g 512` | 0.33 | 108-162 | clicks every few seconds |
+| `-l 4 -g 1024` | 1.7 | 0 | "lots of clicks" |
+
+At `-l 4 -g 1024` both counters are near zero and the clicks are worse than
+ever. `deficit=0`, `snaps=0`, driver `nearMiss=0` throughout. So whatever
+produces the audible artifact is **not** counted by jackd's xrun callback, by
+the daemon's margin tracking, or by the HAL's near-miss counter.
+
+Do not declare this fixed on an xrun number again. Every configuration below
+was scored on xruns because that is what is instrumented; that is a proxy, and
+tonight it was demonstrably a poor one. The open question is what the clicks
+actually are — "What's left to try" #3 (click-localization with a known
+signal) is now the highest-value item on this page, not the lowest.
+
+### The loop budget is undersized (real, measurable, partial)
+
+`jackbridge-pi-up` loaded netadapter with no `-l`, so `JackNetAdapter.cpp:51-52`
+applied: `fSlaveSyncMode = 1` and `fNetworkLatency = NETWORK_DEFAULT_LATENCY`
+= 2. `-l N` means the master consumes slave data N cycles old
+(`fMaxCycleOffset`, `JackNetInterface.cpp:348,512-517`) — N x 1.333 ms of
+round-trip slack at 48k/64.
+
+Direct-cable RTT, 30 ICMP packets over `en7`:
+
+    min 1.121 / avg 2.386 / max 7.517 / stddev 1.335 ms,  0.0% loss
+
+The cycle is 1.333 ms. The **average** round trip is 1.8 cycles and the jitter
+alone is a full cycle, against a 2-cycle budget. Zero loss, zero NIC errors —
+timing, not delivery.
+
+Caveat: ICMP is not netJACK2's path. netadapter's recv runs on an RT thread,
+not ping's userspace, so the mean overstates. The stddev is the trustworthy
+part.
+
+### The delay is the pi's, not the cable's or the Mac's
+
+Same 30-packet test in both directions:
+
+| direction | min | avg | max | jitter |
+|---|---|---|---|---|
+| Mac -> pi | 1.121 | 2.386 | 7.517 | 1.335 |
+| pi -> Mac | 0.256 | 0.677 | 2.871 | 0.559 |
+
+The pi-initiated round trip crosses the Mac's USB adapter **twice** and is 3.5x
+faster with a 2.6x lower worst case. `en7` is a "USB 10/100/1000 LAN" adapter
+and an early guess blamed it for the tail; this measurement exonerates it. It
+demonstrably turns packets around in 0.256 ms.
+
+The slow direction is the one where **the pi generates the reply**. Pi-side
+findings that explain it:
+
+- `ethtool -c eth0`: `rx-usecs: 49`, `tx-usecs: 49` — ~49 us of interrupt
+  coalescing deliberately added in each direction.
+- `/sys/class/net/eth0/threaded` = 0 — NAPI runs in softirq context. On this
+  PREEMPT_RT kernel an FF thread preempts softirq processing, so packet
+  delivery stalls behind audio rather than interleaving with it.
+- eth0 IRQ 104 is pinned entirely to **CPU0** (15.1M interrupts, zero on
+  CPUs 1-3), and CPU0 also carries jackd RT thread TID 102163 (FF 70) and
+  mod-host (FF 65). All 4 cores carry RT threads, so "move the IRQ somewhere
+  quiet" has nowhere to go without pinning the audio threads too.
+
+Note this partially re-opens "What we've eliminated" #4. That test moved the
+eth IRQ *onto* CPU0 to get it away from a jackd RT thread on CPU3; an RT
+thread has since landed on CPU0, so the co-location is back — and it is now
+the netJACK2 thread specifically, which is the one that matters for turnaround.
+
+### Reducing the RTT instead of hiding it (untried)
+
+`-l` and `-g` buy tolerance for a bad RTT. These attack the RTT itself:
+
+1. `sudo ethtool -C eth0 rx-usecs 0 tx-usecs 0` — removes ~49 us per
+   direction. Small next to a 7.5 ms tail, but free and immediate.
+2. `echo 1 | sudo tee /sys/class/net/eth0/threaded` — moves NAPI into a
+   schedulable kthread, then give `napi/eth0-*` an explicit RT priority just
+   below jackd's. This is the standard PREEMPT_RT remedy for exactly this
+   shape and is the highest-value item here.
+3. Deliberate CPU partitioning: pin the netJACK2 RT thread and the eth0 IRQ to
+   *different* cores, rather than letting them collide by accident.
+
+None of these have been measured. Re-run the bidirectional ping after each.
+
+### Corroboration: playback is much glitchier than recording
+
+Reported independently of the ping test, and it matches the asymmetry exactly:
+
+- **Playback** = Mac -> pi. The pi must receive and process. Slow direction.
+- **Recording** = pi -> Mac. The Mac must receive. Fast direction.
+
+The two data-carrying flows are different packets on the same sync exchange:
+master->slave carries playback (netadapter `capture_*`), slave->master carries
+recording (netadapter `playback_*`). A jittery pi receive path starves the
+playback side of netadapter's ring while the recording side is unaffected.
+
+**This is probably the answer to "the metric and the symptom disagree" above.**
+The playback artifact happens on the *pi*, inside netadapter's capture ring.
+Nothing on the Mac can count it, and `xruns_1m` counts jackd graph xruns and
+ring "too slow" events — not a resampler filling a gap. So both counters can
+read 0 through audible clicking, which is precisely what was observed at
+`-l 4 -g 1024`.
+
+Corollary: the pi's receive path is the target, so the three levers above are
+aimed correctly. Score them on **audible playback**, or on a pi-side capture of
+netadapter's ring occupancy — not on either xrun counter.
+
+### `-l` and `-g` are coupled — raising one alone moves the fault, silently
+
+`-g` sizes the slip ring; the resampler drives occupancy toward the midpoint
+(`g/2`), which is why the latency model uses `T_g = G/2`. `-l` demands
+`N * period` frames of cushion *inside that ring*.
+
+    required:  (g / 2)  >  l * period
+
+`-l 6 -g 512` asks a 256-frame target to hold 384 frames. Result: the **pi**
+xruns at ~2/s while Mac xruns, `deficit`, `snaps` and `nearMiss` all stay
+clean. That reads as "the change did nothing" unless you check
+`jackbridge-pi-status` on the pi. Raise them together.
+
+Both are now knobs in `/etc/default/jackbridge`
+(`JACKBRIDGE_NET_LATENCY`, `JACKBRIDGE_NET_RING`); `jackbridge-pi-up` warns to
+the journal when the inequality fails. See CLAUDE.md 4b.
+
+### The DAW's buffer size dominated everything else
+
+| Workgroup | DAW `halNFrames` | `-l` | Mac xruns / 5 s |
+|---|---|---|---|
+| `hal` | 128 | 2 | 39.6 |
+| `none` | 64 | 2 | 19.0 |
+| `backend` | 64 | 2 | 12.5 |
+| `hal` | 64 | 2 | 7.3 |
+| `hal` | 64 | 6 (`-g 2048`) | 0.17 |
+
+REAPER at 128 was 5x worse than the same config at 64. The first row is the
+condition the original crackle report was filed under.
+
+**The driver never implements `kAudioDevicePropertyBufferFrameSize` or
+`...BufferFrameSizeRange`** (`SA_Device.cpp` handles neither selector), so
+CoreAudio hands clients its generic 128-frame default and a host cannot request
+64. Fixing that is untried and cheap.
+
+### The workgroup axis is second-order
+
+2026-06-02 point 6 hypothesized that joining the device workgroup was the fix.
+The fork now does it (`JackClient.cpp` SetupRealTime, opt out with
+`JACK_NO_WORKGROUP`), and `Workgroup` in `config.plist` selects backend / hal /
+none for the daemon.
+
+A thread holds exactly one: `os_workgroup_join` returns `EALREADY` for a
+workgroup that does not nest, and two CoreAudio device workgroups do not nest.
+
+Measured (rows 2-4 above): the choice moves xruns 2-5x and never to zero. At
+matched buffer size `hal` beat `backend`, which is the opposite of what the
+"join the workgroup whose deadline you must meet" argument predicts — the
+earlier `hal` = 39.6 figure was a 128-frame artifact, not evidence about
+workgroups. Treat this axis as tuning, not cause.
+
+### Reconfirmed
+
+- `nearMiss = 0` and `leadJitter ~1.2 frames/cycle` in every configuration
+  tested, including while clicking. The HAL is not the bottleneck. This is the
+  third independent confirmation; stop testing it.
+- The xrun stanza shape from point 4 below is a **graph ordering artifact**:
+  auto-wire makes `pistomp:from_slave_N -> JackBridge #1:input_N`, so
+  JackBridge runs downstream. `JackBridge #1 ... state = Triggered` means it
+  never got its turn behind `pistomp`. Its xruns are derivative — do not read
+  them as an independent fault.
+
+---
+
 ## Status update 2026-06-02 — root cause localized
 
 The "still to try" list below (hops 8/9 — daemon shm read/write path) is
@@ -224,6 +407,11 @@ and looking for discrete jumps. Requires a small modification to jack2
 or LD_PRELOAD'ing a shim. Lower prior than #1–#3.
 
 ### 5. Bump netadapter `-g 2048` (jitter tolerance / fewer ring doublings)
+**Superseded 2026-08-29** — `-g` is not an independent knob, it is `-l`'s
+partner (`g/2 > l * period`), and both are now settable from
+`/etc/default/jackbridge`. See the 2026-08-29 status update. Original note
+kept below.
+
 **Not currently relevant** for the empty-board click — under empty board
 the adapter ring isn't failing. But if we re-introduce load and the
 adapter ring resets come back, `-g 2048` pins the ring at 2048 frames
@@ -253,13 +441,16 @@ One-line change in `jackbridge/pi/bin/jackbridge-pi-up` (`jack_load netadapter -
 
 ## FAQ
 
-1. **Which direction has the clicks?** Playback (Mac → pi speakers)
-   and recording (pi mic → Mac DAW) both have clicks.
+1. **Which direction has the clicks?** Both, but **playback (Mac → pi
+   speakers) is much worse than recording** (pi mic → Mac DAW) — confirmed
+   2026-08-29, and it matches the measured RTT asymmetry: playback is the
+   direction the pi has to receive on.
   
 2. **Are clicks correlated with anything observable?** They seem to be
    a bit more common when I'm doing a lot of other stuff on the Mac,
    but they happen even when I'm just sitting and playing back something
    on the pi-Stomp via JackRouter.
 
-3. **Does the click rate change with sample rate or buffer size?** 
-   Unknown so far.
+3. **Does the click rate change with sample rate or buffer size?**
+   Yes, strongly. The DAW's CoreAudio buffer at 128 frames measured 5x the
+   Mac xrun rate of the same config at 64 (2026-08-29). Sample rate untested.

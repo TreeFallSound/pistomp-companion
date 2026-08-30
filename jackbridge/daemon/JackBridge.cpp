@@ -61,17 +61,64 @@ static std::string config_plist_string(const char* key) {
             if (strstr(line, needle)) want_value = true;
             continue;
         }
-        // Expect:  <string>value</string>
-        const char* open = strstr(line, "<string>");
-        const char* close = open ? strstr(open + 8, "</string>") : nullptr;
-        if (open && close && close > open + 8) {
-            result.assign(open + 8, close);
+        // Expect <string>value</string> or <integer>value</integer>.
+        static const struct { const char* open; const char* close; size_t len; } tags[] = {
+            { "<string>",  "</string>",  8 },
+            { "<integer>", "</integer>", 9 },
+        };
+        for (const auto& t : tags) {
+            const char* open = strstr(line, t.open);
+            const char* close = open ? strstr(open + t.len, t.close) : nullptr;
+            if (open && close && close > open + t.len) {
+                result.assign(open + t.len, close);
+                break;
+            }
         }
         break;
     }
     fclose(f);
     return result;
 }
+
+// Numeric config value, clamped. Anything unparseable falls back to `dflt`
+// rather than failing the daemon: config.plist is user-editable.
+static long config_plist_long(const char* key, long dflt, long lo, long hi) {
+    std::string raw = config_plist_string(key);
+    if (raw.empty()) return dflt;
+    errno = 0;
+    char* end = nullptr;
+    long v = strtol(raw.c_str(), &end, 10);
+    if (errno || !end || *end != '\0' || v < lo || v > hi) return dflt;
+    return v;
+}
+
+// Which CoreAudio workgroup the JACK realtime thread belongs to. A thread can
+// hold exactly one: os_workgroup_join returns EALREADY for a workgroup that
+// does not nest with the one it already has.
+//
+//   backend  jackd's clock device (the audio interface). The deadline the JACK
+//            graph actually enforces, and what JackEngine::XRun reports on.
+//   hal      the JackBridge virtual device, whose timeline this thread itself
+//            publishes via shm.
+//   none     plain Mach time-constraint realtime, no workgroup.
+enum class WorkgroupMode { Backend, Hal, None };
+
+static WorkgroupMode config_workgroup_mode() {
+    std::string v = config_plist_string("Workgroup");
+    if (v == "hal")  return WorkgroupMode::Hal;
+    if (v == "none") return WorkgroupMode::None;
+    return WorkgroupMode::Backend;
+}
+
+static const char* workgroup_mode_name(WorkgroupMode m) {
+    switch (m) {
+        case WorkgroupMode::Hal:  return "hal";
+        case WorkgroupMode::None: return "none";
+        default:                  return "backend";
+    }
+}
+
+static WorkgroupMode g_workgroup_mode = WorkgroupMode::Backend;
 
 // Device display name: "pi-Stomp (<host>)" built from DeviceName (explicit
 // override) or PiHostname. Bounded to JB_DEVICE_NAME_MAX-1 so the shm field is
@@ -100,9 +147,10 @@ static std::string device_display_name() {
 static pthread_t g_main_thread;
 static std::atomic<bool> g_wire_dirty{false};
 
-// Fixed runtime safety margin. JitterFrames is intentionally not user
-// configurable; keep this value aligned with the HAL driver.
+// Frames the daemon stays ahead of the HAL's read head. Published to shm so
+// the HAL reports the same number as SafetyOffset; see JB_OFF_JITTER_FRAMES.
 static constexpr long kDefaultJitterFrames = 0;
+static constexpr long kMaxJitterFrames = 2048;
 static long g_jitter_frames = kDefaultJitterFrames;
 static constexpr int64_t kSnapThresholdFrames = 512;
 #ifdef _WITH_MIDI_BRIDGE_
@@ -165,7 +213,8 @@ public:
         // Protocol-8 self-healing fields the daemon owns. Start from a known
         // zero so the app never reads a stale count out of a reused region.
         shmSlavePortsConnected->store(0, std::memory_order_relaxed);
-        shmDaemonXRuns->store(0, std::memory_order_release);
+        shmDaemonXRuns->store(0, std::memory_order_relaxed);
+        shmJitterFrames->store((uint64_t)g_jitter_frames, std::memory_order_release);
 
         config_audio_ports();
 #ifdef _WITH_MIDI_BRIDGE_
@@ -196,8 +245,10 @@ public:
         // process callback retries until it succeeds. Joining the workgroup
         // happens lazily on the JACK RT thread because os_workgroup_join must
         // run on the joining thread itself.
-        mWorkgroup = workgroup_acquire_by_uid(JACKBRIDGE_DEVICE_UID);
-        mWorkgroupJoined = false;
+        mWorkgroup = (g_workgroup_mode == WorkgroupMode::Hal)
+            ? workgroup_acquire_by_uid(JACKBRIDGE_DEVICE_UID)
+            : NULL;
+        mWorkgroupJoined = (g_workgroup_mode != WorkgroupMode::Hal);
         mWorkgroupAcquireBackoff = 0;
 
         JB_LOG_INFO(jb_log_daemon(),
@@ -294,6 +345,9 @@ public:
                 // Backoff: ~once per ~1s at 48k/64 (~750 cycles).
                 if (++mWorkgroupAcquireBackoff >= 750) {
                     mWorkgroupAcquireBackoff = 0;
+                    // CoreAudio property calls on the RT thread. Only the
+                    // startup acquire in the constructor normally runs; this
+                    // is the fallback for a device that was not up yet.
                     mWorkgroup = workgroup_acquire_by_uid(JACKBRIDGE_DEVICE_UID);
                 }
             }
@@ -453,9 +507,10 @@ public:
         // so we exit cleanly. LaunchAgent KeepAlive brings us back when jackd
         // is back.
         //
-        // Exiting here is what plan-b-daemon-survives-jackd.md removes: the
-        // restart gap is dead air the user hears. The device now survives it,
-        // but the gap itself is still ours to close.
+        // Exiting here costs a restart gap the user hears. A cable fault no
+        // longer reaches this path -- jackd survives one since the CoreAudio
+        // workgroup and SIGPIPE fixes in the jack2 fork (docs/idiosyncrasies.md,
+        // "jackd on macOS") -- so what remains here is a genuine jackd stop.
         //
         // We write the heartbeat and NOT shmDriverStatus. That field belongs
         // to the driver, and writing INIT here was a self-inflicted deadlock:
@@ -837,9 +892,19 @@ main(int argc, char** argv)
     // can pthread_kill us awake.
     g_main_thread = pthread_self();
 
-    // Keep the daemon and HAL on the same fixed runtime default.
-    g_jitter_frames = kDefaultJitterFrames;
-    JB_LOG_DEFAULT(jb_log_daemon(), "config: JitterFrames=%ld", g_jitter_frames);
+    g_jitter_frames = config_plist_long("JitterFrames", kDefaultJitterFrames,
+                                        0, kMaxJitterFrames);
+    g_workgroup_mode = config_workgroup_mode();
+
+    // libjack reads JACK_NO_WORKGROUP when the client's realtime thread starts,
+    // inside jack_client_open -> activate, so this must precede every client.
+    if (g_workgroup_mode != WorkgroupMode::Backend) {
+        setenv("JACK_NO_WORKGROUP", "1", 1);
+    } else {
+        unsetenv("JACK_NO_WORKGROUP");
+    }
+    JB_LOG_DEFAULT(jb_log_daemon(), "config: JitterFrames=%ld Workgroup=%{public}s",
+                   g_jitter_frames, workgroup_mode_name(g_workgroup_mode));
 
     while ((ch = getopt(argc, argv, "vi:o:")) != -1) {
         switch (ch) {

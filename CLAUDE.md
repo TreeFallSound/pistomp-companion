@@ -334,6 +334,37 @@ the source of truth; `JACKBRIDGE_PI_HOST` overrides the host.
 The systemd unit on the pi is `pi-stomp-jackbridge.service` (system, not
 `--user`, so its journal needs `sudo journalctl -u`).
 
+### The netJACK2 loop budget
+
+`/etc/default/jackbridge` on the pi, read by the unit, applied by
+`jackbridge-pi-up`:
+
+| Variable | netadapter flag | Default |
+|----------|-----------------|---------|
+| `JACKBRIDGE_NET_LATENCY` | `-l`, cycles of loop cushion | 2 |
+| `JACKBRIDGE_NET_RING` | `-g`, slip-ring frames | 512 |
+
+    sudo systemctl restart pi-stomp-jackbridge      # apply, ~200 ms gap
+    .../jackbridge/jackbridge-pi-status             # xruns_1m must be 0
+
+**They are coupled: `NET_RING / 2` must exceed `NET_LATENCY * period`.** The
+resampler drives ring occupancy toward the midpoint, so cushion beyond it
+overruns — `-l 6 -g 512` xruns the *pi* at ~2/s while every Mac-side metric
+stays clean, which reads as "the fix did nothing" rather than as a new fault.
+`jackbridge-pi-up` warns to the journal when the inequality fails.
+
+Too small is the other failure: `-l 2` is 2.67 ms against a measured 7.5 ms
+worst-case cable RTT (a USB NIC), which xruns the *Mac* — that is the crackle,
+not the workgroup or the HAL. Each cycle costs monitoring latency, so use the
+smallest pair that holds zero on both sides.
+
+`JB_NET_LATENCY_CYCLES` and `JB_NETADAPTER_RING_FRAMES` in
+`jackbridge/shared/JackBridge.h` mirror these for the advertised-latency model
+and **do not track them**. Change one, change the other, or the DAW's delay
+compensation is wrong by the difference.
+
+The file is device-local — in neither repo, and lost on a reimage.
+
 Never name an internal shell function (`pi_service`, `bootstrap_agent`,
 `wired_iface`) as though it were a thing anyone can invoke. They are private
 to their scripts. `jackbridge-ctl` subcommands and `just` recipes are real
@@ -391,4 +422,5 @@ Read these when you touch the matching area, not before:
 | The jack2 fork | `docs/vendor-jack2.md` |
 | Shipping a release | `docs/releases.md` |
 | Walkthrough of the source tree | `docs/codebase-tour.md` |
+| Decreasing the pi's network delay (plan) | `docs/plan-rtt-reduction.md` |
 | Replug recovery, driver re-anchor (plan) | `docs/plan-replug-recovery.md` |

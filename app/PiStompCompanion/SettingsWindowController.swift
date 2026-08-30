@@ -12,6 +12,8 @@ final class SettingsWindowController: NSWindowController {
     private let hostnameField = NSTextField()
     private let networkPopup = NSPopUpButton()
     private let clockPopup = NSPopUpButton()
+    private let workgroupPopup = NSPopUpButton()
+    private let jitterPopup = NSPopUpButton()
     private let timingField = NSTextField(labelWithString: "No value")
     private let errorField = NSTextField(labelWithString: "")
     private var values: [String: Any] = [:]
@@ -61,6 +63,25 @@ final class SettingsWindowController: NSWindowController {
         connection.addArrangedSubview(row("Network interface", networkPopup))
         connection.addArrangedSubview(row("Clock device", clockPopup))
 
+        workgroupPopup.translatesAutoresizingMaskIntoConstraints = false
+        jitterPopup.translatesAutoresizingMaskIntoConstraints = false
+        for mode in ConfigStore.workgroupModes { workgroupPopup.addItem(withTitle: mode.title) }
+        for frames in ConfigStore.jitterChoices { jitterPopup.addItem(withTitle: String(frames)) }
+
+        let scheduling = NSStackView()
+        scheduling.orientation = .vertical
+        scheduling.alignment = .leading
+        scheduling.spacing = 8
+        scheduling.translatesAutoresizingMaskIntoConstraints = false
+        scheduling.addArrangedSubview(sectionTitle("Realtime scheduling"))
+        scheduling.addArrangedSubview(row("Workgroup", workgroupPopup))
+        scheduling.addArrangedSubview(row("Jitter frames", jitterPopup))
+        scheduling.addArrangedSubview(note("""
+            Which CoreAudio workgroup the daemon's realtime thread joins. \
+            The thread can hold exactly one. "Backend" is jackd's clock \
+            device, which is the deadline the JACK graph enforces.
+            """))
+
         let audio = NSStackView()
         audio.orientation = .vertical
         audio.alignment = .leading
@@ -82,15 +103,19 @@ final class SettingsWindowController: NSWindowController {
         actions.translatesAutoresizingMaskIntoConstraints = false
 
         content.addSubview(connection)
+        content.addSubview(scheduling)
         content.addSubview(audio)
         content.addSubview(actions)
         NSLayoutConstraint.activate([
             connection.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             connection.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             connection.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            scheduling.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
+            scheduling.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
+            scheduling.topAnchor.constraint(equalTo: connection.bottomAnchor, constant: 22),
             audio.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
             audio.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
-            audio.topAnchor.constraint(equalTo: connection.bottomAnchor, constant: 22),
+            audio.topAnchor.constraint(equalTo: scheduling.bottomAnchor, constant: 22),
             actions.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
             actions.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
             actions.topAnchor.constraint(equalTo: audio.bottomAnchor, constant: 22),
@@ -98,10 +123,20 @@ final class SettingsWindowController: NSWindowController {
             hostnameField.widthAnchor.constraint(equalToConstant: 300),
             networkPopup.widthAnchor.constraint(equalToConstant: 300),
             clockPopup.widthAnchor.constraint(equalToConstant: 300),
+            workgroupPopup.widthAnchor.constraint(equalToConstant: 300),
+            jitterPopup.widthAnchor.constraint(equalToConstant: 300),
         ])
         window?.setContentSize(NSSize(width: 520, height: 1))
         window?.layoutIfNeeded()
         window?.setContentSize(content.fittingSize)
+    }
+
+    private func note(_ text: String) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: text)
+        field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        field.textColor = .secondaryLabelColor
+        field.widthAnchor.constraint(equalToConstant: 440).isActive = true
+        return field
     }
 
     private func sectionTitle(_ title: String) -> NSTextField {
@@ -164,6 +199,17 @@ final class SettingsWindowController: NSWindowController {
         if let item = clockPopup.itemArray.first(where: { $0.representedObject as? String == clock }) {
             clockPopup.select(item)
         } else { clockPopup.selectItem(at: 0) }
+
+        let workgroup = values["Workgroup"] as? String ?? ConfigStore.defaultWorkgroup
+        let mode = ConfigStore.workgroupModes.first { $0.key == workgroup } ?? ConfigStore.workgroupModes[0]
+        workgroupPopup.selectItem(withTitle: mode.title)
+
+        // Tolerate either <integer> or <string>: config.plist is hand-editable.
+        let jitter = (values["JitterFrames"] as? Int)
+            ?? (values["JitterFrames"] as? String).flatMap(Int.init)
+            ?? 0
+        jitterPopup.selectItem(withTitle: String(jitter))
+        if jitterPopup.selectedItem == nil { jitterPopup.selectItem(at: 0) }
     }
 
     private func updateTiming() {
@@ -234,6 +280,9 @@ final class SettingsWindowController: NSWindowController {
         next["PiHostname"] = hostname
         next["NetworkInterface"] = network
         next["ClockDeviceUID"] = clock
+        next["Workgroup"] = ConfigStore.workgroupModes
+            .first { $0.title == workgroupPopup.selectedItem?.title }?.key ?? ConfigStore.defaultWorkgroup
+        next["JitterFrames"] = Int(jitterPopup.selectedItem?.title ?? "0") ?? 0
         do {
             try ConfigStore.write(next)
             values = next
@@ -259,8 +308,20 @@ private enum ConfigStore {
         // "<DeviceName> (<PiHostname>)"; override this to rename the product
         // half (e.g. a co-branded build) without touching code.
         "DeviceName": "pi-Stomp",
+        "Workgroup": defaultWorkgroup,
+        "JitterFrames": 0,
     ]
-    private static let forbidden = ["SampleRate", "PeriodFrames", "JackPrefix", "JitterFrames",
+
+    // Mirrors WorkgroupMode in jackbridge/daemon/JackBridge.cpp.
+    static let workgroupModes: [(key: String, title: String)] = [
+        ("backend", "Backend device (jackd clock)"),
+        ("hal", "JackBridge HAL device"),
+        ("none", "None (plain realtime)"),
+    ]
+    static let defaultWorkgroup = "backend"
+    static let jitterChoices = [0, 64, 128, 256, 512, 1024]
+
+    private static let forbidden = ["SampleRate", "PeriodFrames", "JackPrefix",
                                     "RealtimePriority", "NetJack", "AutoConnect", "Logging"]
     static let path = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/JackBridge/config.plist").path

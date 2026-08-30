@@ -24,6 +24,16 @@ EnvironmentFile=-/etc/default/jackbridge
 LimitMEMLOCK=infinity
 LimitRTPRIO=infinity
 
+# jack.service is Type=simple, so After=jack.service only waits for jackd to
+# fork -- not for its server socket to accept clients. jackbridge-pi-up calls
+# jack_load against jackd, which races socket readiness on a busy boot. Block
+# until jack_lsp succeeds, or 30 s, then fail loudly on its own exit 1.
+#
+# Provided by the image (pi-gen-pistomp stage2/05-pistomp/01-run.sh), not by
+# this repo. ExecStartPre lines run in order and all must succeed, so this
+# gates the route pin below.
+ExecStartPre=/usr/local/bin/wait-for-jack.sh
+
 # Pin the netJACK2 multicast group (225.3.19.154) to a wired interface so
 # discovery doesn't follow the default route out wlan0. Auto-detects the
 # right NIC; respects $JACKBRIDGE_IFACE. Needs CAP_NET_ADMIN — the `+` prefix
@@ -44,7 +54,11 @@ ExecStart=/usr/local/libexec/jackbridge/jackbridge-pi-up
 ExecStop=/usr/local/libexec/jackbridge/jackbridge-pi-down
 ExecStopPost=+/usr/local/libexec/jackbridge/jackbridge-unpin-route
 
-TimeoutStartSec=10
+# Must cover the worst case of every ExecStartPre plus ExecStart:
+# wait-for-jack.sh alone can burn 30 s before it gives up. At the old value of
+# 10 s systemd killed the start job first, so a slow boot failed the unit
+# before the guard could either succeed or report why.
+TimeoutStartSec=45
 TimeoutStopSec=15
 # the Mac and jackbridge-ctl own start/stop, and a unit that restarts on a
 # deliberate stop would fight jackbridge-pi-down. on-failure fires only on

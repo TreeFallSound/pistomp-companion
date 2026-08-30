@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 8
+#define JACKBRIDGE_PROTOCOL_VERSION 9
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -117,6 +117,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x01b8      :    daemon xrun counter (monotonic; today only reaches os_log)
 // 0x01c0      :    driver fault bitfield (driver; bit 0 = mDeviceIsAlive false)
 // 0x01c8      :    app -> driver re-anchor request (app increments; driver acts + echoes)
+// 0x01d0      :    daemon write-ahead safety margin, frames (JitterFrames)
 // 0x0200      :    CoreAudio device name (daemon-published, NUL-terminated UTF-8)
 // 0x10000     : Upstream buffer #0 (Driver -> Application)
 // 0x18000     : Downstream buffer #0 (Application -> Driver)
@@ -172,6 +173,12 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 #define JB_OFF_DAEMON_XRUNS          (0x1b8)
 #define JB_OFF_DRIVER_FAULT          (0x1c0)
 #define JB_OFF_RESYNC_REQUEST        (0x1c8)
+
+// Protocol-9. Frames the daemon stays ahead of the HAL's read head. The
+// daemon reads JitterFrames from config.plist and publishes it here; the HAL
+// reports it as kAudioDevicePropertySafetyOffset. One value, two consumers —
+// a per-side constant is how the DAW's latency figure goes wrong silently.
+#define JB_OFF_JITTER_FRAMES         (0x1d0)
 
 // Bit definitions for JB_OFF_DRIVER_FAULT.
 #define JB_FAULT_DEVICE_NOT_ALIVE   (1u << 0)
@@ -302,7 +309,10 @@ static_assert((JB_OFF_SLAVE_PORTS_CONNECTED % 8) == 0 &&
               (JB_OFF_DRIVER_FAULT % 8) == 0 &&
               (JB_OFF_RESYNC_REQUEST % 8) == 0,
               "protocol-8 atomic<uint64_t> fields must be 8-byte aligned");
-static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_RESYNC_REQUEST + 8,
+static_assert(JB_OFF_JITTER_FRAMES >= JB_OFF_RESYNC_REQUEST + 8 &&
+              (JB_OFF_JITTER_FRAMES % 8) == 0,
+              "jitter-frames field overlaps or is misaligned");
+static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_JITTER_FRAMES + 8,
               "device name overlaps the control atomics");
 static_assert(JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX <= STRBUF_U0,
               "device name runs into the first ring buffer");
@@ -354,6 +364,7 @@ protected:
     std::atomic<uint64_t> *shmDaemonXRuns;         // daemon writes
     std::atomic<uint64_t> *shmDriverFault;         // driver writes
     std::atomic<uint64_t> *shmResyncRequest;       // app writes, driver echoes
+    std::atomic<uint64_t> *shmJitterFrames;        // daemon writes (protocol 9)
     std::atomic<uint64_t> *shmReadFrameNumber[MAX_STREAMS];
     std::atomic<uint64_t> *shmWriteFrameNumber[MAX_STREAMS];
 
@@ -439,6 +450,7 @@ protected:
         shmDaemonXRuns         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DAEMON_XRUNS);
         shmDriverFault         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DRIVER_FAULT);
         shmResyncRequest       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_RESYNC_REQUEST);
+        shmJitterFrames        = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_JITTER_FRAMES);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

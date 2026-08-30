@@ -39,7 +39,12 @@ struct ShmSnapshot {
     /// Echo of the app's last re-anchor nonce (Phase 4).
     var resyncRequest: UInt64 = 0
 
-    static let expectedProtocolVersion: UInt64 = 8
+    /// Hardcoded on purpose, and it must stay that way. The offsets below are
+    /// hand-copied literals the compiler cannot check against
+    /// shared/JackBridge.h, so this constant is the tripwire that forces
+    /// someone to re-verify them on a layout change. Deriving it from the
+    /// header would let the app recompile past a bump and read stale offsets.
+    static let expectedProtocolVersion: UInt64 = 9
     static let driverStatusStarted: UInt64 = 2
     /// Full complement of daemon slave ports (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS).
     static let slavePortsFull: UInt64 = 6
