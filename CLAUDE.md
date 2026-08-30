@@ -295,14 +295,16 @@ them are:
 
 | Symptom | User action |
 |---------|-------------|
-| Ports don't come back after a replug | Nothing — it should self-heal. Wait ~10 s. |
+| Ports don't come back after a replug | Nothing — it should self-heal. Wait ~5 s. |
 | Pedal turned on (or rebooted) after the Mac | Nothing — the Companion re-asks the pi. Wait ~10 s. |
 | Still not green | **Restart JackBridge** |
 | DAW silent after any of the above | Re-select the device in the DAW |
 
 That last row is currently unavoidable: a stack bounce flips
 `DeviceIsAlive` → 0, and a host that released the device does not re-acquire
-it. Everything else in that table is a bug if a user ever has to do it after
+it. A cable replug no longer bounces the stack, so it should not reach that
+row at all — jackd, the daemon and the master all survive one
+(`docs/idiosyncrasies.md`, "Replug recovery on the Mac"). Everything else in that table is a bug if a user ever has to do it after
 a plain cable replug — the fork's self-healing is supposed to cover exactly
 that. Fix it; do not write it up as a workaround.
 
@@ -390,4 +392,3 @@ Read these when you touch the matching area, not before:
 | Shipping a release | `docs/releases.md` |
 | Walkthrough of the source tree | `docs/codebase-tour.md` |
 | Replug recovery, driver re-anchor (plan) | `docs/plan-replug-recovery.md` |
-| Daemon surviving a jackd restart (plan) | `docs/plan-b-daemon-survives-jackd.md` |

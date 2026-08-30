@@ -109,21 +109,42 @@ pi_hostname() {
     printf '%s\n' "pistomp.local"
 }
 
-# Bounded wait: up to LINK_WAIT_LIMIT seconds total for the pi to answer one
-# 2 s ping. Reaching the limit is logged and the gate proceeds anyway — the
-# failure is then visible in jackd's own output instead of an agent that
-# records nothing.
+# Bounded wait, then start anyway. jackd that records nothing is worse than
+# jackd that fails in its own log.
 LINK_WAIT_LIMIT="${JACKBRIDGE_LINK_WAIT_LIMIT:-60}"
+
+# True when the kernel knows a link-local peer on the wired interface. This is
+# the condition the handshake needs: an address that ARP can resolve to a MAC
+# that is not ours. jackbridge-route-watcher removes these entries on each
+# network change, and writes the pi's again when it hears the pi announce.
+# Thus an entry that is present now is also current.
+#
+# Do not test for "permanent". The watcher's static entry has that flag, but a
+# normal learned entry does not, and both are sufficient. Our own address also
+# has the flag, on lo0.
+peer_pinned() {
+    _mac=$(/sbin/ifconfig "$1" 2>/dev/null | /usr/bin/awk '/[ \t]ether /{print $2; exit}')
+    /usr/sbin/arp -an 2>/dev/null | /usr/bin/awk -v ifc="$1" -v me="$_mac" '
+        $0 !~ ("on " ifc " ") { next }
+        $2 !~ /\(169\.254\./ { next }
+        $2 ~ /\(169\.254\.255\.255\)/ { next }
+        $4 == "ff:ff:ff:ff:ff:ff" { next }
+        me != "" && $4 == me { next }
+        { found = 1 }
+        END { exit !found }'
+}
 
 wait_for_pi() {
     _host=$(pi_hostname)
     _deadline=$(( $(/bin/date +%s) + LINK_WAIT_LIMIT ))
     while :; do
-        if /sbin/ping -c 1 -t 2 -n "$_host" >/dev/null 2>&1; then
+        # The ping stays as the fallback. It is the only probe on a network
+        # that gives the pi a routed address, where no peer is ever pinned.
+        if peer_pinned "$WIRED_IFACE" || /sbin/ping -c 1 -t 2 -n "$_host" >/dev/null 2>&1; then
             return 0
         fi
         [ "$( /bin/date +%s )" -lt "$_deadline" ] || {
-            echo "jackd-launch: pi did not answer ping on $_host within ${LINK_WAIT_LIMIT}s; starting anyway" >&2
+            echo "jackd-launch: no pi on $WIRED_IFACE and no ping answer from $_host within ${LINK_WAIT_LIMIT}s; starting anyway" >&2
             return 1
         }
         sleep 2
@@ -142,17 +163,21 @@ if [ -z "$WIRED_IFACE" ]; then
     echo "jackd-launch: wired connection up on $WIRED_IFACE" >&2
 fi
 
-# The link-local handshake needs the pi's unicast path alive, not merely the
-# interface present. Wait (bounded) for the pi to answer.
-write_status waiting-network
-if wait_for_pi; then
-    echo "jackd-launch: pi answers on $(pi_hostname); link is usable" >&2
-else
-    echo "jackd-launch: proceeding with link unverified" >&2
-fi
-clear_status
-
+# The handshake needs the pi's unicast path alive, not only the interface
+# present. Wait for the pi, with a bound.
+#
+# Do this one time. jackbridge-coordinator starts this script again with
+# --launch-jack, and a gate above that branch ran in both processes. Each run
+# waits the full limit when the pi is absent, thus a replug paid the limit two
+# times: 120 s of the 140 s recovery, measured 2026-08-29.
 if [ "${1:-}" != --launch-jack ]; then
+    write_status waiting-network
+    if wait_for_pi; then
+        echo "jackd-launch: pi is reachable on $WIRED_IFACE; link is usable" >&2
+    else
+        echo "jackd-launch: proceeding with link unverified" >&2
+    fi
+    clear_status
     exec "$SUPPORT/jackbridge-coordinator" "$@"
 fi
 shift
@@ -200,6 +225,17 @@ echo "jackd-launch: multicast route pinned to $WIRED_IFACE" >&2
 JACKD_PID_FILE=/tmp/jackbridge-jackd.pid
 rm -f "$JACKD_PID_FILE"
 
+# jackd's stderr before the filter below removes repeats. The filter can only
+# hide a message, thus a message that is absent from both files was never
+# written. Read only for diagnosis.
+#
+# Keep the file of the previous jackd. The last lines of a jackd that stopped
+# are the reason it stopped, and this agent starts a new jackd immediately
+# after. Truncation here would delete exactly the evidence.
+RAW_LOG="${JACKBRIDGE_RAW_LOG:-/tmp/jackbridge-jackd.raw.log}"
+[ -s "$RAW_LOG" ] && /bin/mv -f "$RAW_LOG" "$RAW_LOG.prev"
+: > "$RAW_LOG"
+
 # fd 3 keeps a handle on the real stdout (the .out.log) before any pipe
 # exists, so that below `2>&1` can send stderr into the filter while
 # `1>&3` puts stdout back where launchd wanted it. Only stderr is noisy;
@@ -225,6 +261,7 @@ exec 3>&1
 /bin/sh -c 'echo $$ > "$1"; shift; exec "$@"' _ "$JACKD_PID_FILE" \
     "$JACKD" -R -P 75 -d coreaudio -P "$CLOCK_UID" -r "$RATE" -p "$PERIOD" \
     2>&1 1>&3 3>&- \
+  | /usr/bin/tee "$RAW_LOG" \
   | /usr/bin/perl -e '
         my $W = 10; my $CAP = 2000; my %s;
         $| = 1;
@@ -260,7 +297,17 @@ if [ -z "$JACKD_PID" ]; then
     exit 1
 fi
 
-trap 'kill "$JACKD_PID" 2>/dev/null || true; rm -f "$JACKD_PID_FILE"' EXIT INT TERM
+# EXIT always stops jackd, as before: every exit path below is a repair that
+# needs a new jackd. INT and TERM only add a log line and then exit, which
+# runs the EXIT trap.
+#
+# The log lines separate the two ways this agent can end: a signal to the
+# agent, which takes jackd down with it, and jackd stopping first, which lets
+# the monitor loop fall through. The two have different causes and the log did
+# not tell them apart.
+trap 'kill "$JACKD_PID" 2>/dev/null || true; rm -f "$JACKD_PID_FILE"' EXIT
+trap 'echo "jackd-launch: agent got SIGINT; stopping jackd $JACKD_PID" >&2; exit 0' INT
+trap 'echo "jackd-launch: agent got SIGTERM; stopping jackd $JACKD_PID" >&2; exit 0' TERM
 
 jackd_ready=0
 for i in $(seq 1 30); do
@@ -278,32 +325,54 @@ if [ "$jackd_ready" = 1 ] && [ -x "$JACK_LOAD" ]; then
 elif [ "$jackd_ready" != 1 ]; then
     echo "jackd-launch: jackd not ready after 15s" >&2
 fi
-# Self-heal. netmanager cannot rebind its multicast interface live, so when
-# the watcher re-pins the group somewhere else -- cable moved, pi rebooted,
-# Wi-Fi rejoined -- the only repair is a fresh jackd. Exiting is that repair:
-# KeepAlive in com.treefallsound.companion.jackd.plist restarts the agent,
-# which re-enters the gate above and re-runs the coordinator's pi probe,
-# stale for exactly the same reason. The EXIT trap takes jackd with us.
+# The IPv6 scopeid is the ifindex. It changes when the interface is destroyed
+# and made again. It does not change when only the carrier drops.
+iface_token() {
+    /sbin/ifconfig "$1" 2>/dev/null | /usr/bin/awk '/scopeid/ { print $NF; exit }'
+}
+
+# Self-heal. netmanager cannot bind its multicast interface again while it
+# runs. Thus a fresh jackd is the only repair when the group must move. Exit
+# to do this repair: KeepAlive starts the agent again.
 #
-# Compare contents, not mtime: jackbridge-pin-route is idempotent and
-# rewrites the same value on every network-change notification.
-#
-# A change has to survive a second look before we act on it. Bringing a link
-# up arrives as a burst -- link, then DHCP, then route -- and every restart
-# here is an audible dropout.
+# A carrier drop is not that condition. The interface, the ifindex and the pin
+# stay the same. A restart then destroys a master that the pi still uses, and
+# recovery takes 80 s in place of 4 s. Thus wait for an absent interface. Do
+# not restart.
+WIRED_TOKEN=$(iface_token "$WIRED_IFACE")
+
 while kill -0 "$JACKD_PID" 2>/dev/null; do
     sleep 2
     now_iface=$(wired_iface || true)
-    [ "$now_iface" = "$WIRED_IFACE" ] && continue
+
+    # The cable is out, or the link starts again. Wait.
+    [ -z "$now_iface" ] && continue
+
+    if [ "$now_iface" = "$WIRED_IFACE" ]; then
+        # An unknown token can be a wrong restart. Thus ignore it.
+        now_token=$(iface_token "$now_iface")
+        if [ -z "$now_token" ] || [ -z "$WIRED_TOKEN" ] || [ "$now_token" = "$WIRED_TOKEN" ]; then
+            continue
+        fi
+        echo "jackd-launch: $WIRED_IFACE was made again (scope $WIRED_TOKEN -> $now_token); restarting" >&2
+        exit 0
+    fi
+
+    # A new link sends a burst of changes. Look a second time before you act.
     sleep 2
     now_iface=$(wired_iface || true)
+    [ -z "$now_iface" ] && continue
     [ "$now_iface" = "$WIRED_IFACE" ] && continue
-    if [ -n "$now_iface" ]; then
-        echo "jackd-launch: wired interface moved $WIRED_IFACE -> $now_iface; restarting" >&2
-    else
-        echo "jackd-launch: wired connection lost (was $WIRED_IFACE); restarting" >&2
-    fi
+    echo "jackd-launch: wired interface moved $WIRED_IFACE -> $now_iface; restarting" >&2
     exit 0
 done
 
+# Only reached when jackd stopped and no signal came to this agent.
+#
+# Do not report an exit status here. jackd is a member of a pipeline, thus the
+# shell does not own it as a job, thus `wait` on it returns 0 whatever jackd
+# did. That 0 reads as a clean stop and is not one: the first time this line
+# appeared, jackd had in fact stopped with SIGTRAP. Use the crash reports in
+# ~/Library/Logs/DiagnosticReports and $RAW_LOG instead.
+echo "jackd-launch: jackd $JACKD_PID stopped; see $RAW_LOG.prev and DiagnosticReports" >&2
 wait "$PIPELINE_PID"

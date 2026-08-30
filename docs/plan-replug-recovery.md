@@ -341,8 +341,7 @@ Do the test:
 Step 10 and step 11 are the necessary controls. `_HW_StartIO` corrects fault 1
 by itself, and a restart of `coreaudiod` corrects almost everything. A test
 that permits either one proves nothing. A change of the daemon process ID is
-correct and is expected: the LaunchAgent starts a new daemon. Refer to
-`docs/plan-b-daemon-survives-jackd.md`.
+correct and is expected: the LaunchAgent starts a new daemon.
 
 To test change 4 (the resync value): Task C removes the menu item that wrote
 the nonce, and nothing writes `JB_OFF_RESYNC_REQUEST` at the moment. Keep the
@@ -386,8 +385,6 @@ gives a stack that starts nothing and records nothing. Give a limit.
 
 ## Related
 
-- `docs/plan-b-daemon-survives-jackd.md` — the daemon stays alive when jackd
-  stops. That plan removes the daemon restart that made fault 1 visible.
 - `CLAUDE.md` section 4, rule 6 — one writer for each shm field.
 - `CLAUDE.md` section 4b — recovery has two audiences.
 - `CLAUDE.md` section 1 — the `install → unlink-shm → restart` order.

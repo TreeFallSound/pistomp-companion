@@ -20,6 +20,20 @@ PIN="$SUPPORT/jackbridge-pin-route"
 ROUTE_STATE=/var/run/jackbridge-route.iface
 SENTINEL=/var/run/jackbridge-ethernet.up
 
+# Stop the listener of the previous generation. This script execs notifyutil
+# and thus cannot use a trap, and launchd starts a new generation on each
+# network change. Without this, each change adds one subshell and one tcpdump
+# that stay for the life of the login session.
+#
+# The main shell of an older generation is now notifyutil and does not match.
+# Thus a match that is not this process is an orphan listener. Kill the
+# subshell first: it starts tcpdump again after 2 s.
+for _stale in $(/usr/bin/pgrep -f jackbridge-route-watcher 2>/dev/null); do
+    [ "$_stale" = "$$" ] && continue
+    kill "$_stale" 2>/dev/null || true
+done
+/usr/bin/pkill -f 'tcpdump -i .* -n -e -l udp dst port 19000' 2>/dev/null || true
+
 "$PIN" || true
 
 new_iface=$(cat "$ROUTE_STATE" 2>/dev/null || true)
@@ -62,10 +76,17 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
         # On a host whose whole job is low-latency audio, that churn comes
         # straight out of the jitter budget.
         #
-        # We also only act when the address actually changes: the route add
-        # is idempotent, so re-adding a known IP is pure noise.
+        # Act only when the ARP table disagrees with the packet. This keeps
+        # the announce rate (1/s) off the routing code, and it also repairs
+        # the entry after a flush.
+        #
+        # Do not remember the last address instead. A later generation of this
+        # watcher flushes every 169.254 entry, including this pin, while this
+        # listener continues to run. A listener that remembers the address
+        # then skips every packet and never writes the entry again. The pi
+        # announced once a second into a Mac with no ARP entry for 64 s,
+        # measured 2026-08-29.
         (
-            last_key=
             while :; do
                 # -e so we get the Ethernet source alongside the IP: the
                 # discovery frame is the one place the pi's true MAC is
@@ -84,7 +105,9 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
                         }
                 }' | while read pi_mac pi_ip; do
                     [ -n "$pi_ip" ] && [ -n "$pi_mac" ] || continue
-                    [ "$pi_mac $pi_ip" = "$last_key" ] && continue
+                    have=$(/usr/sbin/arp -n "$pi_ip" 2>/dev/null | \
+                           /usr/bin/awk -v ifc="$new_iface" '$0 ~ ("on " ifc " ") { print $4; exit }')
+                    [ "$have" = "$pi_mac" ] && continue
                     # Pin the pi's real MAC as an interface-scoped static
                     # ARP entry. The wifi router can still proxy-ARP a
                     # reply, but we never ask — and never believe it.
@@ -101,7 +124,6 @@ if [ -n "$new_iface" ] && ! is_wifi_iface "$new_iface"; then
                     /sbin/route -n delete -host "$pi_ip" >/dev/null 2>&1 || true
                     /usr/sbin/arp -S "$pi_ip" "$pi_mac" ifscope "$new_iface" >/dev/null 2>&1 || true
                     echo "jackbridge-route-watcher: pinned $pi_ip at $pi_mac to $new_iface" >&2
-                    last_key="$pi_mac $pi_ip"
                 done
                 # Only reached if tcpdump exits (interface down, BPF error).
                 # A network change restarts the whole watcher via launchd;

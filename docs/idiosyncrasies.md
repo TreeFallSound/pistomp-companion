@@ -110,6 +110,92 @@ The user-visible device name (e.g. `"Steinberg UR22C"`, the same string Audio MI
 ### `jackd -d coreaudio` does **not** take exclusive control of the device
 Even while jackd is bound to a CoreAudio device, that device remains available as a system output — apps can play through it and the audio mixes with whatever's going through jackd. Useful (system audio keeps working during development) but a trap: **if the user sets the same device as both jackd's backend and the system output, they get a feedback loop / mix-of-everything** with no clear error. The aggregate-device strategy (built-in output as the aggregate's sub-device) avoids this for production, since the user is unlikely to pick the aggregate as their normal system output. Pass `-H`/`--hog` to force exclusive access if needed; we don't, to allow side-by-side dev workflows.
 
+### A client RT thread must leave the CoreAudio workgroup before it ends
+`JackClient::SetupRealTime` (`../jack2/common/JackClient.cpp`) joins the
+backend device's `os_workgroup` on the client's realtime thread. Membership
+does **not** drop by itself at thread exit: libdispatch raises
+`EXC_BREAKPOINT` in `_os_workgroup_tsd_cleanup` during that thread's
+`pthread_exit`, which kills jackd. `JackEngine::ClientDeactivate` cancels the
+thread, so no ordinary return path runs and a plain call at the end of the run
+loop never executes.
+
+`JackPosixThread::ThreadHandler` therefore runs a thread-local exit hook from a
+`pthread_cleanup_push` handler; cancellation handlers run before the
+thread-specific-data destructors, which is the ordering that matters.
+`SetupRealTime` registers the hook only when the join succeeded. The hook is
+thread-local and reached through `JackSetThreadExitHook` rather than a direct
+call, because `JackPosixThread.cpp` is compiled into libraries that do not
+contain `JackWorkgroup.mm` — `netlib` fails to link a direct reference, and
+`weak_import` does not help for a symbol absent at static link time.
+
+Symptom before the fix: jackd died on **every** cable pull, with a report in
+`~/Library/Logs/DiagnosticReports/jackd-*.ips` naming
+`_os_workgroup_tsd_cleanup`. The whole restart cascade below it — daemon
+restart storm, agent restart, gate, coordinator, netmanager reload — was
+fallout from that crash.
+
+### `SIGPIPE` used to stop the server
+`jackctl_setup_signals` puts `SIGPIPE` in the sigwait set
+(`../jack2/common/JackControlAPI.cpp`), and `jackctl_wait_signals` had no case
+for it, so it fell to `default: waiting = false` and began shutdown. A write to
+a peer that went away is routine for a server doing network I/O, and the code
+already handles the `EPIPE` correctly (`connection lost … 'pistomp' exiting`).
+The signal killed it anyway, and the shutdown then hung in `ClientDeactivate`
+for the client that had just lost its peer. `SIGPIPE` now logs and keeps
+waiting. It stays blocked in every thread, so writes still return `EPIPE`.
+
+### jackd's own death message can be missing from the log
+`jackd-launch` pipes jackd's stderr through a dedupe filter. A crash produces
+no `Jack main caught signal` line at all, because the only path that prints one
+is `jackctl_wait_signals`. Do not read its absence as "jackd exited cleanly",
+and do not trust an exit status from `wait "$JACKD_PID"`: jackd is a pipeline
+member, the shell does not own it as a job, and `wait` returns 0 whatever
+happened. The unfiltered stream is teed to `/tmp/jackbridge-jackd.raw.log`
+(rotated to `.prev` when the next jackd starts); the crash reports are the
+other half.
+
+## Replug recovery on the Mac
+
+### A carrier drop is not an interface move
+`jackd-launch`'s monitor loop restarts the agent when the wired interface
+changes, because netmanager cannot rebind its multicast interface live. An
+absent interface is **not** that case: pull the cable and put it back and the
+name, the ifindex and the pin are all identical. Restarting anyway destroyed
+jackd and the master the pi was still announcing to. The loop now waits out an
+absent interface and compares the IPv6 scopeid (the ifindex) to catch a device
+that was re-created, such as a USB adapter re-enumerated.
+
+### The startup gate runs once, and cannot use `pistomp.local`
+The gate sat above the `--launch-jack` dispatch, so it ran in the coordinator's
+parent *and* again in its child — two full `LINK_WAIT_LIMIT` waits, 120 s of a
+140 s recovery. It is now inside the branch that execs the coordinator.
+
+Its probe pinged `pistomp.local`, which resolves to the pi's **Wi-Fi** address
+only — mDNS advertises no address for the pi's `eth0`. `ping -b en7` to that
+address fails with the same `No route to host` the netJACK2 master gets, so the
+probe could never test the wired path it claimed to. The gate now waits for an
+ARP-resolvable link-local peer on the wired interface, and keeps the ping as a
+fallback for a deployment where the pi has a routed address.
+
+### The ARP pinner must compare against the ARP table, not its own memory
+`jackbridge-route-watcher` pins the pi's MAC as an interface-scoped static ARP
+entry when `tcpdump` sees a discovery packet, and flushes every `169.254` entry
+— including that pin — at the top of each generation. The listener used to
+remember the last address it pinned and skip every later announce, so once a
+newer generation flushed the entry, nothing rewrote it. Measured: the pi
+announcing once a second into a Mac with no ARP entry for it for 64 s. The
+listener now compares the packet against the live ARP table, and each
+generation reaps the previous one's orphaned subshell and `tcpdump`.
+
+### The floor is RFC 3927, not JackBridge
+After the above, a replug costs 4–9 s of IPv4 link-local address probing (three
+ARP probes 1–2 s apart plus two announcements) before en7 has a usable address,
+plus up to 1 s of the pi's announce interval. During the probe window the
+master's socket fails with `EADDRNOTAVAIL` and logs `Can't init new NetMaster`
+once per announce; it is retrying, not stuck. Nothing in the stack is idle
+there. A static address alias on the wired interface would remove it, at the
+cost of hardcoding one machine's cable.
+
 ## netJACK2 slave reconnection — stale master entries
 
 When the netJACK2 slave restarts, the Mac netmanager may retain a stale
@@ -145,9 +231,12 @@ port 19000 or icmp'` shows the pi answer exactly one SETUP per cycle then
 ICMP-refuse the rest.
 
 **Fix (2026-08-28):** `InitMaster` in `../jack2/common/JackNetManager.cpp`
-now ignores announces from a slave whose existing master `IsSynched()` (RT
-sync exchange completed, `std::atomic<bool> fSynched`); it only supersedes
-masters that never synched. `ReapDeadMasters()` remains the death path.
+ignores every announce for a slave that already has a master in the list.
+`ReapDeadMasters()` is the only death path.
+
+`IsSynched()` (`JackNetInterface.h`, `std::atomic<bool> fSynched`) was added
+for a narrower rule — supersede a master that never synched, ignore one that
+did — but nothing calls it. Do not describe that rule as shipped.
 Correction 2b's socket-close-on-failed-Init in the same file is related but
 insufficient alone — it tidies each iteration without breaking the cycle.
 See `docs/plan-replug-recovery.md`, fault 2.
