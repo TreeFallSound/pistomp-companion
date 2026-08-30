@@ -239,7 +239,6 @@ for a narrower rule — supersede a master that never synched, ignore one that
 did — but nothing calls it. Do not describe that rule as shipped.
 Correction 2b's socket-close-on-failed-Init in the same file is related but
 insufficient alone — it tidies each iteration without breaking the cycle.
-See `docs/plan-replug-recovery.md`, fault 2.
 
 ## Proxy-ARP poisoning on link-local unicast
 

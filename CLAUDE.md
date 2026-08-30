@@ -422,5 +422,4 @@ Read these when you touch the matching area, not before:
 | The jack2 fork | `docs/vendor-jack2.md` |
 | Shipping a release | `docs/releases.md` |
 | Walkthrough of the source tree | `docs/codebase-tour.md` |
-| Decreasing the pi's network delay (plan) | `docs/plan-rtt-reduction.md` |
-| Replug recovery, driver re-anchor (plan) | `docs/plan-replug-recovery.md` |
+| Mac-authoritative tuning (plan) | `docs/plan-tuning.md` |
