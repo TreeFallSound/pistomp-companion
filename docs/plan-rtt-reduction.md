@@ -139,6 +139,7 @@ item 3 gives the method.
 
 Measure the RTT in both directions after each step:
 
+    # TODO: This is broken because we actually use IPv4...
     # Mac to pi
     ping6 -c 30 -i 0.2 <pi-link-local>%en7
     # pi to Mac
