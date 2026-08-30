@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Apply interrupt-coalescing removal, NAPI threading, and SCHED_FIFO priority
+# to the JackBridge ethernet interface. Runs as root via the unit's
+# ExecStartPre=+ prefix, after jackbridge-pin-route has written
+# /run/jackbridge.iface.
+#
+# Only operates on the selected wired interface — jb-detect-net-iface already
+# excludes wifi. WiFi NAPI threads are NEVER touched.
+#
+# Why this matters:
+#   On a PREEMPT_RT kernel, a SCHED_FIFO thread preempts softirq context.
+#   With NAPI in softirq, the jackd/mod-host RT threads block packet delivery
+#   whenever they hold the CPU. Moving NAPI into a schedulable kthread and
+#   giving it a lower priority (FF 60, below jackd FF 70 and mod-host FF 65)
+#   lets the audio threads finish their cycle first and then NAPI delivers the
+#   next batch — instead of audio competing with an unschedulable softirq.
+set -euo pipefail
+
+STATE=/run/jackbridge.iface
+if [ ! -r "$STATE" ]; then
+    echo "jackbridge-napi-rt: $STATE missing — jackbridge-pin-route must succeed first" >&2
+    exit 1
+fi
+IFACE=$(cat "$STATE")
+
+# Step 1: Remove interrupt coalescing (~49 µs per direction by default on the
+# pi-stomp eth driver). Capped at 0 = deliver each interrupt immediately.
+# Non-fatal: some drivers don't support the coalescing sysfs knob.
+if command -v ethtool >/dev/null 2>&1; then
+    if ethtool -C "$IFACE" rx-usecs 0 tx-usecs 0 2>/dev/null; then
+        echo "jackbridge-napi-rt: $IFACE coalescing → rx-usecs 0 tx-usecs 0" >&2
+    else
+        echo "jackbridge-napi-rt: ethtool -C skipped (driver may not support it)" >&2
+    fi
+fi
+
+# Step 2: Move NAPI polling from softirq into a schedulable kthread.
+THREADED=/sys/class/net/$IFACE/threaded
+if [ ! -f "$THREADED" ]; then
+    echo "jackbridge-napi-rt: $THREADED absent — kernel does not support threaded NAPI; skipping" >&2
+    exit 0
+fi
+echo 1 > "$THREADED"
+echo "jackbridge-napi-rt: $IFACE threaded NAPI enabled" >&2
+
+# Step 3: Apply SCHED_FIFO 60 to the napi/$IFACE-* kthreads. Priority 60 sits
+# below jackd RT threads (FF 70) and mod-host (FF 65) so audio is never
+# preempted, but above SCHED_OTHER so packet delivery isn't stalled behind
+# normal userspace. Wait up to 500 ms for the kthreads to appear — on first
+# enable they may not exist yet.
+DEADLINE=$(( $(date +%s%3N) + 500 ))
+while true; do
+    mapfile -t PIDS < <(pgrep "napi/$IFACE" 2>/dev/null || true)
+    [ "${#PIDS[@]}" -gt 0 ] && break
+    NOW=$(date +%s%3N)
+    if [ "$NOW" -ge "$DEADLINE" ]; then
+        echo "jackbridge-napi-rt: napi/$IFACE threads did not appear within 500 ms (driver may batch them)" >&2
+        exit 0  # non-fatal
+    fi
+    sleep 0.05
+done
+
+for pid in "${PIDS[@]}"; do
+    chrt -f -p 60 "$pid" 2>/dev/null || true
+done
+echo "jackbridge-napi-rt: napi/$IFACE pids (${PIDS[*]}) → SCHED_FIFO 60" >&2

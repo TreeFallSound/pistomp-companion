@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Reverse jackbridge-napi-rt: return NAPI to softirq context on the JackBridge
+# interface. Runs as root via ExecStopPost=+, before jackbridge-unpin-route
+# removes /run/jackbridge.iface.
+#
+# The kthreads disappear automatically when threaded is set back to 0.
+# Interrupt coalescing is left at 0 — there is no reason to restore the
+# original 49 µs delay.
+#
+# Always exits 0: a failure here must not hold the unit in a failed state.
+set -u
+
+STATE=/run/jackbridge.iface
+[ -r "$STATE" ] || exit 0
+IFACE=$(cat "$STATE")
+
+THREADED=/sys/class/net/$IFACE/threaded
+if [ -f "$THREADED" ]; then
+    echo 0 > "$THREADED" 2>/dev/null || true
+    echo "jackbridge-napi-rt-down: $IFACE threaded NAPI disabled" >&2
+fi
+exit 0

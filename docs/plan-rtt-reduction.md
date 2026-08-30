@@ -87,19 +87,16 @@ Procedure:
 Caution: `NET_RING / 2` must be more than `NET_LATENCY x period`. If the value
 is too small, the pi gets xruns and the Mac counters stay at 0.
 
-### 4.2 Remove the interrupt delay
+### 4.2 Remove the interrupt delay (automated)
 
 The driver holds each interrupt for a maximum of 49 microseconds in each
-direction. Remove this delay.
-
-Procedure:
-
-    sudo ethtool -C eth0 rx-usecs 0 tx-usecs 0
+direction. `jackbridge-napi-rt` removes this delay automatically on each
+service start via `ethtool -C $IFACE rx-usecs 0 tx-usecs 0`.
 
 Expected result: the RTT decreases by a maximum of 0.1 ms. This is a small
-quantity. Do this step because it is easy, not because it is sufficient.
+quantity. It is free, so it is always applied.
 
-### 4.3 Move NAPI into a thread
+### 4.3 Move NAPI into a thread (automated)
 
 This is the step with the highest expected effect.
 
@@ -107,11 +104,13 @@ NAPI operates in a softirq. On a PREEMPT_RT kernel, a realtime thread stops a
 softirq. Thus the audio threads delay the packets. A thread has a priority.
 A softirq does not.
 
-Procedure:
+`jackbridge-napi-rt` applies this automatically on each service start:
 
-    echo 1 | sudo tee /sys/class/net/eth0/threaded
-    # then set the priority of the napi/eth0-* thread below the jackd threads
-    sudo chrt -f -p 60 $(pgrep -f 'napi/eth0')
+    echo 1 > /sys/class/net/$IFACE/threaded
+    chrt -f -p 60 <napi/$IFACE-* pids>   # FF 60: below jackd FF 70, mod-host FF 65
+
+Only the selected wired interface is affected. WiFi NAPI threads are never
+touched. On service stop, `jackbridge-napi-rt-down` restores threaded to 0.
 
 Expected result: the maximum RTT from the Mac to the pi decreases.
 
@@ -137,13 +136,14 @@ item 3 gives the method.
 
 ## 5. How to measure
 
-Measure the RTT in both directions after each step:
+Measure the RTT in both directions after each step. The link uses IPv4
+(169.254.x.x link-local). Discover the addresses and ping in one command:
 
-    # TODO: This is broken because we actually use IPv4...
     # Mac to pi
-    ping6 -c 30 -i 0.2 <pi-link-local>%en7
-    # pi to Mac
-    ssh pistomp@pistomp.local 'ping6 -c 30 -i 0.2 <mac-link-local>%eth0'
+    ping -c 30 -i 0.2 "$(ssh pistomp@pistomp.local \
+        'ip -4 -o addr show eth0 | awk "{print \$4}" | cut -d/ -f1 | head -1')"
+    # pi to Mac  (replace en7 with the direct-cable adapter if different)
+    ssh pistomp@pistomp.local "ping -c 30 -i 0.2 $(ipconfig getifaddr en7)"
 
 Compare the maximum and the jitter, not the average.
 

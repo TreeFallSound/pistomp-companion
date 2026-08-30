@@ -25,6 +25,8 @@ install -m 0755 "$SRC_DIR/bin/jackbridge-xrun-watcher" "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jb-detect-net-iface"     "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jackbridge-pin-route"    "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jackbridge-unpin-route"  "$LIBEXEC/"
+install -m 0755 "$SRC_DIR/bin/jackbridge-napi-rt"      "$LIBEXEC/"
+install -m 0755 "$SRC_DIR/bin/jackbridge-napi-rt-down" "$LIBEXEC/"
 install -m 0755 "$SRC_DIR/bin/jackbridge-pi-status"    "$LIBEXEC/"
 install -m 0644 "$SRC_DIR/pi-stomp-jackbridge.service" "$UNIT_DIR/"
 

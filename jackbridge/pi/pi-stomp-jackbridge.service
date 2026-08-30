@@ -41,6 +41,11 @@ ExecStartPre=/usr/local/bin/wait-for-jack.sh
 # wired iface is available, which is the correct loud failure mode.
 ExecStartPre=+/usr/local/libexec/jackbridge/jackbridge-pin-route
 
+# Remove interrupt coalescing, enable threaded NAPI, and apply SCHED_FIFO 60
+# to the napi/$IFACE-* kthreads. Only operates on the wired JackBridge iface;
+# wifi is never touched. Reads /run/jackbridge.iface written by the line above.
+ExecStartPre=+/usr/local/libexec/jackbridge/jackbridge-napi-rt
+
 # Loads netadapter into the stock jackd, wires the graph, then execs the
 # xrun watcher as the long-running foreground process. The watcher doubles
 # as the liveness supervisor: it polls the jack graph for a `netadapter`
@@ -52,6 +57,9 @@ ExecStart=/usr/local/libexec/jackbridge/jackbridge-pi-up
 
 # Best-effort unload on stop; the watcher is killed by systemd's normal SIGTERM.
 ExecStop=/usr/local/libexec/jackbridge/jackbridge-pi-down
+# Return NAPI to softirq context on the JackBridge iface. Must precede
+# jackbridge-unpin-route because that script removes /run/jackbridge.iface.
+ExecStopPost=+/usr/local/libexec/jackbridge/jackbridge-napi-rt-down
 ExecStopPost=+/usr/local/libexec/jackbridge/jackbridge-unpin-route
 
 # Must cover the worst case of every ExecStartPre plus ExecStart:

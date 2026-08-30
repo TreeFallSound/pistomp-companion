@@ -38,6 +38,7 @@
 # from the build tree, no install.
 
 version        := "0.3.0"
+pi             := env_var_or_default("JACKBRIDGE_PI", "pistomp@pistomp.local")
 jack_prefix    := env_var_or_default("JACK_PREFIX", "/usr/local")
 archs          := "arm64"
 proj           := "jackbridge/driver/JackBridgePlugIn.xcodeproj"
@@ -336,6 +337,27 @@ open-app:
     open -a PiStompCompanion
 
 # ── misc ──────────────────────────────────────────────────────────────────────
+
+# ── pi (jackbridge pi-side scripts) ──────────────────────────────────────────
+
+# Sync jackbridge/pi/ to the pi and run install.sh there. No restart.
+# Override the target with: JACKBRIDGE_PI=pi@192.168.x.x just pi-install
+pi-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in jackbridge/pi/bin/*; do
+        read -r shebang < "$f"
+        [[ "$shebang" == *bash* ]] && bash -n "$f"
+    done
+    rsync -a --delete jackbridge/pi/ {{pi}}:/tmp/jackbridge-pi/
+    ssh {{pi}} 'sudo /tmp/jackbridge-pi/install.sh'
+
+# Restart the pi-stomp-jackbridge unit. No install.
+pi-restart:
+    ssh {{pi}} 'sudo systemctl restart pi-stomp-jackbridge'
+
+# Install pi scripts and restart the unit.
+pi-reload: pi-install pi-restart
 
 # Remove both build trees.
 clean:
