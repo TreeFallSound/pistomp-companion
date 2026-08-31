@@ -1,0 +1,122 @@
+[H[2J── mac ── 23:19:25
+instance 0  (/JackBridge)
+  protocolVersion       11
+  driverStatus          2 (STARTED)
+  driverFault           0 (none)
+  syncMode              1 (daemon owns the timeline)
+  daemonAlive           224573   (heartbeat; must advance)
+  slavePortsConnected   6 of 6
+  daemonXRuns           260
+  resyncRequest         0   (app -> daemon+driver; both re-anchor on a new nonce)
+  reanchorCount         2   (re-anchors since the daemon started)
+  healthDeltaMax        512 frames
+  healthSnaps           0
+  dupReadCycles         531   (re-read a zeroed slot: silence to the pi)
+  skipReadFrames        42240   (audio the daemon never read)
+  dupWriteCycles        0
+  skipWriteFrames       14208   (ring positions the daemon never wrote)
+  halNFrames            512
+  halSampleRate         48000
+  jackPeriodFrames      64
+  jackSampleRate        48000
+  jitterFrames          128   (SafetyOffset)
+  netLatencyCycles      4   (netadapter -l)
+  netRingFrames         1024   (netadapter -g)
+  oneWayLatency         1106 frames   (derived; monitoring trip 2212)
+  halInputReadHead      0
+  halOutputWriteHead    13688192
+  numberTimeStamps      3341
+  zeroHostTime          0x12fd04a4f8db
+  seed                  4
+  deviceName            'pi-Stomp (pistomp.local)'
+
+── pi ── (not polled yet)
+waiting for first poll...
+[H[2J── mac ── 23:19:27
+instance 0  (/JackBridge)
+  protocolVersion       11
+  driverStatus          2 (STARTED)
+  driverFault           0 (none)
+  syncMode              1 (daemon owns the timeline)
+  daemonAlive           226087   (heartbeat; must advance)
+  slavePortsConnected   6 of 6
+  daemonXRuns           264
+  resyncRequest         0   (app -> daemon+driver; both re-anchor on a new nonce)
+  reanchorCount         2   (re-anchors since the daemon started)
+  healthDeltaMax        512 frames
+  healthSnaps           0
+  dupReadCycles         534   (re-read a zeroed slot: silence to the pi)
+  skipReadFrames        42432   (audio the daemon never read)
+  dupWriteCycles        0
+  skipWriteFrames       14208   (ring positions the daemon never wrote)
+  halNFrames            512
+  halSampleRate         48000
+  jackPeriodFrames      64
+  jackSampleRate        48000
+  jitterFrames          128   (SafetyOffset)
+  netLatencyCycles      4   (netadapter -l)
+  netRingFrames         1024   (netadapter -g)
+  oneWayLatency         1106 frames   (derived; monitoring trip 2212)
+  halInputReadHead      0
+  halOutputWriteHead    13784960
+  numberTimeStamps      3365
+  zeroHostTime          0x12fd0792f732
+  seed                  4
+  deviceName            'pi-Stomp (pistomp.local)'
+
+── pi ── (2s ago)
+service=active
+netadapters=1
+ports_wired=6
+route=eth0
+link=up
+net_restarts=0
+iface=eth0
+xruns_1m=0
+xruns_5m=37
+xruns_15m=37
+[H[2J── mac ── 23:19:29
+instance 0  (/JackBridge)
+  protocolVersion       11
+  driverStatus          2 (STARTED)
+  driverFault           0 (none)
+  syncMode              1 (daemon owns the timeline)
+  daemonAlive           227607   (heartbeat; must advance)
+  slavePortsConnected   6 of 6
+  daemonXRuns           266
+  resyncRequest         0   (app -> daemon+driver; both re-anchor on a new nonce)
+  reanchorCount         2   (re-anchors since the daemon started)
+  healthDeltaMax        512 frames
+  healthSnaps           0
+  dupReadCycles         534   (re-read a zeroed slot: silence to the pi)
+  skipReadFrames        42432   (audio the daemon never read)
+  dupWriteCycles        0
+  skipWriteFrames       14208   (ring positions the daemon never wrote)
+  halNFrames            512
+  halSampleRate         48000
+  jackPeriodFrames      64
+  jackSampleRate        48000
+  jitterFrames          128   (SafetyOffset)
+  netLatencyCycles      4   (netadapter -l)
+  netRingFrames         1024   (netadapter -g)
+  oneWayLatency         1106 frames   (derived; monitoring trip 2212)
+  halInputReadHead      0
+  halOutputWriteHead    13882240
+  numberTimeStamps      3389
+  zeroHostTime          0x12fd0a80f6f2
+  seed                  4
+  deviceName            'pi-Stomp (pistomp.local)'
+
+── pi ── (2s ago)
+service=active
+netadapters=1
+ports_wired=6
+route=eth0
+link=up
+net_restarts=0
+iface=eth0
+xruns_1m=0
+xruns_5m=37
+xruns_15m=37
+
+

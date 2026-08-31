@@ -382,7 +382,30 @@ have not been instrumented.
 ## What's left to try (ordered)
 
 ### 1. Audit JackBridged daemon's shm read/write path (hop 8/9)
-Highest prior given everything else is ruled out. Looking for:
+**Closed 2026-08-30 — a bug was found here.** `recv_offset()` did not walk the
+settled block, so whenever the host's block size N differed from the JACK
+period P, the daemon read the same slot N/P times and the consume-side zeroing
+sent silence for all but the first. Measured loss at N = 512, P = 64: 87.5% of
+playback frames. `docs/DEBUGGING.md` section 6 has the full workup.
+
+This closes two entries below. FAQ 1 ("playback is much worse than
+recording") is the direct signature: the capture path already had the walk.
+FAQ 3 and "The DAW's buffer size dominated everything else" are the same
+cause, because the loss is a function of N/P.
+
+Note what it does **not** close. The bug is inert when N == P, so any crackle
+measured at a matched buffer size is a separate fault, and the netJACK2 loop
+budget work in the 2026-08-29 update stands on its own. Re-measure the
+remaining items before you trust their old numbers — every reading taken at
+N != P has this loss mixed into it.
+
+One defect is left on this path, and it is small: a 0.1% loss from the beat
+between the two cycle rates. `docs/plan-free-running-cursor.md` has the plan.
+
+The original audit list follows. The first item is what the bug turned out to
+be adjacent to, not identical to: the cursor was not torn, it was stationary.
+
+Looking for:
 - **TOCTOU on the producer-consumer cursor.** Can HAL read from a frame
   position the daemon hasn't fully written? Need acquire/release on the
   *write* head update, with HAL doing acquire on read.
@@ -457,6 +480,9 @@ One-line change in `jackbridge/pi/bin/jackbridge-pi-up` (`jack_load netadapter -
    speakers) is much worse than recording** (pi mic → Mac DAW) — confirmed
    2026-08-29, and it matches the measured RTT asymmetry: playback is the
    direction the pi has to receive on.
+   **Explained 2026-08-30.** The asymmetry was mostly the `recv_offset()` bug,
+   which affected the playback path only. Re-measure before you attribute what
+   is left to the RTT.
   
 2. **Are clicks correlated with anything observable?** They seem to be
    a bit more common when I'm doing a lot of other stuff on the Mac,
@@ -466,3 +492,5 @@ One-line change in `jackbridge/pi/bin/jackbridge-pi-up` (`jack_load netadapter -
 3. **Does the click rate change with sample rate or buffer size?**
    Yes, strongly. The DAW's CoreAudio buffer at 128 frames measured 5x the
    Mac xrun rate of the same config at 64 (2026-08-29). Sample rate untested.
+   **Explained 2026-08-30.** 64 was N == P, where the bug is inert; 128 was
+   N/P = 2, where half the playback frames were lost. Re-measure.

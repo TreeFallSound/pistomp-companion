@@ -1,7 +1,7 @@
 import Foundation
 
 /// Snapshot of the /JackBridge shm control region. Field offsets are the
-/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 10.
+/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 11.
 /// Every field is a plain aligned uint64_t (compile-time asserted on the
 /// C++ side), so a read of UInt64 at these offsets is exact.
 struct ShmSnapshot {
@@ -52,13 +52,28 @@ struct ShmSnapshot {
     /// Re-anchors since the daemon started. Advancing on its own means the
     /// automatic divergence recovery is firing.
     var reanchorCount: UInt64 = 0
+    /// Cadence. The daemon positions both rings from the HAL's heads, and
+    /// these say whether its own cycles ran 1:1 against them. The read side
+    /// is the audible one: the daemon's read is destructive, so a repeated
+    /// cycle sends the pi zeroed slots — silence inside correctly paced
+    /// audio, heard as a haze rather than as a click. Read as rates: a few
+    /// from a start transient mean nothing, a counter climbing while audio
+    /// plays is the fault.
+    var dupReadCycles: UInt64 = 0
+    var skipReadFrames: UInt64 = 0
+    var dupWriteCycles: UInt64 = 0
+    var skipWriteFrames: UInt64 = 0
+    /// Snap-to-target corrections of the free-running read cursor.
+    /// Occasional snaps absorb scheduling jitter; a steady climb means the
+    /// two clock rates differ.
+    var recvResyncs: UInt64 = 0
 
     /// Hardcoded on purpose, and it must stay that way. The offsets below are
     /// hand-copied literals the compiler cannot check against
     /// shared/JackBridge.h, so this constant is the tripwire that forces
     /// someone to re-verify them on a layout change. Deriving it from the
     /// header would let the app recompile past a bump and read stale offsets.
-    static let expectedProtocolVersion: UInt64 = 10
+    static let expectedProtocolVersion: UInt64 = 12
     static let driverStatusStarted: UInt64 = 2
     /// Full complement of daemon slave ports (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS).
     static let slavePortsFull: UInt64 = 6
@@ -194,6 +209,11 @@ final class ShmReader {
         s.healthDeltaMax      = field(0x1e8)
         s.healthSnaps         = field(0x1f0)
         s.reanchorCount       = field(0x1f8)
+        s.dupReadCycles       = field(0x280)
+        s.skipReadFrames      = field(0x288)
+        s.dupWriteCycles      = field(0x290)
+        s.skipWriteFrames     = field(0x298)
+        s.recvResyncs         = field(0x2a0)
         return s
     }
 }

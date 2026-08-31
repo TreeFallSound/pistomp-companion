@@ -70,8 +70,53 @@ engine: driver daemon
     clang -O2 -o "{{engine_out}}/jb-rmshm" jackbridge/tools/rmshm.c
     @echo "engine built → {{engine_out}}"
 
+# Fail if the app's protocol constant has drifted from the C++ contract.
+#
+# ShmReader.swift hard-codes both the protocol version and every field offset,
+# because the Swift app cannot include JackBridge.h. That constant is a
+# deliberate tripwire: it exists so a layout change cannot slip past the app
+# and be read at stale offsets. But nothing enforced it, so a bump to the
+# header alone left the app quietly expecting the old protocol and painting the
+# menu bar red -- with the engine perfectly healthy and `just reload-all`
+# reporting success, which sends you looking at the install rather than at the
+# app.
+#
+# This does NOT sync the two. Syncing would defeat the tripwire: the point is
+# that a human re-checks the hand-copied offsets against JB_OFF_* before
+# changing the number.
+protocol-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    hdr=$(sed -n 's/^#define JACKBRIDGE_PROTOCOL_VERSION[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+          jackbridge/shared/JackBridge.h | head -1)
+    swift=$(sed -n 's/.*expectedProtocolVersion: UInt64 = \([0-9][0-9]*\).*/\1/p' \
+            app/PiStompCompanion/ShmReader.swift | head -1)
+    if [ -z "$hdr" ] || [ -z "$swift" ]; then
+        echo "protocol-check: could not read one of the two constants" >&2
+        echo "  header=${hdr:-<not found>} swift=${swift:-<not found>}" >&2
+        exit 1
+    fi
+    if [ "$hdr" != "$swift" ]; then
+        echo "protocol-check: PROTOCOL VERSION MISMATCH" >&2
+        echo "  jackbridge/shared/JackBridge.h      JACKBRIDGE_PROTOCOL_VERSION = $hdr" >&2
+        echo "  app/PiStompCompanion/ShmReader.swift expectedProtocolVersion    = $swift" >&2
+        echo "" >&2
+        echo "  The app would attach to a protocol-$hdr region expecting $swift and go red." >&2
+        echo "  Re-verify every field(0x...) literal in ShmReader.swift against the" >&2
+        echo "  JB_OFF_* defines in JackBridge.h, THEN set expectedProtocolVersion = $hdr." >&2
+        exit 1
+    fi
+    echo "protocol-check: both sides agree on protocol $hdr"
+
+# Unit test the ring-projector math (cursor, target, error, resync window).
+# Pure C++, no JACK, no shm, no Xcode — runs anywhere the daemon compiles.
+test-projector:
+    clang++ -O2 -Wall -Werror -o "{{justfile_directory()}}/build/RingProjector_test" \
+        jackbridge/daemon/RingProjector_test.cpp
+    "{{justfile_directory()}}/build/RingProjector_test"
+
 # Build the menu-bar app (no install; it reads shm live).
-app:
+app: protocol-check
     xcodebuild -project app/PiStompCompanion.xcodeproj -target PiStompCompanion \
         -configuration Release ARCHS={{archs}} ONLY_ACTIVE_ARCH=NO | tail -3
     @echo "app built → {{app_out}}/PiStompCompanion.app"
@@ -235,6 +280,56 @@ shm instance="0":
 status:
     "{{sys_support}}/jackbridge-ctl" status || echo "jackbridge-ctl not installed — run just pkg-install first"
 
+# Poll the shm fields and the pi's status side by side (ctrl-C to stop).
+watch interval="2" instance="0":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # Compile once, not once per tick -- `just shm` rebuilds every invocation,
+    # which is right for a one-shot and wrong at 0.5 Hz.
+    mkdir -p "{{justfile_directory()}}/build"
+    clang++ -std=c++17 -O2 -I jackbridge/shared \
+        -o "{{justfile_directory()}}/build/jbdump" jackbridge/tools/jbdump.cpp
+    jbdump="{{justfile_directory()}}/build/jbdump"
+    ctl="{{sys_support}}/jackbridge-ctl"
+
+    pipane=$(mktemp -t jbwatch)
+    trap 'rm -f "$pipane"; printf "\n"; exit 0' INT TERM EXIT
+    # Always two lines: an epoch (or "-" for a reading that has not landed
+    # yet) then the body. The renderer slices on that shape, so a placeholder
+    # in any other shape draws an empty pane.
+    printf -- '-\nwaiting for first poll...\n' > "$pipane"
+
+    # One refresher at a time. Without the guard a pi that takes 15 s to time
+    # out at a 2 s interval accumulates seven concurrent ssh attempts. Start it
+    # empty, not 0: `kill -0 0` signals the whole process group and succeeds,
+    # so a 0 here reads as "a refresher is already running" forever and the
+    # first one never launches.
+    pipid=""
+    while :; do
+        if [ -z "$pipid" ] || ! kill -0 "$pipid" 2>/dev/null; then
+            {
+                if [ -x "$ctl" ]; then
+                    body=$("$ctl" pi-status 2>&1)
+                else
+                    body="jackbridge-ctl not installed — run just pkg-install first"
+                fi
+                printf '%s\n%s\n' "$(date +%s)" "$body" > "$pipane"
+            } &
+            pipid=$!
+        fi
+
+        mac=$("$jbdump" {{instance}} 2>&1)
+        stamp=$(head -n1 "$pipane" 2>/dev/null)
+        if [ "$stamp" = "-" ]; then age="not polled yet"
+        else age="$(( $(date +%s) - stamp ))s ago"; fi
+
+        # \033[H\033[2J in one write with the Mac pane: clearing separately
+        # leaves the terminal blank between the two, which flickers.
+        printf '\033[H\033[2J── mac ── %s\n%s\n\n── pi ── (%s)\n%s\n' \
+            "$(date '+%H:%M:%S')" "$mac" "$age" "$(tail -n +2 "$pipane")"
+        sleep {{interval}}
+    done
+
 # ── loops ─────────────────────────────────────────────────────────────────────
 # Compositions of the layers above. Each restarts exactly once, at the end.
 
@@ -311,7 +406,7 @@ rmshm: unlink-shm
 # ── package (outer loop) ──────────────────────────────────────────────────────
 
 # Build a real installer package.
-pkg:
+pkg: protocol-check
     ./jackbridge/installer/build-pkg.sh {{version}}
 
 # Build and install the package (authoritative path).
@@ -322,7 +417,10 @@ pkg-install: pkg
 # ── app ───────────────────────────────────────────────────────────────────────
 
 # App inner loop: kill the running copy, rebuild, relaunch detached.
-app-restart config="Debug":
+# protocol-check because this is the path `reload-all` takes: app-restart.sh
+# calls xcodebuild directly and never goes through `just app`, so without the
+# dependency here the guard misses the exact loop that hits it most.
+app-restart config="Debug": protocol-check
     ./app-restart.sh "{{config}}"
 
 # Run the app from its build tree (shares the live shm, no install).
@@ -347,7 +445,13 @@ pi-install:
     set -euo pipefail
     for f in jackbridge/pi/bin/*; do
         read -r shebang < "$f"
-        [[ "$shebang" == *bash* ]] && bash -n "$f"
+        case "$shebang" in
+            *bash*)    bash -n "$f" ;;
+            # compile() rather than py_compile: the latter writes a
+            # __pycache__ beside the source, which `rsync -a --delete` would
+            # then ship to the pi.
+            *python3*) python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$f" ;;
+        esac
     done
     rsync -a --delete jackbridge/pi/ {{pi}}:/tmp/jackbridge-pi/
     ssh {{pi}} 'sudo /tmp/jackbridge-pi/install.sh'

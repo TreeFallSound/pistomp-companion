@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 10
+#define JACKBRIDGE_PROTOCOL_VERSION 12
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -71,10 +71,10 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 //                       HAL_NFRAMES, HAL_SAMPLE_RATE,
 //                       READ/WRITE_FRAME_NUMBER(i)
 //   Daemon owns       : DAEMON_ALIVE, SLAVE_PORTS_CONNECTED, DAEMON_XRUNS,
-//                       JACK_PERIOD_FRAMES, JACK_SAMPLE_RATE, DEVICE_NAME,
-//                       BUFFER_SIZE, PROTOCOL_VERSION, SYNC_MODE,
 //                       JITTER_FRAMES, NET_LATENCY_CYCLES, NET_RING_FRAMES,
-//                       HEALTH_DELTA_MAX, HEALTH_SNAPS, REANCHOR_COUNT
+//                       HEALTH_DELTA_MAX, HEALTH_SNAPS, REANCHOR_COUNT,
+//                       DUP_READ_CYCLES, SKIP_READ_FRAMES, DUP_WRITE_CYCLES,
+//                       SKIP_WRITE_FRAMES, RECV_RESYNCS
 //   App owns          : RESYNC_REQUEST (write-only; the driver and the daemon
 //                       both read it and re-anchor their own side)
 //   Mode-dependent    : NUMBER_TIMESTAMPS, ZERO_HOST_TIME, SEED. SYNC_MODE
@@ -127,6 +127,11 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x01f0      :    health: snap count in the last window (daemon)
 // 0x01f8      :    re-anchors performed since daemon start (daemon)
 // 0x0200      :    CoreAudio device name (daemon-published, NUL-terminated UTF-8)
+// 0x0280      :    cadence: daemon cycles that re-read an unchanged write head (daemon)
+// 0x0288      :    cadence: frames the write head skipped past one block (daemon)
+// 0x0290      :    cadence: daemon cycles that re-wrote against an unchanged read head (daemon)
+// 0x0298      :    cadence: frames the read head skipped past one block (daemon)
+// 0x02a0      :    cadence: upstream cursor snap-to-target corrections (daemon)
 // 0x10000     : Upstream buffer #0 (Driver -> Application)
 // 0x18000     : Downstream buffer #0 (Application -> Driver)
 // 0x20000     : Upstream buffer #0 (Driver -> Application)
@@ -228,6 +233,37 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // make the next such overlap a build error instead of a latent corruption.
 #define JB_DEVICE_NAME_MAX         128
 #define JB_OFF_DEVICE_NAME         (0x200)
+
+// Cadence counters, all daemon-written, all monotonic.
+//
+// The daemon positions both rings relative to the HAL's heads, which move
+// only when the HAL cycles. These counters record whether the daemon's own
+// cycles ran 1:1 against them. recv reads destructively (RingCopy.hpp zeroes
+// each slot as it copies it out), so the read counters are the audible ones:
+// a repeat or a skip puts silence inside correctly-paced audio, which reads
+// as a haze rather than as a click, while every timing field still looks
+// clean.
+//
+//   DUP_READ_CYCLES    daemon cycles that re-read a slot they already zeroed;
+//                      each one handed the pi silence.
+//   SKIP_READ_FRAMES   frames no daemon cycle ever read.
+//   DUP_WRITE_CYCLES   daemon cycles that re-wrote the same ring position.
+//   SKIP_WRITE_FRAMES  ring positions the daemon left unwritten.
+//   RECV_RESYNCS       corrections of the upstream read cursor. The cursor
+//                      free-runs and is snapped to its target only when it
+//                      leaves the safe window; every snap lands here so a
+//                      correction can never hide in the counters above.
+//
+// Steady state is all five at 0 and staying there. Read them as rates, not
+// totals: a handful accumulated across a start transient means nothing, and
+// a counter that climbs while audio plays is the fault. A steady climb in
+// RECV_RESYNCS specifically means the two clock rates differ — see
+// docs/plan-free-running-cursor.md section 6.
+#define JB_OFF_DUP_READ_CYCLES     (0x280)
+#define JB_OFF_SKIP_READ_FRAMES    (0x288)
+#define JB_OFF_DUP_WRITE_CYCLES    (0x290)
+#define JB_OFF_SKIP_WRITE_FRAMES   (0x298)
+#define JB_OFF_RECV_RESYNCS        (0x2a0)
 #define JB_DEVICE_NAME_FALLBACK    "pi-Stomp"
 
 /******************************************************************************
@@ -272,9 +308,18 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // Daemon write-ahead safety margin in frames. Reported via
 // kAudioDevicePropertySafetyOffset; the DAW adds it on top of the one-way
 // latency, so it must NOT be included in jb_one_way_latency_frames().
-// Sized to cover the maximum observed CoreAudio IOProc burst (maxBurst=272
-// in a 2-hour live session 2026-08-30); 320 = next 5×P above that.
-#define JB_JITTER_FRAMES            320
+// This is a real latency cost, not free headroom: RingProjector reads at
+// (write_head - JB_JITTER_FRAMES), so the daemon hands the DAW audio that is
+// JB_JITTER_FRAMES old. A value of 0 does NOT mean "no cushion" — it lands on
+// the slot one past the newest, which still holds the previous lap, so it
+// costs a FULL ring (4096 frames, 85 ms per direction). Keep it ≥ 1.
+//
+// 128 chosen 2026-08-30. The previous 320 was sized to cover the maximum
+// observed CoreAudio IOProc burst (maxBurst=272 in a 2-hour live session).
+// 128 is below that figure, so a burst past 128 frames can starve the ring;
+// this trades that risk for 4 ms per direction. If starvation appears under
+// load, raise it before you change anything else.
+#define JB_JITTER_FRAMES            128
 // IQaudIO ADC/DAC group delay (datasheet, low ms -> ~1 frame).
 #define JB_CODEC_GROUP_DELAY_FRAMES 1
 // LAN one-way transit on a direct cable. A consumer switch in the path costs
@@ -410,6 +455,24 @@ static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_REANCHOR_COUNT + 8,
               "device name overlaps the control atomics");
 static_assert(JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX <= STRBUF_U0,
               "device name runs into the first ring buffer");
+static_assert(JB_OFF_DUP_READ_CYCLES >= JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX,
+              "cadence counters overlap the device name");
+static_assert(JB_OFF_RECV_RESYNCS >= JB_OFF_SKIP_WRITE_FRAMES + 8 &&
+              (JB_OFF_RECV_RESYNCS % 8) == 0,
+              "resync counter overlaps or is misaligned");
+static_assert(JB_OFF_RECV_RESYNCS + 8 <= STRBUF_U0,
+              "resync counter runs into the first ring buffer");
+static_assert(JB_OFF_SKIP_READ_FRAMES  >= JB_OFF_DUP_READ_CYCLES + 8 &&
+              JB_OFF_DUP_WRITE_CYCLES  >= JB_OFF_SKIP_READ_FRAMES + 8 &&
+              JB_OFF_SKIP_WRITE_FRAMES >= JB_OFF_DUP_WRITE_CYCLES + 8,
+              "cadence counters overlap");
+static_assert((JB_OFF_DUP_READ_CYCLES % 8) == 0 &&
+              (JB_OFF_SKIP_READ_FRAMES % 8) == 0 &&
+              (JB_OFF_DUP_WRITE_CYCLES % 8) == 0 &&
+              (JB_OFF_SKIP_WRITE_FRAMES % 8) == 0,
+              "cadence atomic<uint64_t> fields must be 8-byte aligned");
+static_assert(JB_OFF_SKIP_WRITE_FRAMES + 8 <= STRBUF_U0,
+              "cadence counters run into the first ring buffer");
 static_assert((JB_OFF_JACK_PERIOD_FRAMES % 8) == 0 &&
               (JB_OFF_JACK_SAMPLE_RATE % 8) == 0,
               "atomic<uint64_t> fields must be 8-byte aligned");
@@ -423,7 +486,7 @@ protected:
     sample_t *buf_up[MAX_STREAMS];
     sample_t *buf_down[MAX_STREAMS];
     uint64_t   FrameNumber;
-    int        FramesPerBuffer;
+    int        RingFrames;          // shm ring size in frames (STRBUFNUM/2 = 4096)
     std::atomic<uint64_t> *shmNumberTimeStamps;
     std::atomic<uint64_t> *shmZeroHostTime;
     std::atomic<uint64_t> *shmSeed;
@@ -456,6 +519,7 @@ protected:
     // Protocol-8 self-healing fields. See the JB_OFF_* comments above.
     std::atomic<uint64_t> *shmSlavePortsConnected; // daemon writes
     std::atomic<uint64_t> *shmDaemonXRuns;         // daemon writes
+    std::atomic<uint64_t> *shmRecvResyncs;         // daemon writes (upstream cursor corrections)
     std::atomic<uint64_t> *shmDriverFault;         // driver writes
     std::atomic<uint64_t> *shmResyncRequest;       // app writes, driver echoes
     std::atomic<uint64_t> *shmJitterFrames;        // daemon writes (protocol 9)
@@ -465,6 +529,11 @@ protected:
     std::atomic<uint64_t> *shmHealthDeltaMax;      // daemon writes
     std::atomic<uint64_t> *shmHealthSnaps;         // daemon writes
     std::atomic<uint64_t> *shmReanchorCount;       // daemon writes
+    // Cadence counters (daemon writes; see the block above).
+    std::atomic<uint64_t> *shmDupReadCycles;
+    std::atomic<uint64_t> *shmSkipReadFrames;
+    std::atomic<uint64_t> *shmDupWriteCycles;
+    std::atomic<uint64_t> *shmSkipWriteFrames;
     std::atomic<uint64_t> *shmReadFrameNumber[MAX_STREAMS];
     std::atomic<uint64_t> *shmWriteFrameNumber[MAX_STREAMS];
 
@@ -556,6 +625,11 @@ protected:
         shmHealthDeltaMax      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HEALTH_DELTA_MAX);
         shmHealthSnaps         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HEALTH_SNAPS);
         shmReanchorCount       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_REANCHOR_COUNT);
+        shmDupReadCycles       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DUP_READ_CYCLES);
+        shmSkipReadFrames      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_SKIP_READ_FRAMES);
+        shmDupWriteCycles      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DUP_WRITE_CYCLES);
+        shmSkipWriteFrames     = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_SKIP_WRITE_FRAMES);
+        shmRecvResyncs         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_RECV_RESYNCS);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

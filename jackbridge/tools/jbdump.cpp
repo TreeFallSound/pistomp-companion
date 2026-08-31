@@ -111,16 +111,48 @@ int main(int argc, char** argv)
            field(base, JB_OFF_REANCHOR_COUNT));
 
     // The timeline health window. These two were os_log-only until protocol
-    // 10, which is how a stack could be hours out of anchor and still show
+    // 10, which is how a stack could sit hours out of anchor and still show
     // STARTED, no fault, a live heartbeat and 6 of 6 ports. deltaMax near 0
     // and snaps at 0 is the only shape that means the timeline is holding --
     // check them before and after any measurement window.
     uint64_t deltaMax = field(base, JB_OFF_HEALTH_DELTA_MAX);
     uint64_t snaps    = field(base, JB_OFF_HEALTH_SNAPS);
+    // The delta sawtooths 0..N on a healthy stack (the daemon samples the
+    // anchor once per JACK cycle, the anchor moves once per HAL cycle), so
+    // the alarm must sit above the sawtooth exactly as the daemon's own
+    // snap threshold does: N + 512. A fixed value here cried wolf at every
+    // N >= 512 while the daemon stayed healthy.
+    const uint64_t halN = field(base, JB_OFF_HAL_NFRAMES);
+    const uint64_t deltaAlarm = halN + 512;
     printf("  healthDeltaMax        %" PRIu64 " frames%s\n", deltaMax,
-           deltaMax ? "   *** timeline is not holding ***" : "");
+           deltaMax > deltaAlarm ? "   *** timeline is not holding ***" : "");
     printf("  healthSnaps           %" PRIu64 "%s\n", snaps,
            snaps ? "   *** timeline is not holding ***" : "");
+
+    // Cadence. The daemon positions both rings from the HAL's heads, and
+    // these say whether its own cycles ran 1:1 against them. The read side
+    // is the audible one: the daemon's read is destructive, so a repeated
+    // cycle hands the pi zeroed slots — silence stitched into
+    // correctly-paced audio, which is heard as a haze rather than a click.
+    // Read them as rates. A few from a start transient mean nothing; a
+    // counter climbing while audio plays is the fault. recvResyncs counts
+    // snaps of the free-running read cursor: occasional snaps absorb
+    // scheduling jitter, a steady climb means the two clock rates differ.
+    uint64_t dupRead    = field(base, JB_OFF_DUP_READ_CYCLES);
+    uint64_t skipRead   = field(base, JB_OFF_SKIP_READ_FRAMES);
+    uint64_t dupWrite   = field(base, JB_OFF_DUP_WRITE_CYCLES);
+    uint64_t skipWrite  = field(base, JB_OFF_SKIP_WRITE_FRAMES);
+    uint64_t resyncs    = field(base, JB_OFF_RECV_RESYNCS);
+    printf("  dupReadCycles         %" PRIu64 "%s\n", dupRead,
+           dupRead ? "   (re-read a zeroed slot: silence to the pi)" : "");
+    printf("  skipReadFrames        %" PRIu64 "%s\n", skipRead,
+           skipRead ? "   (audio the daemon never read)" : "");
+    printf("  dupWriteCycles        %" PRIu64 "%s\n", dupWrite,
+           dupWrite ? "   (re-wrote the same ring position)" : "");
+    printf("  skipWriteFrames       %" PRIu64 "%s\n", skipWrite,
+           skipWrite ? "   (ring positions the daemon never wrote)" : "");
+    printf("  recvResyncs           %" PRIu64 "%s\n", resyncs,
+           resyncs ? "   (read-cursor snaps: a steady climb means a rate mismatch)" : "");
 
     printf("  halNFrames            %" PRIu64 "\n", field(base, JB_OFF_HAL_NFRAMES));
     printf("  halSampleRate         %" PRIu64 "\n", field(base, JB_OFF_HAL_SAMPLE_RATE));

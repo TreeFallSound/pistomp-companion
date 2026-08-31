@@ -174,6 +174,8 @@ There is no SRC inside JackBridge. netJACK2 handles the clock-domain
 crossing.
 
 - [docs/architecture.md](docs/architecture.md) — detailed design
+- [docs/DEBUGGING.md](docs/DEBUGGING.md) — how to read `just shm` and the
+  cadence counters, with a symptom index
 - [docs/macos-setup.md](docs/macos-setup.md) — edge cases
 - [jackbridge/tools/jackbridge-ctl](jackbridge/tools/jackbridge-ctl) —
   status/stop/start script

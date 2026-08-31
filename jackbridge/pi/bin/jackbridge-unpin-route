@@ -7,9 +7,20 @@ set -u
 STATE=/run/jackbridge.iface
 GROUP=225.3.19.154/32
 
+log() { echo "jackbridge-unpin-route: $*" >&2; }
+
 if [ -r "$STATE" ]; then
     iface=$(cat "$STATE")
-    ip route del "$GROUP" dev "$iface" 2>/dev/null || true
+    if ip route del "$GROUP" dev "$iface" 2>/dev/null; then
+        log "removed route $GROUP dev $iface"
+    else
+        # Not a fault on its own: a route the kernel already dropped with the
+        # link leaves nothing to delete. It matters only next to a start that
+        # then cannot pin.
+        log "no route $GROUP dev $iface to remove"
+    fi
     rm -f "$STATE"
+else
+    log "$STATE absent; nothing to unpin"
 fi
 exit 0

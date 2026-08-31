@@ -97,6 +97,16 @@ def write_file(path: str, buckets: list[int], cur_min: int) -> None:
         raise
 
 
+def log(msg: str) -> None:
+    """One line to stderr, which systemd routes to the unit's journal.
+
+    Every caller is on the 1 Hz loop or rarer. Never log per xrun: the
+    previous version of this script wrote per event, pegged a core, starved
+    jackd, and amplified the very xrun rate it was measuring.
+    """
+    print(f"jackbridge-xrun-watcher: {msg}", file=sys.stderr, flush=True)
+
+
 def write_link(path: str, last_restart: int, restarts: int) -> None:
     """Atomic rewrite: one line, "<epoch_of_last_restart> <restarts>"."""
     dirpath = os.path.dirname(path) or "."
@@ -134,6 +144,7 @@ def main() -> int:
     # that is over. Start from zero and say so.
     restarts = 0
     write_link(link_path, 0, 0)
+    log(f"watching jack journal; xruns -> {path}, link -> {link_path}")
 
     buckets = [0] * N_BUCKETS
     cur_min = int(time.time()) // 60
@@ -164,6 +175,12 @@ def main() -> int:
 
             # Advance the window; zero out any minute buckets we've crossed.
             if now_min != cur_min:
+                # Summarise the minute that just closed, and only when it was
+                # not clean. A quiet link stays quiet in the journal, so a
+                # single line here always means something happened.
+                closed = buckets[cur_min % N_BUCKETS]
+                if closed:
+                    log(f"{closed} ringbuffer xrun(s) in the last minute")
                 for m in range(cur_min + 1, now_min + 1):
                     buckets[m % N_BUCKETS] = 0
                 cur_min = now_min
@@ -172,7 +189,13 @@ def main() -> int:
             if ready:
                 line = proc.stdout.readline()
                 if not line:
-                    break  # journalctl exited
+                    # journalctl exited. Returning 0 here let the unit stop
+                    # without tripping Restart=on-failure: telemetry died, the
+                    # slave kept running, and pi-status went on reporting the
+                    # last xrun buckets as though they were current. Fail
+                    # loudly instead, so systemd re-establishes the watch.
+                    log("WARNING journalctl exited; xrun telemetry has stopped")
+                    return 1
                 if PATTERN.search(line):
                     buckets[cur_min % N_BUCKETS] += 1
                     dirty = True
@@ -181,6 +204,11 @@ def main() -> int:
                     # needs no rate limit of its own.
                     restarts += 1
                     write_link(link_path, int(now), restarts)
+                    # netadapter restarts its network layer in process. The
+                    # JACK client, its ports, the route and the xrun rate all
+                    # still read healthy while no audio crosses the wire, so
+                    # this line is the only pi-side evidence of the gap.
+                    log(f"netadapter link restarted (restart #{restarts})")
 
             # Flush at most once per second. Bounds filesystem work no matter
             # how fast xruns arrive — the bug this script's previous version

@@ -11,7 +11,7 @@ Status: **verified**. The daemon and HAL use two independent modulo counters on 
 | `STRBUFSZ` | `0x8000` = 32,768 bytes | `jackbridge/shared/JackBridge.h` |
 | `AUDIO_SAMPLE_SIZE` | `sizeof(float)` = 4 bytes | `jackbridge/shared/JackBridge.h` |
 | `STRBUFNUM` | `32768 / 4 = 8192` float slots | `jackbridge/shared/JackBridge.h` |
-| `FramesPerBuffer` | `8192 / 2 = 4096` stereo frames | `jackbridge/daemon/JackBridge.cpp`, `jackbridge/driver/JackBridge/Plug-In/SA_Device.cpp` |
+| `FramesPerBuffer` (renamed `RingFrames`) | `8192 / 2 = 4096` stereo frames | `jackbridge/daemon/JackBridge.cpp`, `jackbridge/driver/JackBridge/Plug-In/SA_Device.cpp` |
 
 Each ring holds **4096 stereo float frames** (interleaved L/R). Both sides know this value; neither can change it at runtime.
 

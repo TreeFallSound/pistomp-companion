@@ -92,7 +92,7 @@ JackClient::JackClient(const char* name, uint32_t flags) {
         exit(1);
     }
     SampleRate = jack_get_sample_rate(client);
-    BufSize = jack_get_buffer_size(client);
+    JackPeriodFrames = jack_get_buffer_size(client);
     cb_flags = flags;
 }
 

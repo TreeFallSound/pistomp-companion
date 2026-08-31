@@ -18,11 +18,25 @@
 exec 9>/run/lock/jackbridge.flock
 flock 9
 
+log() { echo "jackbridge-pi-down: $*" >&2; }
+
 # jack_lsp -l format is one "<client>:<port>" line followed by indented
 # per-port metadata. Filter for our client name pattern, drop the :port
 # suffix, and sort -u so we unload each client exactly once.
+# Say what was detached. A stop that unloads two clients means the previous
+# start left a duplicate, and the count is the only evidence of it once the
+# graph is gone.
+n=0
 while read -r client; do
     [ -n "$client" ] || continue
-    jack_unload "$client" 2>/dev/null || true
+    n=$(( n + 1 ))
+    if jack_unload "$client" 2>/dev/null; then
+        log "unloaded '$client'"
+    else
+        log "WARNING could not unload '$client'"
+    fi
 done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/null | \
          awk '/^netadapter(-[0-9]+)?:/ { sub(/:.*/, ""); print }' | sort -u)
+
+[ "$n" -gt 0 ] || log "no netadapter client to unload"
+[ "$n" -le 1 ] || log "WARNING unloaded $n netadapter clients; the previous start left duplicates"

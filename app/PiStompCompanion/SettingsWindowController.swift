@@ -149,7 +149,7 @@ final class SettingsWindowController: NSWindowController {
         let probe = button("Probe Pi Now", #selector(probeNow(_:)))
         let reset = button("Reset to Defaults", #selector(resetDefaults(_:)))
         let cancel = button("Cancel", #selector(cancel(_:)))
-        let apply = button("Apply", #selector(apply(_:)))
+        let apply = button("Save", #selector(apply(_:)))
         apply.keyEquivalent = "\r"
         cancel.keyEquivalent = "\\e"
         let actions = NSStackView(views: [probe, reset, NSView(), cancel, apply])
@@ -277,9 +277,14 @@ final class SettingsWindowController: NSWindowController {
         // Tolerate either <integer> or <string>: config.plist is hand-editable.
         let jitter = (values["JitterFrames"] as? Int)
             ?? (values["JitterFrames"] as? String).flatMap(Int.init)
-            ?? 0
+            ?? ConfigStore.defaultJitterFrames
+        // A value we do not offer (e.g. a hand-edited 320) must fall back to the
+        // default, NOT to item 0 — item 0 is "0 frames", which costs a full ring
+        // lap in each direction and would be written back on the next Save.
         jitterPopup.selectItem(withTitle: String(jitter))
-        if jitterPopup.selectedItem == nil { jitterPopup.selectItem(at: 0) }
+        if jitterPopup.selectedItem == nil {
+            jitterPopup.selectItem(withTitle: String(ConfigStore.defaultJitterFrames))
+        }
 
         select(netLatencyPopup, String(ConfigStore.int(values, "NetLatency", 4)))
         select(netRingPopup, String(ConfigStore.int(values, "NetRing", 1024)))
@@ -390,20 +395,19 @@ final class SettingsWindowController: NSWindowController {
             return
         }
 
-        let alert = NSAlert()
-        alert.messageText = "Restart JackBridge?"
-        alert.informativeText = "Applying these settings restarts the existing JackBridge services. Audio will briefly stop."
-        alert.addButton(withTitle: "Apply")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
+        // No restart, and no prompt offering one. This writes config.plist and
+        // nothing else; the engine reads the file at startup, so the values take
+        // effect the next time JackBridge starts. The button said "Apply" and the
+        // prompt claimed a restart that no code here ever performed — see
+        // AppDelegate.runCtl("restart"), which only the menu item calls.
         var next = values
         next["PiHostname"] = hostname
         next["NetworkInterface"] = network
         next["ClockDeviceUID"] = clock
         next["Workgroup"] = ConfigStore.workgroupModes
             .first { $0.title == workgroupPopup.selectedItem?.title }?.key ?? ConfigStore.defaultWorkgroup
-        next["JitterFrames"] = Int(jitterPopup.selectedItem?.title ?? "0") ?? 0
+        next["JitterFrames"] = jitterPopup.selectedItem.flatMap { Int($0.title) }
+            ?? ConfigStore.defaultJitterFrames
         next["NetLatency"] = netLatency
         next["NetRing"] = netRing
         next["NetRtNapi"] = rtNapi
@@ -419,7 +423,7 @@ final class SettingsWindowController: NSWindowController {
             try ConfigStore.write(next)
             values = next
             loadError = nil
-            showStatus("Applied. launchd is restarting JackBridge.")
+            showStatus("Saved. These settings take effect the next time JackBridge starts.")
         } catch {
             showStatus("Configuration write error: \(error.localizedDescription)", error: true)
         }
@@ -441,7 +445,10 @@ private enum ConfigStore {
         // half (e.g. a co-branded build) without touching code.
         "DeviceName": "pi-Stomp",
         "Workgroup": defaultWorkgroup,
-        "JitterFrames": 0,
+        // Must equal JB_JITTER_FRAMES in jackbridge/shared/JackBridge.h. write()
+        // fills every absent key from this table, so a disagreement here silently
+        // retunes the engine on any Save the user makes for an unrelated key.
+        "JitterFrames": 128,
         // Pi tuning. Defaults are the pi's present behaviour, so adopting them
         // changes no timing; "" means "leave that setting alone on the pi",
         // which is not the same as a default. Mirrors PI_CONFIG_KEYS in
@@ -505,6 +512,7 @@ private enum ConfigStore {
     ]
     static let defaultWorkgroup = "backend"
     static let jitterChoices = [0, 64, 128, 256, 512, 1024]
+    static let defaultJitterFrames = 128
 
     private static let forbidden = ["SampleRate", "PeriodFrames", "JackPrefix",
                                     "RealtimePriority", "NetJack", "AutoConnect", "Logging"]

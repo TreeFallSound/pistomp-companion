@@ -55,7 +55,7 @@ protected:
 
     int nAudioIn, nAudioOut, nMidiIn, nMidiOut;
     int SampleRate;
-    jack_nframes_t BufSize;
+    jack_nframes_t JackPeriodFrames;
     bool is_master;
 
     virtual int process_callback(jack_nframes_t nframes);

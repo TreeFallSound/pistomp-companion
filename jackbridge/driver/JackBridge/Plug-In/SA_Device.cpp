@@ -1762,10 +1762,23 @@ void	SA_Device::BeginIOOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSiz
 	                            std::memory_order_relaxed);
 	shmHalAnchorSampleTime->store((UInt64)inIOCycleInfo.mCurrentTime.mSampleTime,
 	                              std::memory_order_relaxed);
-	shmHalInputReadHead->store((UInt64)inIOCycleInfo.mInputTime.mSampleTime,
-	                           std::memory_order_relaxed);
-	shmHalOutputWriteHead->store((UInt64)inIOCycleInfo.mOutputTime.mSampleTime,
-	                             std::memory_order_relaxed);
+	// Each op carries exactly one valid direction: on a WriteMix cycle
+	// mInputTime.mSampleTime is 0, and on a ReadInput cycle mOutputTime's is.
+	// Publishing both unconditionally lets whichever op ran last clobber the
+	// other direction's head with that zero. A playback-only client (no armed
+	// input track) issues nothing but WriteMix, so the input head sat at 0
+	// permanently — which the daemon reads as a HAL that stopped consuming,
+	// and its divergence check then reads as a timeline hours out of anchor.
+	// Publish only the head whose timestamp this op actually carries; the
+	// other keeps its last real value. The early return above guarantees the
+	// op is one of these two.
+	if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
+		shmHalInputReadHead->store((UInt64)inIOCycleInfo.mInputTime.mSampleTime,
+		                           std::memory_order_relaxed);
+	} else {
+		shmHalOutputWriteHead->store((UInt64)inIOCycleInfo.mOutputTime.mSampleTime,
+		                             std::memory_order_relaxed);
+	}
 	shmHalNFrames->store(inIOBufferFrameSize, std::memory_order_relaxed);
 	shmHalSampleRate->store(mSampleRateShadow, std::memory_order_relaxed);
 	shmHalAnchorSeq->store(seq + 1, std::memory_order_release);

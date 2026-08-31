@@ -166,6 +166,63 @@ these.
 
 ---
 
+## What the model does not cover: the mod-host graph
+
+Verified on the live pi, 2026-08-30. Full investigation: `docs/mod-latency.md`.
+
+**The model covers the transport path only.** Every term above describes the
+path from the pi codec to the Mac HAL. None of them describes `mod-host`. The
+plugin graph adds delay, and no term in `jb_one_way_latency_frames()` accounts
+for it.
+
+**The four inputs are not homogeneous.** This is why the omission matters.
+
+| Mac input | JACK port | Signal | Passes mod-host |
+|-----------|-----------|--------|-----------------|
+| In1 / In2 | `netadapter:playback_1` / `_2` | dry | no |
+| In3 / In4 | `netadapter:playback_3` / `_4` (ModOut1 / ModOut2) | wet | yes |
+
+One advertised figure describes both pairs. It is correct for the dry pair and
+too small for the wet pair.
+
+**JACK reports the wet pair as faster than the dry pair.** Read with
+`JACK_PROMISCUOUS_SERVER=jack jack_lsp -l` on the pi — jackd runs as the user
+`jack`, so a plain `jack_lsp` from an ssh login cannot reach the server:
+
+    system:capture_1          capture latency = [ 64 64 ]   dry, hardware ADC
+    netadapter:playback_1     capture latency = [ 64 64 ]   dry pair
+    netadapter:playback_3     capture latency = [  0  0 ]   wet pair
+
+The wet path is the dry path plus the plugin graph, so its latency cannot be
+lower. `mod-host` implements no JACK latency callback, so nothing propagates
+through it and the ports report zero.
+
+**The number is not obtainable today.** `/usr/bin/mod-host` contains no
+occurrence of the string `latency`, in any case. It has no protocol command for
+it. mod-ui 0.99.8 serves no latency route. Only 19 of the 526 LV2 bundles on
+the pi declare `lv2:reportsLatency`, so summing the plugins gives a lower bound
+and not an answer.
+
+**Per-stream advertisement would not reach the DAW either.** CoreAudio has
+`kAudioStreamPropertyLatency` per stream, beside `kAudioDevicePropertyLatency`
+per device, and the two input pairs are two separate streams. The driver
+returns a hardcoded 0 for the stream property today
+(`jackbridge/driver/JackBridge/Plug-In/SA_Device.cpp:1310`). Implementing it
+does not help: JUCE reads stream 0 only, and Ardour collects the per-stream
+values and then discards them. Both claims come from upstream source; see
+`docs/mod-latency.md` for the citations.
+
+**What to do about it.** Treat the advertised figure as the dry-pair number.
+Do not trust it for In3 / In4.
+
+The audible consequence is a phase error, not a delay a user can hear on its
+own. A user who mixes In1 / In2 against In3 / In4 in the DAW is summing two
+copies of one signal at different delays, and the DAW aligns both by the same
+advertised figure. Delay compensation therefore corrects neither pair
+relatively. Comb filtering is the result.
+
+---
+
 ## Tunables — what to change and where
 
 Ordered roughly by latency impact (biggest first), with the latency
@@ -232,11 +289,19 @@ tolerance:
 
 ### J (JitterFrames) — now load-bearing
 
-J = **320 frames** as of 2026-08-30. The daemon writes at
-`(halInputReadHead + J + delta) % ring_frames` and reads at
-`(halOutputWriteHead − J) % ring_frames`, with `delta` tracking the
+J = **128 frames** as of 2026-08-30 (`JB_JITTER_FRAMES`, lowered from 320 the
+same day). It is user-set in `config.plist`, so read the live value from
+`just shm` rather than assuming the default. The daemon writes at
+`(halInputReadHead + block + J + delta) % ring_frames` and reads at
+`(halOutputWriteHead − block − J) % ring_frames`, with `delta` tracking the
 daemon's open-loop advance since the HAL's read head last moved. This
 absorbs HAL stalls without overwriting the ring.
+
+`block` is `max(HAL buffer size, JACK period)`, and it is separate from J on
+purpose. Both heads are published *before* the HAL copies that cycle's block,
+so a head of H means the HAL is about to touch `[H, H+block)`. The block term
+is the mandatory clearance; J is cushion on top of it. J therefore means
+cushion and nothing else.
 
 J is reported via `kAudioDevicePropertySafetyOffset`. The DAW adds it on
 top of the one-way latency from `kAudioDevicePropertyLatency`, so it must
@@ -250,7 +315,31 @@ stable session with `daemonXruns=0` in quiet windows is needed to measure
 true correlation. If stalls are uncorrelated, J can shrink to
 `maxBurst − stall_cycles×P`; if correlated, J must equal `maxBurst`.
 At J=320 (5×P) the 472-frame burst produces a 152-frame starvation in the
-fully-correlated case. **Open risk — needs measurement.**
+fully-correlated case. At the current J=128 (2×P) the same burst produces a
+344-frame starvation, so lowering J widened this risk rather than closing it.
+**Open risk — needs measurement.**
+
+**J=0 used to be the worst setting. It is now the tightest correct one.**
+The upstream read position is a free-running cursor whose target is
+`(halOutputWriteHead − block − J) % ring_frames`. The HAL has written up to
+the write head, exclusive, so the newest *complete block* is `[W−block, W)`.
+The read is a block, not a slot, so the whole block has to land in written
+data. The `block` term places it there, and J trails further back from it.
+The cursor free-runs between corrections, so J is also the forward slack of
+the resync window: past it, the read would touch the live block and the
+cursor snaps back.
+
+Before the block term existed the read was `(W − J)`, and J paid for the
+alignment before it bought any cushion. J=0 then read `[W, W+block)` — frames
+the HAL had not written on this lap — so the data was a full ring old: 4096
+frames, 85 ms, in each direction. A J between 1 and one block tore, part fresh
+and part stale. The earlier claim here that "J=1 reads the newest sample" was
+per-slot reasoning, and it does not hold for a block-sized read.
+`send_offset()` had the same form and paid the same lap.
+
+None of that appears in the advertised figure. The model excludes J on purpose,
+and `SafetyOffset` reports 0 when J is 0, so the DAW compensates for nothing
+while the real delay is at its largest. Keep J ≥ 1.
 
 ### Q is free latency-wise but not CPU-wise
 
@@ -303,7 +392,7 @@ Reference values from the model (L=2, G=1024, J=0 for simplicity), for orientati
 
 - T_alsa, T_pj, T_mj, T_nm are from the JACK / ALSA buffer math (frames ÷ sample rate).
 - T_g midpoint behavior is documented in jack2's `JackAudioAdapter::PushAndPull` — the controller targets midpoint via the resampler ratio.
-- T_jf (JitterFrames) is now J=320, enforced as a write lead in `RingProjector::send_offset` and a read trail in `recv_offset`. See `docs/investigation-bug1.md` for the original bug and `jackbridge/daemon/RingProjector.hpp` for the implementation.
+- T_jf (JitterFrames) defaults to J=128 (`JB_JITTER_FRAMES`, changed from 320 on 2026-08-30), enforced as a write lead in `RingProjector::send_offset` and a read trail in `recv_offset`. It is user-set in `config.plist`, so read the live value from `just shm` rather than assuming the default. `J = 0` now means the tightest correct alignment and costs nothing beyond the mandatory block clearance; before the block term was separated out it cost a full ring (4096 frames, 85 ms) in each direction, invisible to both the advertised figure and SafetyOffset. Subtract accordingly when reading a measurement taken before that fix. See `docs/investigation-bug1.md` for the original bug and `jackbridge/daemon/RingProjector.hpp` for the implementation.
 - The model itself lives in `jb_one_way_latency_frames()` in `jackbridge/shared/JackBridge.h`, alongside the constants it uses (`JB_ALSA_PERIODS_PI`, `JB_NET_LATENCY_CYCLES`, `JB_NETADAPTER_RING_FRAMES`, `JB_WIRE_TRANSIT_MICROS`, `JB_JITTER_FRAMES`). L and G no longer have to be kept in step by hand: the four-argument form takes the pair the daemon published from `config.plist` (`NetLatency`, `NetRing`), and the HAL uses that. `JB_NET_LATENCY_CYCLES` / `JB_NETADAPTER_RING_FRAMES` are the fallback for a region no daemon has attached to yet — keep them equal to the `config.plist` defaults. The other constants are still hand-maintained: change a Pi-side knob they describe and you must change them, or the advertised figure drifts from reality. `just shm` prints the published pair and the resulting one-way figure.
 - Network latency default (`-l 2`, max 30) verified on the live pi by loading netadapter under a probe client name and reading the `Network latency : N cycles` line from `journalctl -u jack` (jack2 1.9.22 on Arch).
 - T_adc / T_dac are codec group-delay values from the IQaudIO datasheet (low ms).

@@ -4,6 +4,14 @@
 # as the service's long-running foreground process.
 set -euo pipefail
 
+# Everything this script prints goes to stderr, which systemd routes to the
+# unit's journal. The start path used to run almost silently: it chose an
+# interface, clamped the tuning pair, loaded netadapter and made six
+# connections, and reported none of it. A start that produced no audio was
+# therefore indistinguishable from a start that worked, and the only evidence
+# left was the graph an hour later. Log the decisions, not the steps.
+log() { echo "jackbridge-pi-up: $*" >&2; }
+
 XRUN_FILE=/tmp/pi-stomp-jackbridge.xruns
 LINK_FILE=/tmp/pi-stomp-jackbridge.link
 WATCHER=/usr/local/libexec/jackbridge/jackbridge-xrun-watcher
@@ -46,23 +54,40 @@ flock 9
 STATE=/run/jackbridge.iface
 if [ -r "$STATE" ]; then
     IFACE=$(cat "$STATE")
+    IFACE_SRC="$STATE"
 elif [ -n "${JACKBRIDGE_IFACE:-}" ]; then
     IFACE="$JACKBRIDGE_IFACE"
+    IFACE_SRC="JACKBRIDGE_IFACE"
 else
     IFACE=eth0
+    IFACE_SRC="fallback (jackbridge-pin-route did not write $STATE)"
 fi
+# Name the source, not only the interface. The three sources fail in different
+# ways, and the fallback means an ExecStartPre did not do its job.
+log "iface $IFACE (from $IFACE_SRC)"
 export JACK_NETJACK_MULTICAST_IF="${JACK_NETJACK_MULTICAST_IF:-$IFACE}"
+log "JACK_NETJACK_MULTICAST_IF=$JACK_NETJACK_MULTICAST_IF"
 
 # Unload any stale netadapter instances left from a previous run. The
 # ExecStop= handler (jackbridge-pi-down) is best-effort — if it failed
 # silently, the next jack_load would get a -01 suffix and the wiring
 # below would silently no-op, breaking the link. Clean up here so load
 # always starts fresh.
+stale=0
 while read -r client; do
     [ -n "$client" ] || continue
-    jack_unload "$client" 2>/dev/null || true
+    stale=$(( stale + 1 ))
+    # A stale client here is the duplicate-netadapter fault. It is worth a line
+    # each time, because two of them multiply the audio-thread load and the
+    # symptom (mass xruns) looks nothing like the cause.
+    if jack_unload "$client" 2>/dev/null; then
+        log "unloaded stale netadapter client '$client'"
+    else
+        log "WARNING could not unload stale netadapter client '$client'"
+    fi
 done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/null | \
          awk '/^netadapter(-[0-9]+)?:/ { sub(/:.*/, ""); print }' | sort -u)
+[ "$stale" -eq 0 ] && log "no stale netadapter clients" || true
 
 # (The old "sleep 3" here — waiting for the Mac's netmanager to reap the
 # stale master before re-announcing — was removed with the fork's fix 3
@@ -86,11 +111,22 @@ done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/
 # default below is the same number config.plist ships, so a pi with no
 # environment file runs the pair the Mac would have asked for. Do not hand-edit
 # that file — the next start overwrites it.
-NET_LATENCY="${JACKBRIDGE_NET_LATENCY:-4}"
+# Report every rewrite of a requested value. The Mac is the source of truth
+# for this pair, so a value the pi quietly replaces is a value the operator
+# set on one machine and cannot observe on either. That is worse than a value
+# the pi refuses.
+NET_LATENCY_REQ="${JACKBRIDGE_NET_LATENCY:-}"
+NET_LATENCY="${NET_LATENCY_REQ:-4}"
 case "$NET_LATENCY" in
-    ''|*[!0-9]*|0) NET_LATENCY=4 ;;
+    ''|*[!0-9]*|0)
+        log "WARNING NetLatency '$NET_LATENCY' is not a positive integer; using 4"
+        NET_LATENCY=4 ;;
 esac
-[ "$NET_LATENCY" -le 30 ] || NET_LATENCY=30
+if [ "$NET_LATENCY" -gt 30 ]; then
+    log "WARNING NetLatency $NET_LATENCY exceeds the maximum; clamped to 30"
+    NET_LATENCY=30
+fi
+[ -n "$NET_LATENCY_REQ" ] || log "NetLatency unset in /etc/default/jackbridge; using default 4"
 
 # -g sizes the slip ring. It is NOT independent of -l: the resampler drives
 # ring occupancy toward the midpoint (g/2), and -l demands NET_LATENCY * period
@@ -107,28 +143,61 @@ esac
 # from the published pair. JB_NET_LATENCY_CYCLES / JB_NETADAPTER_RING_FRAMES in
 # pistomp-companion shared/JackBridge.h are fallbacks for a region no daemon
 # has attached to yet, and should equal the config.plist defaults.
-NET_RING="${JACKBRIDGE_NET_RING:-1024}"
+NET_RING_REQ="${JACKBRIDGE_NET_RING:-}"
+NET_RING="${NET_RING_REQ:-1024}"
 case "$NET_RING" in
-    ''|*[!0-9]*|0) NET_RING=1024 ;;
+    ''|*[!0-9]*|0)
+        log "WARNING NetRing '$NET_RING' is not a positive integer; using 1024"
+        NET_RING=1024 ;;
 esac
+[ -n "$NET_RING_REQ" ] || log "NetRing unset in /etc/default/jackbridge; using default 1024"
 
 PERIOD=$(jack_bufsize 2>/dev/null | tr -cd '0-9') || PERIOD=""
 if [ -n "$PERIOD" ] && [ "$PERIOD" -gt 0 ] 2>/dev/null; then
     need=$(( NET_LATENCY * PERIOD ))
     if [ "$(( NET_RING / 2 ))" -le "$need" ]; then
-        echo "jackbridge-pi-up: WARNING -g $NET_RING (midpoint $(( NET_RING / 2 ))) cannot hold" \
-             "-l $NET_LATENCY at period $PERIOD (needs > $need frames); expect pi-side xruns" >&2
+        log "WARNING -g $NET_RING (midpoint $(( NET_RING / 2 ))) cannot hold" \
+            "-l $NET_LATENCY at period $PERIOD (needs > $need frames); expect pi-side xruns"
+    else
+        log "tuning -l $NET_LATENCY -g $NET_RING at period $PERIOD:" \
+            "midpoint $(( NET_RING / 2 )) holds the required $need frames"
     fi
+else
+    # The check is the only guard on a pair that overruns. Silence here used to
+    # read as a pair that passed.
+    log "WARNING jack_bufsize gave no period; skipped the -l/-g coupling check"
 fi
 
-jack_load netadapter -i "-C 2 -P 4 -q 0 -g $NET_RING -l $NET_LATENCY"
+NETADAPTER_ARGS="-C 2 -P 4 -q 0 -g $NET_RING -l $NET_LATENCY"
+log "jack_load netadapter -i \"$NETADAPTER_ARGS\""
+jack_load netadapter -i "$NETADAPTER_ARGS"
 
 # Beat for port registration to settle before we connect.
 sleep 0.5
 
+# Every connection used to end in `|| true`, so a pair that failed to wire
+# left no trace at all. That is precisely the "6 of 6 ports, link up, and
+# silence" shape: the ports exist because netadapter registered them, and
+# nothing recorded that the graph edge was never made. Report each result.
+connect() {
+    local out
+    # The assignment must sit in the `if` condition. Under `set -e` a bare
+    # `out=$(failing command)` aborts the whole start script, which would turn
+    # one unwired pair into no audio at all.
+    if out=$(jack_connect "$1" "$2" 2>&1); then
+        log "wired $1 -> $2"
+    else
+        # jack_connect also fails on an edge that already exists, which is a
+        # normal outcome after a partial restart. Keep its own text so the two
+        # cases stay distinguishable in the journal.
+        log "WARNING could not wire $1 -> $2: ${out:-jack_connect failed}"
+    fi
+    return 0
+}
+
 # 1/2: raw hardware capture → first stereo pair on the Mac (In1/In2).
-jack_connect system:capture_1 netadapter:playback_1 || true
-jack_connect system:capture_2 netadapter:playback_2 || true
+connect system:capture_1 netadapter:playback_1
+connect system:capture_2 netadapter:playback_2
 
 # 3/4: post-mod-host wet feed → second stereo pair (ModOut1/ModOut2). Port
 # naming varies across mod-host configurations; first-match wins. The grep
@@ -141,17 +210,30 @@ wire_wet() {
     sources=$(jack_lsp -p 2>/dev/null | awk '/^[^ \t]/{p=$0} /properties:.*output/{print p}')
     for src in "$@"; do
         if grep -qxF "$src" <<< "$sources"; then
-            jack_connect "$src" "$dst" || true
+            connect "$src" "$dst"
             return
         fi
     done
-    echo "jackbridge-pi-up: no mod-host wet source found for $dst" >&2
+    # Name the candidates that were tried. Port naming varies across mod-host
+    # configurations, so the useful fact is which names this build looked for.
+    log "WARNING no mod-host wet source found for $dst (tried: $*)"
 }
 wire_wet netadapter:playback_3 mod-monitor:out_1 mod-host:monitor-out_1
 wire_wet netadapter:playback_4 mod-monitor:out_2 mod-host:monitor-out_2
 
-jack_connect netadapter:capture_1 system:playback_1 || true
-jack_connect netadapter:capture_2 system:playback_2 || true
+connect netadapter:capture_1 system:playback_1
+connect netadapter:capture_2 system:playback_2
+
+# One summary line to close the start path. `ports_wired` in
+# jackbridge-pi-status counts this same thing, but only while the service is
+# up; the journal keeps the count from every start, including the starts that
+# have already failed and been restarted.
+# `|| wired="?"` because pipefail makes a failing jack_lsp fail the whole
+# assignment, and a summary line must never be the thing that fails the start.
+wired=$(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -c 2>/dev/null | \
+        awk '/^[^ \t]/ { na = ($0 ~ /^netadapter(-[0-9]+)?:/); next }
+             /^[ \t]+[^ \t]/ && na { n++ } END { print n + 0 }') || wired="?"
+log "start complete: $wired of 6 netadapter ports wired, handing off to the watcher"
 
 # Do not hold the start/stop lock while the watcher runs. systemd executes
 # ExecStop before terminating this main process; keeping fd 9 locked through

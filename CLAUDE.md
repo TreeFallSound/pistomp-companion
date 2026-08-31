@@ -110,6 +110,7 @@ just run-app         # build the app and open the build-tree copy
 just device-name  # the CoreAudio device entry (name, channels, transport)
 just status       # LaunchAgent health
 just shm          # the shm control fields, raw (read-only, safe while live)
+just watch        # shm + the pi's status, polled side by side (tuning loop)
 just logs         # os_log stream, subsystem com.treefallsound.companion
 just rmshm        # unlink-shm + restart (after a protocol bump)
 ```
@@ -128,6 +129,31 @@ window — and the netadapter pair with the one-way latency it produces. Check
 the two health fields before and after any measurement: a diverged timeline
 reports `STARTED`, no fault, a live heartbeat and 6 of 6 ports while the audio
 is noise, and it silently voids whatever you were measuring.
+
+`just watch` is `shm` on a timer with `jackbridge-ctl pi-status` beside it, and
+it is the one to run while tuning `NetLatency`/`NetRing`. Both panes are needed
+because the coupled failure is one-sided: a pair whose cushion overruns
+(`NET_RING / 2` must exceed `NET_LATENCY * period`) xruns the *pi* while every
+Mac-side field stays perfect, which reads as "the change did nothing" rather
+than as a new fault. Read `netLatencyCycles`, `netRingFrames` and
+`oneWayLatency` in the top pane against `xruns_1m` in the bottom one.
+
+The pi is polled in a background job and its pane is stamped with the age of
+the reading, because an unreachable pi costs ssh ~15 s to give up —
+`ConnectTimeout` is per address and `pistomp.local` resolves to several — and
+the Mac fields move at audio rate. A stale pi pane is a reading; a frozen Mac
+pane is a broken tool.
+
+`just logs` is the wrong instrument for this. It reports *transitions* —
+attach, re-anchor, fault — and never the current value of anything, so a stack
+that is quietly diverged looks identical to one that is holding.
+
+This section says which command to run. **`docs/DEBUGGING.md` says how to read
+what it prints** — every `just shm` field with its healthy value, the cadence
+counters, the arithmetic that turns a counter delta into a duty cycle, and a
+symptom index. Read it before you interpret a number, and especially before
+you report one: the cadence counters are monotonic totals, so a raw value is
+meaningless without a window and without the N/P ratio beside it.
 
 ### What the loops do *not* cover
 
@@ -419,6 +445,40 @@ The menu-bar "Network Diagnostics…" collects probes into
 `~/Library/Logs/JackBridge/`. Run it when the pi does not connect, and attach
 the log to bug reports.
 
+### The pi side
+
+The pi's helpers have no `os_log`. They write to stderr, and systemd routes
+stderr to the unit's journal. The unit is a system unit, so its journal needs
+`sudo`:
+
+```sh
+ssh pistomp@pistomp.local 'sudo journalctl -u pi-stomp-jackbridge.service -n 200'
+ssh pistomp@pistomp.local 'sudo journalctl -u pi-stomp-jackbridge.service -f'
+```
+
+Every helper prefixes its own name: `jackbridge-pi-up:`, `jackbridge-pi-down:`,
+`jackbridge-napi-rt:`, `jackbridge-unpin-route:`, `jackbridge-xrun-watcher:`.
+Grep the prefix to isolate one stage. Keep this format when you add a line.
+
+`jackbridge-pi-up` logs the decisions of the start path, not its steps: the
+interface and the source that chose it, each stale netadapter client it
+unloads, the resolved `-l`/`-g` pair, the exact `jack_load` arguments, and the
+result of all six connections. Two of those lines matter more than the rest:
+
+- **A clamp warning.** The pi rewrites a `NetLatency` or `NetRing` value that
+  is not a positive integer, and it caps `NetLatency` at 30. The Mac owns the
+  pair, so a silent rewrite is a value the operator sets on one machine and
+  can observe on neither. Every rewrite now says so.
+- **A wiring warning.** Each `jack_connect` reports its result. A failed edge
+  is invisible in `ports_wired`, because netadapter registers the ports
+  whether or not anything connects to them — so the old silent `|| true` gave
+  exactly the "6 of 6 ports, link up, and silence" shape with no evidence.
+
+`jackbridge-xrun-watcher` logs a one-line summary for each minute that carried
+xruns, and one line per netadapter link restart. It never logs per event: a
+previous version wrote per xrun, pegged a core, starved jackd, and amplified
+the rate it was measuring. Keep that rule when you add to it.
+
 ---
 
 ## 6. Platform constraints
@@ -444,6 +504,7 @@ Read these when you touch the matching area, not before:
 
 | Topic | File |
 |-------|------|
+| Reading the diagnostics, field by field | `docs/DEBUGGING.md` |
 | Architecture and clock domains | `docs/architecture.md` |
 | Latency math and tunables | `docs/LATENCY-MODEL.md` |
 | Jitter and crackle | `docs/JITTER.md` |
@@ -455,3 +516,4 @@ Read these when you touch the matching area, not before:
 | Shipping a release | `docs/releases.md` |
 | Walkthrough of the source tree | `docs/codebase-tour.md` |
 | Mac-authoritative tuning (plan) | `docs/plan-tuning.md` |
+| Free-running read cursor (plan) | `docs/plan-free-running-cursor.md` |
