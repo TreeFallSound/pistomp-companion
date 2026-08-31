@@ -66,6 +66,27 @@
 #include <mach/mach_time.h>
 #include <cstdlib>
 
+//	kAudioDevicePropertyBufferFrameSize / ...Range are declared in the client
+//	side of the HAL API, not in AudioHardwareBase.h which AudioServerPlugIn.h
+//	pulls in — an AudioServerPlugIn is still expected to answer them, but the
+//	selectors are not in the driver-side header. Including the client header
+//	only adds declarations; nothing here calls a HAL function, so it adds no
+//	link dependency.
+#include <CoreAudio/AudioHardware.h>
+
+//	IO buffer size bounds, in frames (kAudioDevicePropertyBufferFrameSizeRange).
+//
+//	The maximum is half the shm ring (STRBUFNUM/2 frames): the daemon writes
+//	JitterFrames ahead of the HAL read head inside that same ring, so a cycle
+//	that consumed more than half of it would read across the write head.
+//	The default matches the JACK period the pi runs, so a host that never asks
+//	gets the size the link is actually built around instead of CoreAudio's
+//	generic 128 — _HW_Open narrows it to the daemon's published period when
+//	there is one.
+static constexpr UInt32 kMinIOBufferFrames     = 32;
+static constexpr UInt32 kMaxIOBufferFrames     = (STRBUFNUM / 2) / 2;
+static constexpr UInt32 kDefaultIOBufferFrames = JB_REFERENCE_PERIOD_FRAMES;
+
 //==================================================================================================
 //	SA_Device
 //==================================================================================================
@@ -80,6 +101,7 @@ SA_Device::SA_Device(AudioObjectID inObjectID, UInt32 instance)
 	mStartCount(0),
 	mSampleRateShadow(48000),
 	mRingBufferFrameSize(0),
+	mIOBufferFrameSize(kDefaultIOBufferFrames),
 	mDriverStatus(JB_DRV_STATUS_INIT),
 	mDaemonLive(true),
 	mLastDaemonAlive(0),
@@ -330,6 +352,11 @@ bool	SA_Device::Device_HasProperty(AudioObjectID inObjectID, pid_t inClientPID, 
 		case kAudioDevicePropertyIsHidden:
 		case kAudioDevicePropertyZeroTimeStampPeriod:
 		case kAudioDevicePropertyStreams:
+		//	The IO buffer size, and the range a host may ask for. Answering
+		//	these is what lets a host pick 64 frames; without them CoreAudio
+		//	imposes its generic 128-frame default on everyone.
+		case kAudioDevicePropertyBufferFrameSize:
+		case kAudioDevicePropertyBufferFrameSizeRange:
 			theAnswer = true;
 			break;
 
@@ -387,10 +414,12 @@ bool	SA_Device::Device_IsPropertySettable(AudioObjectID inObjectID, pid_t inClie
 		case kAudioDevicePropertyPreferredChannelsForStereo:
 		case kAudioDevicePropertyPreferredChannelLayout:
 		case kAudioDevicePropertyZeroTimeStampPeriod:
+		case kAudioDevicePropertyBufferFrameSizeRange:
 			theAnswer = false;
 			break;
 
 		case kAudioDevicePropertyNominalSampleRate:
+		case kAudioDevicePropertyBufferFrameSize:
 			theAnswer = true;
 			break;
 
@@ -498,6 +527,14 @@ UInt32	SA_Device::Device_GetPropertyDataSize(AudioObjectID inObjectID, pid_t inC
 
 		case kAudioDevicePropertySafetyOffset:
 			theAnswer = sizeof(UInt32);
+			break;
+
+		case kAudioDevicePropertyBufferFrameSize:
+			theAnswer = sizeof(UInt32);
+			break;
+
+		case kAudioDevicePropertyBufferFrameSizeRange:
+			theAnswer = sizeof(AudioValueRange);
 			break;
 
 		case kAudioDevicePropertyNominalSampleRate:
@@ -963,6 +1000,25 @@ void	SA_Device::Device_GetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 			outDataSize = sizeof(UInt32);
 			break;
 
+		case kAudioDevicePropertyBufferFrameSize:
+			//	The IO buffer size in frames. Handing this back is half of what
+			//	lets a host run at 64; the other half is the range below.
+			ThrowIf(inDataSize < sizeof(UInt32), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioDevicePropertyBufferFrameSize for the device");
+			*reinterpret_cast<UInt32*>(outData) = mIOBufferFrameSize;
+			outDataSize = sizeof(UInt32);
+			break;
+
+		case kAudioDevicePropertyBufferFrameSizeRange:
+			//	What a host is allowed to ask for. The upper bound is half the
+			//	shm ring: the daemon writes JitterFrames ahead of the HAL read
+			//	head inside that same ring, so a cycle that consumed more than
+			//	half of it would read across the write head.
+			ThrowIf(inDataSize < sizeof(AudioValueRange), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_GetPropertyData: not enough space for the return value of kAudioDevicePropertyBufferFrameSizeRange for the device");
+			reinterpret_cast<AudioValueRange*>(outData)->mMinimum = kMinIOBufferFrames;
+			reinterpret_cast<AudioValueRange*>(outData)->mMaximum = kMaxIOBufferFrames;
+			outDataSize = sizeof(AudioValueRange);
+			break;
+
 		case kAudioObjectPropertyElementName:
 			//	Device-scope channel labels. REAPER (and others) query here
 			//	with mElement = absolute 1-based channel index, not via Stream
@@ -1004,6 +1060,34 @@ void	SA_Device::Device_SetPropertyData(AudioObjectID inObjectID, pid_t inClientP
 
 	switch(inAddress.mSelector)
 	{
+		case kAudioDevicePropertyBufferFrameSize:
+			//	The host picking its IO buffer size. Clamp rather than throw on
+			//	an out-of-range ask: CoreAudio negotiates by trying values, and
+			//	a host that gets an error where it expected a smaller number
+			//	falls back to its own default, which is the 128 we are trying
+			//	to get away from. Nothing here reconfigures the ring — the HAL
+			//	IO proc copies inIOBufferFrameSize frames per cycle whatever
+			//	the size — so the store is the whole operation.
+			{
+				ThrowIf(inDataSize != sizeof(UInt32), CAException(kAudioHardwareBadPropertySizeError), "SA_Device::Device_SetPropertyData: wrong size for the data for kAudioDevicePropertyBufferFrameSize");
+				UInt32 requested = *reinterpret_cast<const UInt32*>(inData);
+				if (requested < kMinIOBufferFrames) requested = kMinIOBufferFrames;
+				if (requested > kMaxIOBufferFrames) requested = kMaxIOBufferFrames;
+				if (requested != mIOBufferFrameSize)
+				{
+					{
+						CAMutex::Locker theStateLocker(mStateMutex);
+						mIOBufferFrameSize = requested;
+					}
+					JB_LOG_INFO(jb_log_driver(), "bufferFrameSize -> %u frames (host asked %u)",
+						(unsigned)requested, (unsigned)*reinterpret_cast<const UInt32*>(inData));
+					AudioObjectPropertyAddress addr =
+						{ kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+					SA_PlugIn::Host_PropertiesChanged(GetObjectID(), 1, &addr);
+				}
+			}
+			break;
+
 		case kAudioDevicePropertyNominalSampleRate:
 			//	Changing the sample rate needs to be handled via the RequestConfigChange/PerformConfigChange machinery.
 			{
@@ -1880,8 +1964,14 @@ bool	SA_Device::_UpdateAdvertisedLatency()
 {
     const uint64_t period = shmJackPeriodFrames->load(std::memory_order_relaxed);
     const uint64_t rate   = shmJackSampleRate->load(std::memory_order_acquire);
+    // The netadapter pair the pi is running, published by the daemon from
+    // config.plist. Zero means no daemon has attached to this region yet, and
+    // jb_one_way_latency_frames falls back to the compile-time constants — a
+    // new driver against an old daemon still advertises a sensible number.
+    const uint64_t netL   = shmNetLatencyCycles->load(std::memory_order_relaxed);
+    const uint64_t netG   = shmNetRingFrames->load(std::memory_order_acquire);
     const bool     known  = jb_timing_is_plausible(period, rate);
-    const UInt32   oneWay = jb_one_way_latency_frames(period, rate);
+    const UInt32   oneWay = jb_one_way_latency_frames(period, rate, netL, netG);
 
     if (oneWay == mReportedLatencyInput && oneWay == mReportedLatencyOutput) {
         return false;
@@ -1889,8 +1979,9 @@ bool	SA_Device::_UpdateAdvertisedLatency()
 
     if (known) {
         JB_LOG_INFO(jb_log_driver(),
-            "latency: period=%llu f_s=%llu -> %u frames per scope (monitoring trip %u)",
+            "latency: period=%llu f_s=%llu L=%llu G=%llu -> %u frames per scope (monitoring trip %u)",
             (unsigned long long)period, (unsigned long long)rate,
+            (unsigned long long)netL, (unsigned long long)netG,
             (unsigned)oneWay, (unsigned)(2 * oneWay));
     } else {
         JB_LOG_INFO(jb_log_driver(),
@@ -1938,6 +2029,21 @@ void	SA_Device::_HW_Open()
     mDriverStatus.store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     shmDriverStatus->store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     mRingBufferFrameSize = STRBUFNUM / 2;
+
+    // Default IO buffer size. A host that never sets the property gets this
+    // one, so prefer the JACK period the daemon discovered from the pi over
+    // the reference 64 — matching the link's own period is what keeps a
+    // CoreAudio cycle from straddling two JACK cycles.
+    {
+        const uint64_t period = shmJackPeriodFrames->load(std::memory_order_acquire);
+        UInt32 dflt = (period >= kMinIOBufferFrames && period <= kMaxIOBufferFrames)
+                    ? (UInt32)period : kDefaultIOBufferFrames;
+        mIOBufferFrameSize = dflt;
+        JB_LOG_INFO(jb_log_driver(),
+            "bufferFrameSize default=%u frames (range %u..%u)",
+            (unsigned)mIOBufferFrameSize,
+            (unsigned)kMinIOBufferFrames, (unsigned)kMaxIOBufferFrames);
+    }
 
     // Advertised latency = the one-way leg for the Pi's discovered timing.
     // JitterFrames is surfaced separately via kAudioDevicePropertySafetyOffset

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Snapshot of the /JackBridge shm control region. Field offsets are the
-/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 8.
+/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 10.
 /// Every field is a plain aligned uint64_t (compile-time asserted on the
 /// C++ side), so a read of UInt64 at these offsets is exact.
 struct ShmSnapshot {
@@ -36,15 +36,29 @@ struct ShmSnapshot {
     /// Driver fault bitfield. Bit 0 (`JB_FAULT_DEVICE_NOT_ALIVE`) = the DAW is
     /// being fed bzero silence right now.
     var driverFault: UInt64 = 0
-    /// Echo of the app's last re-anchor nonce (Phase 4).
+    /// Echo of the app's last re-anchor nonce (Phase 4). The driver re-arms its
+    /// liveness state on a new nonce; the daemon re-anchors the timeline.
     var resyncRequest: UInt64 = 0
+    /// Protocol-10. The netadapter loop pair the pi is running, published by
+    /// the daemon from config.plist.
+    var netLatencyCycles: UInt64 = 0
+    var netRingFrames: UInt64 = 0
+    /// Protocol-10 timeline health, from the daemon's last ~5 s window. Both
+    /// were os_log-only before, which is how a stack could be hours out of
+    /// anchor while every field here read healthy. Nonzero in steady state
+    /// means the timeline is not holding.
+    var healthDeltaMax: UInt64 = 0
+    var healthSnaps: UInt64 = 0
+    /// Re-anchors since the daemon started. Advancing on its own means the
+    /// automatic divergence recovery is firing.
+    var reanchorCount: UInt64 = 0
 
     /// Hardcoded on purpose, and it must stay that way. The offsets below are
     /// hand-copied literals the compiler cannot check against
     /// shared/JackBridge.h, so this constant is the tripwire that forces
     /// someone to re-verify them on a layout change. Deriving it from the
     /// header would let the app recompile past a bump and read stale offsets.
-    static let expectedProtocolVersion: UInt64 = 9
+    static let expectedProtocolVersion: UInt64 = 10
     static let driverStatusStarted: UInt64 = 2
     /// Full complement of daemon slave ports (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS).
     static let slavePortsFull: UInt64 = 6
@@ -175,6 +189,11 @@ final class ShmReader {
         s.daemonXRuns         = field(0x1b8)
         s.driverFault         = field(0x1c0)
         s.resyncRequest       = field(0x1c8)
+        s.netLatencyCycles    = field(0x1d8)
+        s.netRingFrames       = field(0x1e0)
+        s.healthDeltaMax      = field(0x1e8)
+        s.healthSnaps         = field(0x1f0)
+        s.reanchorCount       = field(0x1f8)
         return s
     }
 }

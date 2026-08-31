@@ -184,6 +184,12 @@ private:
 	UInt64						mStartCount;
 	UInt64						mSampleRateShadow;
 	UInt32						mRingBufferFrameSize;
+	//	The IO buffer size the host asked for, in frames
+	//	(kAudioDevicePropertyBufferFrameSize). Until this device implemented the
+	//	selector, CoreAudio handed every host its generic 128-frame default and
+	//	no host could ask for 64 — which is the single largest term in the
+	//	Mac-side xrun rate (docs/plan-tuning.md 2.8).
+	UInt32						mIOBufferFrameSize;
 	//	Read on the IO thread (GetZeroTimeStamp reconciles shmDriverStatus
 	//	against it), written on the control threads by _HW_Open / _HW_StartIO /
 	//	_HW_StopIO / _HW_Close. Atomic so that read is not a data race.

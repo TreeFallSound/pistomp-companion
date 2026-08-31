@@ -38,15 +38,33 @@ is in no repository, so a reimage still removes it.
 ### 2.2 The Mac advertises a wrong latency
 
 `JB_NET_LATENCY_CYCLES` is 2 in `jackbridge/shared/JackBridge.h:227`. The pi
-runs 4. The two extra cycles are 128 frames, which is 2.67 ms at 48 kHz.
+runs 4. The constants and the machine disagree.
 
-    one_way = 1 + 512 + 17 + (JB_ALSA_PERIODS_PI + L + 3) * 64
+    one_way = JB_CODEC_GROUP_DELAY_FRAMES
+            + (JB_ALSA_PERIODS_PI + L + 3) * period
+            + G / 2
+            + wire
 
-    L = 2   ->   978 frames     (what the DAW is told)
-    L = 4   ->  1106 frames     (what the link actually costs)
+    at period 64, 48 kHz, wire = 17:
 
-The DAW (Digital Audio Workstation) aligns each recorded leg with a 128 frame
-error. This is a present, user-visible fault, not a future one.
+    source tree        L=2  G=1024   ->   978 frames
+    installed binary   L=2  G= 512   ->   722 frames
+    the truth          L=4  G=1024   ->  1106 frames
+
+The DAW (Digital Audio Workstation) is told 722 and the link costs 1106. The
+error is **384 frames, which is 8.0 ms per leg**, and the monitoring trip
+carries it twice.
+
+The installed binary is worse than the source tree, because it is stale. It
+was built when `JB_NETADAPTER_RING_FRAMES` was 512, and the header now holds
+1024. The daemon confirms this at startup:
+
+    latency model: period=64 f_s=48000 -> one-way=722 frames
+
+**Rebuild the engine before any measurement.** The running daemon also emits a
+health line whose format does not match `JackBridge.cpp:884` in the tree, so
+the installed engine and this repository are not the same code. Nothing in
+this plan can be trusted against a binary that the source does not describe.
 
 ### 2.3 None of the Mac-side ownership is built
 
@@ -128,13 +146,104 @@ This has a consequence for the order of work. You cannot settle the workgroup
 question while the largest term is unpinned and the shipped default disagrees
 with the only matched measurement. Paragraph 3.3 handles this.
 
+### 2.9 The timeline can diverge, and nothing brings it back
+
+Observed on 2026-08-30. The audio became noise while every status field looked
+healthy: `driverStatus` was `STARTED`, `driverFault` was 0, the heartbeat
+advanced, and `slavePortsConnected` was 6 of 6.
+
+The daemon health lines hold the fault. `deficit` is in frames.
+
+    old daemon
+    13:14:01  xruns=0  deficit=484136464  snaps=52
+    13:14:41  xruns=0  deficit=228045140  snaps=21
+    13:15:21  xruns=0  deficit=188862908  snaps=15
+    13:15:33  caught signal 15, shutting down
+
+    new daemon
+    13:15:40  JackBridge#0: re-anchored after HAL restart frame=0
+    13:15:50  xruns=0  deficit=0          snaps=0
+    13:16:25  xruns=4  deficit=0          snaps=0
+
+A deficit of 484136464 frames is about 2.8 hours of audio.
+
+Three facts explain why only a Mac restart corrected it.
+
+**The snap cannot correct a large divergence.** `kSnapThresholdFrames` is 512
+(`JackBridge.cpp:155`). The snap corrects small drift. At a deficit six orders
+of magnitude above the threshold it fired 52 times in one window and never
+converged. There is no path that stops snapping and re-anchors instead.
+
+**The pi cannot repair a Mac anchor.** `syncMode` is 1, so the daemon owns the
+timeline. A full restart of the pi jack stack was measured to change nothing:
+the ring kept slipping at 83.3 messages per second per channel, the same rate
+before and after. The pi was transporting audio correctly against a Mac
+timeline that was hours out.
+
+**The only re-anchor is process start.** The recovery is one log line, and it
+comes from a fresh daemon.
+
+`JB_OFF_RESYNC_REQUEST` is annotated "app to driver; reserved for automatic
+re-anchor" and its value is 0. The mechanism was reserved and never built.
+
+This is the same shape as the `driverStatus` trap in CLAUDE.md rule 6: Mac-side
+shared-memory state with no way back except a restart.
+
+**This blocks the whole plan, which is why paragraph 3.0 comes first.** Every
+window in this plan compares counters before and after a change. A timeline
+that can silently diverge, and that reports itself healthy while diverged, can
+invalidate any window without telling you. The 2026-08-30 session lost two
+round-trip measurements to exactly this.
+
 ## 3. The order of the work
 
-Six phases. Do them in this sequence. Measure after each phase, and write the
+Seven phases, numbered from 0. Do them in this sequence. Measure after each phase, and write the
 result in `docs/JITTER.md` before you start the next phase.
 
 Hold `-l 4` and `-g 1024` through phase 1 to phase 5. That pair is stable.
 Phase 6 is the only phase that changes it.
+
+### 3.0 Phase 0 — the timeline must recover by itself
+
+Paragraph 2.9 gives the fault. Do this before any measurement, because a
+diverged timeline reports itself healthy and silently voids a window.
+
+**Step 0.1 — rebuild and reinstall the engine.**
+
+The installed binary is not this source tree (paragraph 2.2). Run `just
+reload`. Confirm that the daemon's startup latency line matches the constants
+in the header before you go further.
+
+**Step 0.2 — make the divergence visible.**
+
+`deficit` and `snaps` appear only in an `os_log` line. `just shm` does not
+print them, and neither does the menu bar, so a stack can be hours out of
+anchor and still show green.
+
+Publish both to shared memory, in the protocol 10 change of paragraph 3.2, and
+print them in `jbdump`. A non-zero `snaps` count in steady state is the signal
+that the timeline is not holding.
+
+**Step 0.3 — bound the snap.**
+
+The snap corrects drift up to `kSnapThresholdFrames`. Give it an upper bound
+as well. When the deficit stays above a limit for several consecutive windows,
+stop snapping and re-anchor, in the way that a fresh daemon does at startup.
+
+The daemon already has the code: it runs `re-anchored after HAL restart` on
+each start. The work is to reach that path without a process restart.
+
+**Step 0.4 — use the field that exists, or delete it.**
+
+`JB_OFF_RESYNC_REQUEST` is reserved for exactly this and is unused. Either
+drive step 0.3 through it, so the app and the driver can also ask for a
+re-anchor, or remove the field and its comment. A reserved field that no code
+writes is a claim that the feature exists.
+
+**Acceptance.** Force a divergence: hold the pi's service down long enough for
+the anchor to drift, then bring it back. The stack returns to `deficit` near 0
+and `snaps` 0 with no restart of any Mac process. The DAW keeps the device,
+because nothing bounced.
 
 ### 3.1 Phase 1 — the Mac owns every pi parameter
 
@@ -481,6 +590,17 @@ Caution: confirm that the audio streams before each window. Run `just shm`.
 `driverStatus` must be `STARTED`, and `halOutputWriteHead` must increase. If
 the head does not increase, the window is not valid.
 
+Caution: confirm that the timeline holds, before **and** after each window.
+`deficit` must be near 0 and `snaps` must be 0 in the daemon health line. A
+diverged timeline reports `STARTED`, no fault, a live heartbeat and 6 of 6
+ports, and it makes the counters in this paragraph meaningless. Paragraph 2.9
+gives the case. Until step 0.2 is done, read them with:
+
+```sh
+/usr/bin/log show --last 2m --predicate 'subsystem == "com.treefallsound.companion"' \
+    --info | grep 'health xruns'
+```
+
 ### 4.2 The round trip time
 
 ```sh
@@ -508,6 +628,7 @@ Measure with mod-host under load. A quiet pi does not show the fault.
 - `vcgencmd get_throttled` gives `0x0` after one hour of audio.
 - The pi ALSA xruns stay at 0.
 - `/etc/default/jackbridge` is written only by `jackbridge-ctl`.
+- The timeline recovers from a forced divergence with no process restart.
 - A reimage of the pi costs no configuration.
 - A person hears no clicks in 10 minutes of playback with mod-host under load.
 
@@ -527,6 +648,64 @@ continue, so no Mac-side counter can replace a person listening.
 - We do not know the delay of the netJACK2 packets. Every measurement uses
   ICMP (Internet Control Message Protocol). The netadapter receives its
   packets on a realtime thread, and ICMP does not.
+- We do not know what made the timeline diverge on 2026-08-30. Paragraph 2.9
+  records the recovery, not the cause. The pi had a clock step of about 11
+  hours while jackd was running, which is a candidate and is not proof; a pi
+  jack restart afterwards did not clear the fault, so the divergence had
+  already been taken by the Mac daemon and held there.
 - We do not know the effect of the buffer size selectors in step 3.1, because
   they have never existed. The 5x figure in paragraph 2.8 is a comparison
   between two hosts' defaults, not a controlled test.
+
+## 7. Implementation status
+
+Updated 2026-08-30, after the first implementation pass. Everything below is
+either code that exists in the working tree or a measurement that does not.
+Nothing here is a measured result: no window in this plan has been run against
+the new code yet.
+
+### Built
+
+**Phase 0 — timeline recovery.** `reanchor()` in `jackbridge/daemon/JackBridge.cpp`
+is now the single re-anchor path, reached by three callers: the HAL-restart
+transition (as before), a new `JB_OFF_RESYNC_REQUEST` nonce (step 0.4 — the
+daemon reads the app's field alongside the driver, rather than the field being
+deleted), and the automatic divergence recovery (step 0.3: `deltaMax` past
+`kReanchorThresholdFrames` for `kReanchorWindows` consecutive windows stops
+snapping and re-anchors). `deltaMax`, `snaps` and a re-anchor count are
+published to shm and printed by `jbdump` (step 0.2).
+
+**Phase 1 — Mac owns every pi parameter.** All eleven variables in the 3.1
+table exist in `jackbridge/pi/bin/jackbridge-napi-rt` and `jackbridge-pi-up`,
+with the present behaviour as the default and empty meaning "leave alone".
+`push_pi_config` in `jackbridge/tools/jackbridge-ctl` writes
+`/etc/default/jackbridge` from `config.plist` before every `systemctl start`,
+in both `pi_service start` and `pi-start`. The Settings window has a **Pi
+tuning** section, and refuses a loop pair that violates
+`NetRing / 2 > NetLatency * period`. The `sudoers` question in step 1.3 is
+answered: `pistomp` has `(ALL) NOPASSWD: ALL`, so `sudo tee` works.
+
+**Phase 2 — the latency number.** Protocol 10. `NetLatency`/`NetRing` are
+published at `0x1d8`/`0x1e0`, `jb_one_way_latency_frames()` has a
+four-argument form, the daemon and the HAL both use the published pair, and
+`jbdump` prints the pair and the one-way figure it produces. The stale comment
+about `-l` being left unset is corrected. `JB_NET_LATENCY_CYCLES` is now 4,
+matching what the pi runs and what `config.plist` ships.
+
+**Phase 3 step 3.1 — buffer size selectors.** `kAudioDevicePropertyBufferFrameSize`
+and `...BufferFrameSizeRange` are implemented in `SA_Device.cpp`, range
+32..256 frames, defaulting to the JACK period the daemon published. A host can
+now ask for 64.
+
+### Not built, because it is a measurement
+
+Phases 3.2, 4, 5 and 6 are windows, not code. Every knob they turn is already a
+key in `config.plist`, so each is one Apply and one restart — which was the
+point of doing phase 1 first. The order in section 3 still stands, and the
+results still go in `docs/JITTER.md` before the next phase starts.
+
+The one thing that must happen before any of them: **rebuild and install the
+engine** (step 0.1, `just reload`). Protocol 10 will not attach to a region a
+protocol-9 binary published, so the driver, the daemon and `jbdump` have to
+move together — which is exactly the forced clean rebuild the version bump is
+for.

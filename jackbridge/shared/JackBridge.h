@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 9
+#define JACKBRIDGE_PROTOCOL_VERSION 10
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -72,8 +72,11 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 //                       READ/WRITE_FRAME_NUMBER(i)
 //   Daemon owns       : DAEMON_ALIVE, SLAVE_PORTS_CONNECTED, DAEMON_XRUNS,
 //                       JACK_PERIOD_FRAMES, JACK_SAMPLE_RATE, DEVICE_NAME,
-//                       BUFFER_SIZE, PROTOCOL_VERSION, SYNC_MODE
-//   App owns          : RESYNC_REQUEST (write-only; the driver only reads it)
+//                       BUFFER_SIZE, PROTOCOL_VERSION, SYNC_MODE,
+//                       JITTER_FRAMES, NET_LATENCY_CYCLES, NET_RING_FRAMES,
+//                       HEALTH_DELTA_MAX, HEALTH_SNAPS, REANCHOR_COUNT
+//   App owns          : RESYNC_REQUEST (write-only; the driver and the daemon
+//                       both read it and re-anchor their own side)
 //   Mode-dependent    : NUMBER_TIMESTAMPS, ZERO_HOST_TIME, SEED. SYNC_MODE
 //                       picks the writer: 1 (the only mode shipped -- the
 //                       daemon sets it unconditionally) means the daemon
@@ -118,6 +121,11 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x01c0      :    driver fault bitfield (driver; bit 0 = mDeviceIsAlive false)
 // 0x01c8      :    app -> driver re-anchor request (app increments; driver acts + echoes)
 // 0x01d0      :    daemon write-ahead safety margin, frames (JitterFrames)
+// 0x01d8      :    netadapter -l the pi runs, in cycles (daemon, from config.plist)
+// 0x01e0      :    netadapter -g the pi runs, in frames (daemon, from config.plist)
+// 0x01e8      :    health: peak timeline deficit in the last window, frames (daemon)
+// 0x01f0      :    health: snap count in the last window (daemon)
+// 0x01f8      :    re-anchors performed since daemon start (daemon)
 // 0x0200      :    CoreAudio device name (daemon-published, NUL-terminated UTF-8)
 // 0x10000     : Upstream buffer #0 (Driver -> Application)
 // 0x18000     : Downstream buffer #0 (Application -> Driver)
@@ -166,9 +174,12 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 //                          without tailing os_log.
 //   DRIVER_FAULT           driver: bitfield. bit 0 = mDeviceIsAlive == false
 //                          (the DAW is being fed bzero silence right now).
-//   RESYNC_REQUEST         app -> driver: the app stores a nonce here; the
-//                          driver re-anchors in GetZeroTimeStamp and echoes the
-//                          nonce back so the app knows the request landed.
+//   RESYNC_REQUEST         app -> driver AND daemon: the app stores a nonce
+//                          here. The driver re-anchors gDevice and re-arms its
+//                          liveness state in GetZeroTimeStamp; the daemon
+//                          re-anchors the timeline, which is the half that
+//                          matters under syncMode 1, and bumps REANCHOR_COUNT
+//                          so the app can see that the request landed.
 #define JB_OFF_SLAVE_PORTS_CONNECTED (0x1b0)
 #define JB_OFF_DAEMON_XRUNS          (0x1b8)
 #define JB_OFF_DRIVER_FAULT          (0x1c0)
@@ -179,6 +190,29 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // reports it as kAudioDevicePropertySafetyOffset. One value, two consumers —
 // a per-side constant is how the DAW's latency figure goes wrong silently.
 #define JB_OFF_JITTER_FRAMES         (0x1d0)
+
+// Protocol-10. The two netadapter loop parameters the pi actually runs. The
+// Mac owns them: they live in config.plist, jackbridge-ctl writes them into
+// /etc/default/jackbridge before each pi service start, and the daemon
+// publishes them here so the HAL's latency model uses the live pair instead of
+// the compile-time constants. A zero means the daemon has not published yet —
+// readers fall back to JB_NET_LATENCY_CYCLES / JB_NETADAPTER_RING_FRAMES.
+#define JB_OFF_NET_LATENCY_CYCLES    (0x1d8)
+#define JB_OFF_NET_RING_FRAMES       (0x1e0)
+
+// Protocol-10 timeline health. Both were os_log-only, which is why a stack
+// could sit hours out of anchor and still show green everywhere a user or a
+// script looks (docs/plan-tuning.md 2.9).
+//   HEALTH_DELTA_MAX  daemon: peak (FrameNumber - mLastSyncedFrame) over the
+//                     last ~5 s window, in frames. Near 0 in steady state.
+//   HEALTH_SNAPS      daemon: snap count in that same window. Nonzero in
+//                     steady state means the timeline is not holding.
+//   REANCHOR_COUNT    daemon: monotonic count of re-anchors since start —
+//                     HAL restarts, resync requests, and the automatic
+//                     divergence re-anchor all bump it.
+#define JB_OFF_HEALTH_DELTA_MAX      (0x1e8)
+#define JB_OFF_HEALTH_SNAPS          (0x1f0)
+#define JB_OFF_REANCHOR_COUNT        (0x1f8)
 
 // Bit definitions for JB_OFF_DRIVER_FAULT.
 #define JB_FAULT_DEVICE_NOT_ALIVE   (1u << 0)
@@ -222,12 +256,18 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 ******************************************************************************/
 // jackd -n on the pi (pistomp-arch jackdrc).
 #define JB_ALSA_PERIODS_PI          2
-// netadapter -l, in netjack cycles. jack2 1.9.22 defaults to 2; we leave it
-// unset in jackbridge-pi-up, so the default is what runs.
-#define JB_NET_LATENCY_CYCLES       2
-// netadapter -g, in frames. Set explicitly in jackbridge-pi-up's jack_load.
-// G=512 caused resampler instability under mod-host load (2026-08-30);
-// G=1024 is the stable floor with the current pi image.
+// netadapter -l (cycles) and -g (frames). Both are passed explicitly by
+// jackbridge-pi-up's jack_load; neither is a netadapter default any more.
+//
+// These two are FALLBACKS ONLY, for a reader that has no published pair yet.
+// The live values are Mac-owned: NetLatency / NetRing in config.plist ->
+// jackbridge-ctl writes /etc/default/jackbridge -> jackbridge-pi-up passes
+// them to netadapter, and the daemon publishes the same pair into
+// JB_OFF_NET_LATENCY_CYCLES / JB_OFF_NET_RING_FRAMES. Keep these equal to the
+// config.plist defaults so a first boot with no published pair advertises the
+// number the link will actually cost. L=2 with G=512 was recorded as unstable
+// under mod-host load (2026-08-30); L=4 / G=1024 is the stable pair.
+#define JB_NET_LATENCY_CYCLES       4
 #define JB_NETADAPTER_RING_FRAMES   1024
 // Daemon write-ahead safety margin in frames. Reported via
 // kAudioDevicePropertySafetyOffset; the DAW adds it on top of the one-way
@@ -252,28 +292,62 @@ static inline bool jb_timing_is_plausible(uint64_t period_frames, uint64_t sampl
            sample_rate   >= 8000 && sample_rate   <= 384000;
 }
 
+// Plausibility bounds for the netadapter loop pair, same purpose as
+// jb_timing_is_plausible: a zero (or nonsense) field means "not published
+// yet", and the caller must fall back to the compile-time constant rather
+// than advertise a wrong number to the DAW. The upper bounds mirror the
+// clamps in jackbridge-pi-up.
+static inline bool jb_net_pair_is_plausible(uint64_t net_latency_cycles,
+                                            uint64_t net_ring_frames) {
+    return net_latency_cycles >= 1 && net_latency_cycles <= 30 &&
+           net_ring_frames    >= 64 && net_ring_frames   <= 65536;
+}
+
 // One-way leg in frames: pi ADC -> Mac HAL, or Mac HAL -> pi DAC. The two
 // directions are symmetric (each carries exactly one codec pass), so the
 // monitoring round trip is 2x this.
-static inline uint32_t jb_one_way_latency_frames(uint64_t period_frames, uint64_t sample_rate) {
+//
+// L and G are the netadapter pair the pi is actually running. The two-argument
+// form below fills them in from the compile-time constants; every caller that
+// can read the published pair should use this form instead, because the
+// constants are only right when nobody has retuned the link.
+static inline uint32_t jb_one_way_latency_frames(uint64_t period_frames, uint64_t sample_rate,
+                                                 uint64_t net_latency_cycles,
+                                                 uint64_t net_ring_frames) {
     if (!jb_timing_is_plausible(period_frames, sample_rate)) {
         period_frames = JB_REFERENCE_PERIOD_FRAMES;
         sample_rate   = JB_REFERENCE_SAMPLE_RATE;
     }
+    if (!jb_net_pair_is_plausible(net_latency_cycles, net_ring_frames)) {
+        net_latency_cycles = JB_NET_LATENCY_CYCLES;
+        net_ring_frames    = JB_NETADAPTER_RING_FRAMES;
+    }
     // T_alsa + T_pj + T_l + T_nm + T_mj, all integer multiples of the period.
     const uint64_t period_terms =
-        (uint64_t)(JB_ALSA_PERIODS_PI + JB_NET_LATENCY_CYCLES + 3) * period_frames;
+        (JB_ALSA_PERIODS_PI + net_latency_cycles + 3) * period_frames;
     // T_wire, rounded to the nearest frame at this sample rate.
     const uint64_t wire =
         (sample_rate * JB_WIRE_TRANSIT_MICROS + 500000ULL) / 1000000ULL;
     return (uint32_t)(JB_CODEC_GROUP_DELAY_FRAMES +
                       period_terms +
-                      (JB_NETADAPTER_RING_FRAMES / 2) +
+                      (net_ring_frames / 2) +
                       wire);
+}
+
+static inline uint32_t jb_one_way_latency_frames(uint64_t period_frames, uint64_t sample_rate) {
+    return jb_one_way_latency_frames(period_frames, sample_rate,
+                                     JB_NET_LATENCY_CYCLES, JB_NETADAPTER_RING_FRAMES);
 }
 
 // Monitoring trip: pi ADC -> Mac -> pi DAC. What a guitarist monitoring
 // through the Mac actually hears, excluding the DAW's own buffers.
+static inline uint32_t jb_monitoring_trip_frames(uint64_t period_frames, uint64_t sample_rate,
+                                                 uint64_t net_latency_cycles,
+                                                 uint64_t net_ring_frames) {
+    return 2 * jb_one_way_latency_frames(period_frames, sample_rate,
+                                         net_latency_cycles, net_ring_frames);
+}
+
 static inline uint32_t jb_monitoring_trip_frames(uint64_t period_frames, uint64_t sample_rate) {
     return 2 * jb_one_way_latency_frames(period_frames, sample_rate);
 }
@@ -320,7 +394,19 @@ static_assert((JB_OFF_SLAVE_PORTS_CONNECTED % 8) == 0 &&
 static_assert(JB_OFF_JITTER_FRAMES >= JB_OFF_RESYNC_REQUEST + 8 &&
               (JB_OFF_JITTER_FRAMES % 8) == 0,
               "jitter-frames field overlaps or is misaligned");
-static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_JITTER_FRAMES + 8,
+static_assert(JB_OFF_NET_LATENCY_CYCLES >= JB_OFF_JITTER_FRAMES + 8 &&
+              JB_OFF_NET_RING_FRAMES     >= JB_OFF_NET_LATENCY_CYCLES + 8 &&
+              JB_OFF_HEALTH_DELTA_MAX    >= JB_OFF_NET_RING_FRAMES + 8 &&
+              JB_OFF_HEALTH_SNAPS        >= JB_OFF_HEALTH_DELTA_MAX + 8 &&
+              JB_OFF_REANCHOR_COUNT      >= JB_OFF_HEALTH_SNAPS + 8,
+              "protocol-10 fields overlap");
+static_assert((JB_OFF_NET_LATENCY_CYCLES % 8) == 0 &&
+              (JB_OFF_NET_RING_FRAMES % 8) == 0 &&
+              (JB_OFF_HEALTH_DELTA_MAX % 8) == 0 &&
+              (JB_OFF_HEALTH_SNAPS % 8) == 0 &&
+              (JB_OFF_REANCHOR_COUNT % 8) == 0,
+              "protocol-10 atomic<uint64_t> fields must be 8-byte aligned");
+static_assert(JB_OFF_DEVICE_NAME >= JB_OFF_REANCHOR_COUNT + 8,
               "device name overlaps the control atomics");
 static_assert(JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX <= STRBUF_U0,
               "device name runs into the first ring buffer");
@@ -373,6 +459,12 @@ protected:
     std::atomic<uint64_t> *shmDriverFault;         // driver writes
     std::atomic<uint64_t> *shmResyncRequest;       // app writes, driver echoes
     std::atomic<uint64_t> *shmJitterFrames;        // daemon writes (protocol 9)
+    // Protocol-10. The live netadapter pair and the timeline-health window.
+    std::atomic<uint64_t> *shmNetLatencyCycles;    // daemon writes
+    std::atomic<uint64_t> *shmNetRingFrames;       // daemon writes
+    std::atomic<uint64_t> *shmHealthDeltaMax;      // daemon writes
+    std::atomic<uint64_t> *shmHealthSnaps;         // daemon writes
+    std::atomic<uint64_t> *shmReanchorCount;       // daemon writes
     std::atomic<uint64_t> *shmReadFrameNumber[MAX_STREAMS];
     std::atomic<uint64_t> *shmWriteFrameNumber[MAX_STREAMS];
 
@@ -459,6 +551,11 @@ protected:
         shmDriverFault         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DRIVER_FAULT);
         shmResyncRequest       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_RESYNC_REQUEST);
         shmJitterFrames        = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_JITTER_FRAMES);
+        shmNetLatencyCycles    = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_NET_LATENCY_CYCLES);
+        shmNetRingFrames       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_NET_RING_FRAMES);
+        shmHealthDeltaMax      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HEALTH_DELTA_MAX);
+        shmHealthSnaps         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HEALTH_SNAPS);
+        shmReanchorCount       = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_REANCHOR_COUNT);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

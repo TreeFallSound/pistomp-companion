@@ -21,6 +21,9 @@
 #                                 # Runs `sudo killall`; needs a real terminal for the
 #                                 # password — never invoke it from a GUI context.
 #
+# `start` and `pi-start` push every pi tuning value from config.plist into
+# /etc/default/jackbridge on the pi first. The Mac owns that file.
+#
 # Runs as the logged-in user (no sudo needed). LaunchAgent disabled-state
 # persists across reboots via /var/db/com.apple.xpc.launchd/disabled.<uid>.plist
 # so `stop` survives a reboot and `start` re-enables.
@@ -41,6 +44,8 @@ PI_HOST="${JACKBRIDGE_PI_HOST:-pistomp.local}"
 PI_USER="pistomp"
 PI_SERVICE="pi-stomp-jackbridge"
 PI_STATUS_BIN="/usr/local/libexec/jackbridge/jackbridge-pi-status"
+PI_ENV_FILE="/etc/default/jackbridge"
+CONFIG="${JACKBRIDGE_CONFIG_PATH:-$HOME/Library/Application Support/JackBridge/config.plist}"
 if [ -r "$PREFIX_HELPER" ]; then
     . "$PREFIX_HELPER"
 else
@@ -85,6 +90,9 @@ pi_reachable() {
 pi_service() {
     verb="$1"  # start | stop
     if pi_reachable; then
+        # Configuration first: the unit reads /etc/default/jackbridge at start,
+        # so a push after systemctl would take effect one start late.
+        [ "$verb" = start ] && push_pi_config
         if pi_ssh "sudo systemctl $verb $PI_SERVICE" >/dev/null 2>&1; then
             echo "pi: systemctl $verb $PI_SERVICE ok"
         else
@@ -92,6 +100,82 @@ pi_service() {
         fi
     else
         echo "warning: pi unreachable at $PI_USER@$PI_HOST — skipping pi-side $verb" >&2
+    fi
+}
+
+# Every pi tuning parameter, as "<config.plist key>:<JACKBRIDGE_* variable>".
+# This list is the contract between config.plist, /etc/default/jackbridge, and
+# the two pi helpers that read the environment (jackbridge-pi-up,
+# jackbridge-napi-rt). Adding a knob means adding it in three places: here, the
+# helper that applies it, and the Settings window.
+PI_CONFIG_KEYS="NetLatency:JACKBRIDGE_NET_LATENCY
+NetRing:JACKBRIDGE_NET_RING
+NetRtNapi:JACKBRIDGE_RT_NAPI
+NetRtIrq:JACKBRIDGE_RT_IRQ
+NetCpuNet:JACKBRIDGE_CPU_NET
+NetCpuDsp:JACKBRIDGE_CPU_DSP
+NetGovernor:JACKBRIDGE_GOVERNOR
+NetQdisc:JACKBRIDGE_QDISC
+NetEEE:JACKBRIDGE_EEE
+NetNicRing:JACKBRIDGE_NIC_RING
+NetNicOffload:JACKBRIDGE_NIC_OFFLOAD"
+
+plist_value() {
+    [ -r "$CONFIG" ] || return 0
+    /usr/libexec/PlistBuddy -c "Print :$1" "$CONFIG" 2>/dev/null || true
+}
+
+# Push every pi tuning parameter from config.plist into /etc/default/jackbridge
+# on the pi, replacing the file wholesale.
+#
+# The Mac is the source of truth for the pi's configuration. That file used to
+# be device-local: in neither repository, hand-edited, and gone on a reimage —
+# which is why no measurement was repeatable and why the Mac's advertised
+# latency disagreed with the link for as long as it did. Nothing on the pi
+# writes it now, and a key absent from config.plist is absent from the file, so
+# a value cannot survive being deleted here.
+#
+# Values travel on stdin, never inside the remote command string, and anything
+# outside a conservative character class is dropped rather than sent: this
+# content is written to a file that the pi's root shell later sources.
+#
+# Best-effort, exactly like pi_service: an unreachable pi must not block a Mac
+# restart. A pi that comes back later is started by the app's healer, which
+# calls pi-start, which pushes again.
+# The file's contents. A function rather than an inline $( ... ) block: /bin/sh
+# on macOS mis-parses a `case` written directly inside a command substitution
+# ("syntax error near unexpected token `;;'"), and the value filter below is a
+# case.
+pi_config_body() {
+    printf '# Written by jackbridge-ctl from the Mac config.plist. Do not edit:\n'
+    printf '# the next "jackbridge-ctl start" (or pi-start) overwrites this file.\n'
+    printf '# Source of truth: ~/Library/Application Support/JackBridge/config.plist\n'
+    echo "$PI_CONFIG_KEYS" | while IFS=: read -r key var; do
+        [ -n "$key" ] || continue
+        val=$(plist_value "$key")
+        [ -n "$val" ] || continue
+        case "$val" in
+            *[!A-Za-z0-9,._-]*)
+                echo "warning: ignoring $key='$val' (unexpected characters)" >&2
+                continue ;;
+        esac
+        printf '%s=%s\n' "$var" "$val"
+    done
+}
+
+push_pi_config() {
+    if [ ! -r "$CONFIG" ]; then
+        echo "warning: no config.plist at $CONFIG — pi keeps its current $PI_ENV_FILE" >&2
+        return 0
+    fi
+    body=$(pi_config_body)
+    if printf '%s\n' "$body" | pi_ssh "sudo tee $PI_ENV_FILE >/dev/null" >/dev/null 2>&1; then
+        echo "pi: pushed $(printf '%s\n' "$body" | grep -c '^JACKBRIDGE_') tuning values to $PI_ENV_FILE"
+    else
+        # `sudo tee` needs a NOPASSWD rule for the pistomp user. Say so, rather
+        # than reporting a generic ssh failure — the two look identical here and
+        # only one of them is fixed by plugging the cable back in.
+        echo "warning: could not write $PI_ENV_FILE on the pi (ssh, or sudo tee needs NOPASSWD)" >&2
     fi
 }
 
@@ -123,7 +207,7 @@ bootstrap_agent() {
     }
 }
 usage() {
-    sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
@@ -213,6 +297,7 @@ cmd_pi_start() {
         echo "pi unreachable at $PI_USER@$PI_HOST — slave not started" >&2
         exit 1
     fi
+    push_pi_config
     if ! pi_ssh "sudo systemctl start $PI_SERVICE" >/dev/null 2>&1; then
         echo "pi: systemctl start $PI_SERVICE failed (pi reachable)" >&2
         exit 1

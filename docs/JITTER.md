@@ -132,9 +132,10 @@ xruns at ~2/s while Mac xruns, `deficit`, `snaps` and `nearMiss` all stay
 clean. That reads as "the change did nothing" unless you check
 `jackbridge-pi-status` on the pi. Raise them together.
 
-Both are now knobs in `/etc/default/jackbridge`
-(`JACKBRIDGE_NET_LATENCY`, `JACKBRIDGE_NET_RING`); `jackbridge-pi-up` warns to
-the journal when the inequality fails. See CLAUDE.md 4b.
+Both are keys in `config.plist` on the Mac (`NetLatency`, `NetRing`), pushed to
+`/etc/default/jackbridge` by `jackbridge-ctl` before each pi start.
+`jackbridge-pi-up` warns to the journal when the inequality fails, and the
+Settings window refuses an invalid pair outright. See CLAUDE.md 4b.
 
 ### The DAW's buffer size dominated everything else
 
@@ -149,10 +150,21 @@ the journal when the inequality fails. See CLAUDE.md 4b.
 REAPER at 128 was 5x worse than the same config at 64. The first row is the
 condition the original crackle report was filed under.
 
-**The driver never implements `kAudioDevicePropertyBufferFrameSize` or
-`...BufferFrameSizeRange`** (`SA_Device.cpp` handles neither selector), so
-CoreAudio hands clients its generic 128-frame default and a host cannot request
-64. Fixing that is untried and cheap.
+**The driver used to implement neither `kAudioDevicePropertyBufferFrameSize`
+nor `...BufferFrameSizeRange`**, so CoreAudio handed every client its generic
+128-frame default and a host could not request 64.
+
+2026-08-30: both selectors are implemented (`SA_Device.cpp`). The range is
+32..256 frames — the upper bound is half the shm ring, because the daemon
+writes `JitterFrames` ahead of the HAL read head inside that same ring. The
+default is the JACK period the daemon discovered from the pi, so a host that
+never asks now gets 64 rather than 128. An out-of-range request is clamped, not
+refused: a host that gets an error where it expected a smaller number falls
+back to its own default, which is the 128 we are trying to leave.
+
+**Not yet measured.** The 5x figure above is a comparison between two hosts'
+defaults, not a controlled test. Re-run the table with the buffer pinned before
+touching the workgroup axis (docs/plan-tuning.md 3.3).
 
 ### The workgroup axis is second-order
 

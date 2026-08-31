@@ -1,19 +1,49 @@
 #!/usr/bin/env bash
-# Apply interrupt-coalescing removal, NAPI threading, and SCHED_FIFO priority
-# to the JackBridge ethernet interface. Runs as root via the unit's
-# ExecStartPre=+ prefix, after jackbridge-pin-route has written
-# /run/jackbridge.iface.
+# Apply interrupt-coalescing removal, NAPI threading, realtime priority, CPU
+# placement and interface tuning to the JackBridge ethernet interface. Runs as
+# root via the unit's ExecStartPre=+ prefix, after jackbridge-pin-route has
+# written /run/jackbridge.iface.
 #
 # Only operates on the selected wired interface — jb-detect-net-iface already
 # excludes wifi. WiFi NAPI threads are NEVER touched.
 #
-# Why this matters:
-#   On a PREEMPT_RT kernel, a SCHED_FIFO thread preempts softirq context.
-#   With NAPI in softirq, the jackd/mod-host RT threads block packet delivery
-#   whenever they hold the CPU. Moving NAPI into a schedulable kthread and
-#   giving it a lower priority (FF 60, below jackd FF 70 and mod-host FF 65)
-#   lets the audio threads finish their cycle first and then NAPI delivers the
-#   next batch — instead of audio competing with an unschedulable softirq.
+# THE MAC OWNS EVERY VALUE HERE. Each knob is a JACKBRIDGE_* variable read from
+# /etc/default/jackbridge, which jackbridge-ctl writes from config.plist on the
+# Mac before each service start. Nothing in this file is a setting the pi keeps
+# on its own: the defaults below are exactly the present behaviour, so a pi with
+# no environment file behaves as it always did, and a reimaged pi costs no
+# configuration. Do not hand-edit /etc/default/jackbridge — the next start
+# overwrites it.
+#
+#   JACKBRIDGE_RT_NAPI      chrt -f priority for napi/$IFACE-*        (60)
+#   JACKBRIDGE_RT_IRQ       chrt -f priority for irq/<n>-*            (50)
+#   JACKBRIDGE_CPU_NET      CPU list for NAPI + the eth interrupt     (unset)
+#   JACKBRIDGE_CPU_DSP      CPU list for mod-host                     (unset)
+#   JACKBRIDGE_GOVERNOR     cpufreq scaling_governor                  (unset)
+#   JACKBRIDGE_QDISC        tc qdisc on $IFACE                        (unset)
+#   JACKBRIDGE_EEE          on|off, Energy Efficient Ethernet         (unset)
+#   JACKBRIDGE_NIC_RING     ethtool -G rx/tx ring entries             (unset)
+#   JACKBRIDGE_NIC_OFFLOAD  on|off, gro/lro                           (unset)
+#
+# Unset means "do not touch that setting" — not "apply a default". The
+# difference matters: a value we do not write is one the measurement does not
+# have to account for.
+#
+# Every operation is non-fatal, in the manner of the ethtool -C block: a driver
+# that refuses a knob must not fail the unit and take the audio link with it.
+#
+# Note what is NOT tuned here. Three different things on this pi are called
+# "jackbridge", and only the packet path is ours:
+#   napi/$IFACE-*                 the packet polling kthreads   — tuned here
+#   irq/<n>-*                     the interrupt thread          — tuned here
+#   netadapter                    two SCHED_FIFO threads inside the jackd
+#                                 process — deliberately left alone (raising
+#                                 them above mod-host moves the xrun to the
+#                                 plugin graph rather than removing it), and
+#                                 unfindable by name anyway: every thread in
+#                                 the jackd process is called "jackd"
+#   pi-stomp-jackbridge.service   the unit; its main process is the python
+#                                 xrun watcher, which is telemetry
 set -euo pipefail
 
 STATE=/run/jackbridge.iface
@@ -22,6 +52,65 @@ if [ ! -r "$STATE" ]; then
     exit 1
 fi
 IFACE=$(cat "$STATE")
+
+RT_NAPI="${JACKBRIDGE_RT_NAPI:-60}"
+RT_IRQ="${JACKBRIDGE_RT_IRQ:-50}"
+CPU_NET="${JACKBRIDGE_CPU_NET:-}"
+CPU_DSP="${JACKBRIDGE_CPU_DSP:-}"
+GOVERNOR="${JACKBRIDGE_GOVERNOR:-}"
+QDISC="${JACKBRIDGE_QDISC:-}"
+EEE="${JACKBRIDGE_EEE:-}"
+NIC_RING="${JACKBRIDGE_NIC_RING:-}"
+NIC_OFFLOAD="${JACKBRIDGE_NIC_OFFLOAD:-}"
+
+# SCHED_FIFO is 1..99. Anything else is a typo in config.plist, and a typo must
+# not silently become a priority.
+case "$RT_NAPI" in ''|*[!0-9]*|0) RT_NAPI=60 ;; esac
+case "$RT_IRQ"  in ''|*[!0-9]*|0) RT_IRQ=50 ;; esac
+[ "$RT_NAPI" -le 99 ] || RT_NAPI=99
+[ "$RT_IRQ"  -le 99 ] || RT_IRQ=99
+
+# A CPU list as taskset and smp_affinity_list both spell it: "3", "0-2", "0,2".
+valid_cpu_list() {
+    case "$1" in
+        ''|*[!0-9,-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+for v in CPU_NET CPU_DSP; do
+    val=${!v}
+    if [ -n "$val" ] && ! valid_cpu_list "$val"; then
+        echo "jackbridge-napi-rt: ignoring invalid $v='$val'" >&2
+        eval "$v="
+    fi
+done
+
+# Kernel threads have no cmdline, so pgrep -f cannot see them and their names
+# are not always what you would guess: the eth interrupt thread on this image
+# is literally "irq/104-eth%d", the driver's format string and not the
+# interface. Match on /proc/<pid>/comm, which is the name the scheduler uses.
+pids_by_comm_prefix() {
+    prefix=$1
+    for p in /proc/[0-9]*; do
+        [ -r "$p/comm" ] || continue
+        comm=$(cat "$p/comm" 2>/dev/null || true)
+        case "$comm" in
+            "$prefix"*) echo "${p#/proc/}" ;;
+        esac
+    done
+}
+
+# The IRQs of this interface, from sysfs rather than by grepping
+# /proc/interrupts for the interface name — see the comm note above for why
+# the name in that table cannot be trusted to be $IFACE.
+iface_irqs() {
+    dev=/sys/class/net/$IFACE/device
+    [ -d "$dev" ] || return 0
+    if [ -d "$dev/msi_irqs" ]; then
+        ls "$dev/msi_irqs" 2>/dev/null || true
+    fi
+    [ -r "$dev/irq" ] && cat "$dev/irq" 2>/dev/null || true
+}
 
 # Step 1: Remove interrupt coalescing (~49 µs per direction by default on the
 # pi-stomp eth driver). Capped at 0 = deliver each interrupt immediately.
@@ -32,7 +121,77 @@ if command -v ethtool >/dev/null 2>&1; then
     else
         echo "jackbridge-napi-rt: ethtool -C skipped (driver may not support it)" >&2
     fi
+
+    # Energy Efficient Ethernet parks the PHY between packets and pays a wakeup
+    # on the next one. A netJACK2 cycle is one small packet every 1.33 ms,
+    # which is exactly the traffic shape EEE mistakes for idle.
+    if [ -n "$EEE" ]; then
+        if ethtool --set-eee "$IFACE" eee "$EEE" 2>/dev/null; then
+            echo "jackbridge-napi-rt: $IFACE eee → $EEE" >&2
+        else
+            echo "jackbridge-napi-rt: ethtool --set-eee skipped (driver may not support it)" >&2
+        fi
+    fi
+
+    # A deep NIC ring buys throughput with latency: the further a packet can be
+    # queued behind others, the later it can arrive.
+    if [ -n "$NIC_RING" ]; then
+        if ethtool -G "$IFACE" rx "$NIC_RING" tx "$NIC_RING" 2>/dev/null; then
+            echo "jackbridge-napi-rt: $IFACE ring → rx/tx $NIC_RING" >&2
+        else
+            echo "jackbridge-napi-rt: ethtool -G skipped (driver may not support it)" >&2
+        fi
+    fi
+
+    # GRO/LRO coalesce received packets into larger ones, which means holding
+    # the first one back to see whether a second arrives.
+    if [ -n "$NIC_OFFLOAD" ]; then
+        if ethtool -K "$IFACE" gro "$NIC_OFFLOAD" lro "$NIC_OFFLOAD" 2>/dev/null; then
+            echo "jackbridge-napi-rt: $IFACE gro/lro → $NIC_OFFLOAD" >&2
+        else
+            echo "jackbridge-napi-rt: ethtool -K skipped (driver may not support it)" >&2
+        fi
+    fi
 fi
+
+# Queue discipline. The default fq_codel is a fairness algorithm for a link
+# with competing flows; this link carries one flow that must not be delayed.
+if [ -n "$QDISC" ] && command -v tc >/dev/null 2>&1; then
+    if tc qdisc replace dev "$IFACE" root "$QDISC" 2>/dev/null; then
+        echo "jackbridge-napi-rt: $IFACE qdisc → $QDISC" >&2
+    else
+        echo "jackbridge-napi-rt: tc qdisc replace $QDISC failed (skipped)" >&2
+    fi
+fi
+
+# CPU frequency governor. ondemand ramps up *after* the load arrives, and an
+# audio cycle is over by then.
+if [ -n "$GOVERNOR" ]; then
+    applied=0
+    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -w "$g" ] || continue
+        echo "$GOVERNOR" > "$g" 2>/dev/null && applied=1
+    done
+    if [ "$applied" -eq 1 ]; then
+        echo "jackbridge-napi-rt: scaling_governor → $GOVERNOR" >&2
+    else
+        echo "jackbridge-napi-rt: scaling_governor not writable (skipped)" >&2
+    fi
+fi
+
+# The eth interrupt thread: priority, and the CPU the interrupt itself lands
+# on. Both, or the packet path is split — NAPI pinned to the last core while
+# the interrupt still fires on CPU0 costs a cross-core handoff per packet.
+for irq in $(iface_irqs | sort -u); do
+    for pid in $(pids_by_comm_prefix "irq/$irq-"); do
+        chrt -f -p "$RT_IRQ" "$pid" 2>/dev/null || true
+        [ -n "$CPU_NET" ] && taskset -cp "$CPU_NET" "$pid" >/dev/null 2>&1 || true
+    done
+    if [ -n "$CPU_NET" ] && [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
+        echo "$CPU_NET" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
+    fi
+    echo "jackbridge-napi-rt: irq $irq → SCHED_FIFO $RT_IRQ${CPU_NET:+ cpu $CPU_NET}" >&2
+done
 
 # Step 2: Move NAPI polling from softirq into a schedulable kthread.
 THREADED=/sys/class/net/$IFACE/threaded
@@ -43,11 +202,19 @@ fi
 echo 1 > "$THREADED"
 echo "jackbridge-napi-rt: $IFACE threaded NAPI enabled" >&2
 
-# Step 3: Apply SCHED_FIFO 60 to the napi/$IFACE-* kthreads. Priority 60 sits
-# below jackd RT threads (FF 70) and mod-host (FF 65) so audio is never
-# preempted, but above SCHED_OTHER so packet delivery isn't stalled behind
-# normal userspace. Wait up to 500 ms for the kthreads to appear — on first
-# enable they may not exist yet.
+# Step 3: Priority and placement for the napi/$IFACE-* kthreads. Wait up to
+# 500 ms for them to appear — on first enable they may not exist yet.
+#
+# On the priority itself: 60 was chosen so the audio threads (jackd 75,
+# mod-host 65) finish their cycle before NAPI delivers the next batch. That is
+# a design decision that has never been measured, and the opposite case is at
+# least as strong — at 60 the whole packet path ranks below the work waiting
+# for it, so a packet can wait a plugin quantum before the kernel looks at it,
+# and a plugin quantum is bounded by nothing. Raising both to 72 is nearly
+# free, because an interrupt handler and a NAPI poll each do a small bounded
+# amount of work and then yield: it removes a preemption, not a share of the
+# CPU. That is what JACKBRIDGE_RT_NAPI / JACKBRIDGE_RT_IRQ are for. Measure it
+# (docs/plan-tuning.md 3.4) and record the result in docs/JITTER.md.
 DEADLINE=$(( $(date +%s%3N) + 500 ))
 while true; do
     mapfile -t PIDS < <(pgrep "napi/$IFACE" 2>/dev/null || true)
@@ -61,6 +228,16 @@ while true; do
 done
 
 for pid in "${PIDS[@]}"; do
-    chrt -f -p 60 "$pid" 2>/dev/null || true
+    chrt -f -p "$RT_NAPI" "$pid" 2>/dev/null || true
+    [ -n "$CPU_NET" ] && taskset -cp "$CPU_NET" "$pid" >/dev/null 2>&1 || true
 done
-echo "jackbridge-napi-rt: napi/$IFACE pids (${PIDS[*]}) → SCHED_FIFO 60" >&2
+echo "jackbridge-napi-rt: napi/$IFACE pids (${PIDS[*]}) → SCHED_FIFO $RT_NAPI${CPU_NET:+ cpu $CPU_NET}" >&2
+
+# Keep the plugin graph off the packet path's core. -a covers every thread of
+# the process, which is the point: mod-host is where the DSP threads are.
+if [ -n "$CPU_DSP" ]; then
+    for pid in $(pgrep -x mod-host 2>/dev/null || true); do
+        taskset -acp "$CPU_DSP" "$pid" >/dev/null 2>&1 || true
+    done
+    echo "jackbridge-napi-rt: mod-host → cpu $CPU_DSP" >&2
+fi

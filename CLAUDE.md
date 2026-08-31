@@ -123,6 +123,12 @@ is silent is usually one field disagreeing with another, and this is how you
 see which. Note `syncMode`: it is 1, meaning the daemon owns the timeline and
 the driver's `gDevice_*` anchor globals are dead code on that path.
 
+It also prints `healthDeltaMax` and `healthSnaps` — the daemon's last timeline
+window — and the netadapter pair with the one-way latency it produces. Check
+the two health fields before and after any measurement: a diverged timeline
+reports `STARTED`, no fault, a live heartbeat and 6 of 6 ports while the audio
+is noise, and it silently voids whatever you were measuring.
+
 ### What the loops do *not* cover
 
 The `.pkg` generates or templates four things, and no loop recipe touches
@@ -334,17 +340,42 @@ the source of truth; `JACKBRIDGE_PI_HOST` overrides the host.
 The systemd unit on the pi is `pi-stomp-jackbridge.service` (system, not
 `--user`, so its journal needs `sudo journalctl -u`).
 
-### The netJACK2 loop budget
+### The pi's tuning lives on the Mac
 
-`/etc/default/jackbridge` on the pi, read by the unit, applied by
-`jackbridge-pi-up`:
+**The pi holds no setting of its own.** Every parameter that changes timing is
+a key in `config.plist` on the Mac; `jackbridge-ctl` writes
+`/etc/default/jackbridge` on the pi over ssh before each `systemctl start`
+(`push_pi_config`, called from `start` and from `pi-start`), the unit reads it
+with `EnvironmentFile=-`, and `jackbridge-pi-up` / `jackbridge-napi-rt` apply
+it. A reimage of the pi therefore costs no configuration, and a measurement is
+repeatable because the configuration is one file on one machine.
 
-| Variable | netadapter flag | Default |
-|----------|-----------------|---------|
-| `JACKBRIDGE_NET_LATENCY` | `-l`, cycles of loop cushion | 2 |
-| `JACKBRIDGE_NET_RING` | `-g`, slip-ring frames | 512 |
+Do not hand-edit `/etc/default/jackbridge`. The next start overwrites it, and
+a value that disappears when audio restarts is worse than no value.
 
-    sudo systemctl restart pi-stomp-jackbridge      # apply, ~200 ms gap
+| config.plist key | Variable | Applies | Default |
+|------------------|----------|---------|---------|
+| `NetLatency` | `JACKBRIDGE_NET_LATENCY` | netadapter `-l`, cycles of loop cushion | 4 |
+| `NetRing` | `JACKBRIDGE_NET_RING` | netadapter `-g`, slip-ring frames | 1024 |
+| `NetRtNapi` | `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | 60 |
+| `NetRtIrq` | `JACKBRIDGE_RT_IRQ` | `chrt -f` on the eth interrupt thread | 50 |
+| `NetCpuNet` | `JACKBRIDGE_CPU_NET` | `taskset` for NAPI + `smp_affinity_list` for the interrupt | empty |
+| `NetCpuDsp` | `JACKBRIDGE_CPU_DSP` | `taskset` for mod-host | empty |
+| `NetGovernor` | `JACKBRIDGE_GOVERNOR` | `scaling_governor` | empty |
+| `NetQdisc` | `JACKBRIDGE_QDISC` | `tc qdisc replace` | empty |
+| `NetEEE` | `JACKBRIDGE_EEE` | `ethtool --set-eee` | empty |
+| `NetNicRing` | `JACKBRIDGE_NIC_RING` | `ethtool -G rx tx` | empty |
+| `NetNicOffload` | `JACKBRIDGE_NIC_OFFLOAD` | `ethtool -K gro lro` | empty |
+
+Empty means *do not touch that setting on the pi* — not "apply a default". A
+value we never write is one a measurement does not have to account for. The
+numeric defaults are the pi's pre-existing behaviour, so adopting this
+mechanism changed no timing.
+
+The user-facing path is the Settings window's **Pi tuning** section, then
+Apply. The maintainer path is the same file plus:
+
+    jackbridge-ctl restart                          # push + restart both ends
     .../jackbridge/jackbridge-pi-status             # xruns_1m must be 0
 
 **They are coupled: `NET_RING / 2` must exceed `NET_LATENCY * period`.** The
@@ -358,12 +389,13 @@ worst-case cable RTT (a USB NIC), which xruns the *Mac* — that is the crackle,
 not the workgroup or the HAL. Each cycle costs monitoring latency, so use the
 smallest pair that holds zero on both sides.
 
-`JB_NET_LATENCY_CYCLES` and `JB_NETADAPTER_RING_FRAMES` in
-`jackbridge/shared/JackBridge.h` mirror these for the advertised-latency model
-and **do not track them**. Change one, change the other, or the DAW's delay
-compensation is wrong by the difference.
-
-The file is device-local — in neither repo, and lost on a reimage.
+The advertised latency follows the pair automatically (protocol 10): the
+daemon reads `NetLatency`/`NetRing` from `config.plist` and publishes them into
+shm, and the HAL computes `kAudioDevicePropertyLatency` from the published
+values. `JB_NET_LATENCY_CYCLES` and `JB_NETADAPTER_RING_FRAMES` in
+`jackbridge/shared/JackBridge.h` are now only the fallback for a region no
+daemon has attached to yet — keep them equal to the `config.plist` defaults.
+`just shm` prints the published pair and the one-way figure they produce.
 
 Never name an internal shell function (`pi_service`, `bootstrap_agent`,
 `wired_iface`) as though it were a thing anyone can invoke. They are private

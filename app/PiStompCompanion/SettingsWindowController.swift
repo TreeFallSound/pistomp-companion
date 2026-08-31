@@ -14,6 +14,21 @@ final class SettingsWindowController: NSWindowController {
     private let clockPopup = NSPopUpButton()
     private let workgroupPopup = NSPopUpButton()
     private let jitterPopup = NSPopUpButton()
+    // Pi tuning. Every one of these is pushed to /etc/default/jackbridge by
+    // jackbridge-ctl before the pi service starts — the pi holds no setting of
+    // its own, so a reimage costs no configuration and a measurement is
+    // repeatable.
+    private let netLatencyPopup = NSPopUpButton()
+    private let netRingPopup = NSPopUpButton()
+    private let rtNapiField = NSTextField()
+    private let rtIrqField = NSTextField()
+    private let cpuNetField = NSTextField()
+    private let cpuDspField = NSTextField()
+    private let governorPopup = NSPopUpButton()
+    private let qdiscPopup = NSPopUpButton()
+    private let eeePopup = NSPopUpButton()
+    private let nicRingField = NSTextField()
+    private let offloadPopup = NSPopUpButton()
     private let timingField = NSTextField(labelWithString: "No value")
     private let errorField = NSTextField(labelWithString: "")
     private var values: [String: Any] = [:]
@@ -82,6 +97,46 @@ final class SettingsWindowController: NSWindowController {
             device, which is the deadline the JACK graph enforces.
             """))
 
+        for control in [netLatencyPopup, netRingPopup, governorPopup, qdiscPopup, eeePopup, offloadPopup] {
+            control.translatesAutoresizingMaskIntoConstraints = false
+        }
+        for field in [rtNapiField, rtIrqField, cpuNetField, cpuDspField, nicRingField] {
+            field.translatesAutoresizingMaskIntoConstraints = false
+        }
+        cpuNetField.placeholderString = "Leave unchanged (e.g. 3)"
+        cpuDspField.placeholderString = "Leave unchanged (e.g. 0-2)"
+        nicRingField.placeholderString = "Leave unchanged (e.g. 128)"
+        for frames in ConfigStore.netLatencyChoices { netLatencyPopup.addItem(withTitle: String(frames)) }
+        for frames in ConfigStore.netRingChoices { netRingPopup.addItem(withTitle: String(frames)) }
+        for value in ConfigStore.governorChoices { governorPopup.addItem(withTitle: ConfigStore.title(for: value)) }
+        for value in ConfigStore.qdiscChoices { qdiscPopup.addItem(withTitle: ConfigStore.title(for: value)) }
+        for value in ConfigStore.onOffChoices { eeePopup.addItem(withTitle: ConfigStore.title(for: value)) }
+        for value in ConfigStore.onOffChoices { offloadPopup.addItem(withTitle: ConfigStore.title(for: value)) }
+
+        let pi = NSStackView()
+        pi.orientation = .vertical
+        pi.alignment = .leading
+        pi.spacing = 8
+        pi.translatesAutoresizingMaskIntoConstraints = false
+        pi.addArrangedSubview(sectionTitle("Pi tuning"))
+        pi.addArrangedSubview(row("Net latency (-l)", netLatencyPopup))
+        pi.addArrangedSubview(row("Net ring (-g)", netRingPopup))
+        pi.addArrangedSubview(row("NAPI priority", rtNapiField))
+        pi.addArrangedSubview(row("IRQ priority", rtIrqField))
+        pi.addArrangedSubview(row("Network CPUs", cpuNetField))
+        pi.addArrangedSubview(row("Plugin CPUs", cpuDspField))
+        pi.addArrangedSubview(row("CPU governor", governorPopup))
+        pi.addArrangedSubview(row("Queue discipline", qdiscPopup))
+        pi.addArrangedSubview(row("Energy Eff. Ethernet", eeePopup))
+        pi.addArrangedSubview(row("NIC ring size", nicRingField))
+        pi.addArrangedSubview(row("Offloads (gro/lro)", offloadPopup))
+        pi.addArrangedSubview(note("""
+            These are written to the Pi on every start — the Pi keeps no \
+            setting of its own. The loop pair is coupled: half the ring must \
+            exceed latency × period, or the Pi overruns while the Mac still \
+            looks healthy. Blank fields leave that setting alone.
+            """))
+
         let audio = NSStackView()
         audio.orientation = .vertical
         audio.alignment = .leading
@@ -104,6 +159,7 @@ final class SettingsWindowController: NSWindowController {
 
         content.addSubview(connection)
         content.addSubview(scheduling)
+        content.addSubview(pi)
         content.addSubview(audio)
         content.addSubview(actions)
         NSLayoutConstraint.activate([
@@ -113,9 +169,12 @@ final class SettingsWindowController: NSWindowController {
             scheduling.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
             scheduling.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
             scheduling.topAnchor.constraint(equalTo: connection.bottomAnchor, constant: 22),
+            pi.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
+            pi.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
+            pi.topAnchor.constraint(equalTo: scheduling.bottomAnchor, constant: 22),
             audio.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
             audio.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
-            audio.topAnchor.constraint(equalTo: scheduling.bottomAnchor, constant: 22),
+            audio.topAnchor.constraint(equalTo: pi.bottomAnchor, constant: 22),
             actions.leadingAnchor.constraint(equalTo: connection.leadingAnchor),
             actions.trailingAnchor.constraint(equalTo: connection.trailingAnchor),
             actions.topAnchor.constraint(equalTo: audio.bottomAnchor, constant: 22),
@@ -125,6 +184,17 @@ final class SettingsWindowController: NSWindowController {
             clockPopup.widthAnchor.constraint(equalToConstant: 300),
             workgroupPopup.widthAnchor.constraint(equalToConstant: 300),
             jitterPopup.widthAnchor.constraint(equalToConstant: 300),
+            netLatencyPopup.widthAnchor.constraint(equalToConstant: 300),
+            netRingPopup.widthAnchor.constraint(equalToConstant: 300),
+            rtNapiField.widthAnchor.constraint(equalToConstant: 300),
+            rtIrqField.widthAnchor.constraint(equalToConstant: 300),
+            cpuNetField.widthAnchor.constraint(equalToConstant: 300),
+            cpuDspField.widthAnchor.constraint(equalToConstant: 300),
+            governorPopup.widthAnchor.constraint(equalToConstant: 300),
+            qdiscPopup.widthAnchor.constraint(equalToConstant: 300),
+            eeePopup.widthAnchor.constraint(equalToConstant: 300),
+            nicRingField.widthAnchor.constraint(equalToConstant: 300),
+            offloadPopup.widthAnchor.constraint(equalToConstant: 300),
         ])
         window?.setContentSize(NSSize(width: 520, height: 1))
         window?.layoutIfNeeded()
@@ -210,6 +280,25 @@ final class SettingsWindowController: NSWindowController {
             ?? 0
         jitterPopup.selectItem(withTitle: String(jitter))
         if jitterPopup.selectedItem == nil { jitterPopup.selectItem(at: 0) }
+
+        select(netLatencyPopup, String(ConfigStore.int(values, "NetLatency", 4)))
+        select(netRingPopup, String(ConfigStore.int(values, "NetRing", 1024)))
+        rtNapiField.stringValue = String(ConfigStore.int(values, "NetRtNapi", 60))
+        rtIrqField.stringValue = String(ConfigStore.int(values, "NetRtIrq", 50))
+        cpuNetField.stringValue = ConfigStore.string(values, "NetCpuNet")
+        cpuDspField.stringValue = ConfigStore.string(values, "NetCpuDsp")
+        nicRingField.stringValue = ConfigStore.string(values, "NetNicRing")
+        select(governorPopup, ConfigStore.title(for: ConfigStore.string(values, "NetGovernor")))
+        select(qdiscPopup, ConfigStore.title(for: ConfigStore.string(values, "NetQdisc")))
+        select(eeePopup, ConfigStore.title(for: ConfigStore.string(values, "NetEEE")))
+        select(offloadPopup, ConfigStore.title(for: ConfigStore.string(values, "NetNicOffload")))
+    }
+
+    // Select by title, falling back to the first item rather than leaving the
+    // popup showing nothing when config.plist holds a value we don't offer.
+    private func select(_ popup: NSPopUpButton, _ title: String) {
+        popup.selectItem(withTitle: title)
+        if popup.selectedItem == nil { popup.selectItem(at: 0) }
     }
 
     private func updateTiming() {
@@ -269,6 +358,38 @@ final class SettingsWindowController: NSWindowController {
             return
         }
         let clock = clockPopup.selectedItem?.representedObject as? String ?? ""
+
+        // Pi tuning. Validate before the restart prompt: a bad value here is
+        // worth catching now, not after the audio has stopped.
+        let netLatency = Int(netLatencyPopup.selectedItem?.title ?? "") ?? 4
+        let netRing = Int(netRingPopup.selectedItem?.title ?? "") ?? 1024
+        // The loop pair is coupled. The resampler drives ring occupancy toward
+        // the midpoint, so cushion beyond it overruns — and it overruns on the
+        // *pi*, while every Mac-side metric stays clean, which reads as "the
+        // change did nothing" rather than as a new fault.
+        let period = Int(ConfigStore.cachedTiming()?.period ?? "") ?? 64
+        guard netRing / 2 > netLatency * period else {
+            showStatus("Net ring \(netRing) is too small for latency \(netLatency) at period \(period): "
+                     + "half the ring (\(netRing / 2)) must exceed \(netLatency * period) frames.", error: true)
+            return
+        }
+        guard let rtNapi = ConfigStore.priority(rtNapiField.stringValue),
+              let rtIrq = ConfigStore.priority(rtIrqField.stringValue) else {
+            showStatus("Realtime priorities must be between 1 and 99.", error: true)
+            return
+        }
+        let cpuNet = cpuNetField.stringValue.trimmingCharacters(in: .whitespaces)
+        let cpuDsp = cpuDspField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard ConfigStore.validCPUList(cpuNet), ConfigStore.validCPUList(cpuDsp) else {
+            showStatus("CPU lists look like \"3\", \"0-2\" or \"0,2\" — or blank to leave alone.", error: true)
+            return
+        }
+        let nicRing = nicRingField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard nicRing.isEmpty || (Int(nicRing).map { $0 > 0 && $0 <= 16384 } ?? false) else {
+            showStatus("NIC ring size must be a positive number, or blank to leave it alone.", error: true)
+            return
+        }
+
         let alert = NSAlert()
         alert.messageText = "Restart JackBridge?"
         alert.informativeText = "Applying these settings restarts the existing JackBridge services. Audio will briefly stop."
@@ -283,6 +404,17 @@ final class SettingsWindowController: NSWindowController {
         next["Workgroup"] = ConfigStore.workgroupModes
             .first { $0.title == workgroupPopup.selectedItem?.title }?.key ?? ConfigStore.defaultWorkgroup
         next["JitterFrames"] = Int(jitterPopup.selectedItem?.title ?? "0") ?? 0
+        next["NetLatency"] = netLatency
+        next["NetRing"] = netRing
+        next["NetRtNapi"] = rtNapi
+        next["NetRtIrq"] = rtIrq
+        next["NetCpuNet"] = cpuNet
+        next["NetCpuDsp"] = cpuDsp
+        next["NetNicRing"] = nicRing
+        next["NetGovernor"] = ConfigStore.value(forTitle: governorPopup.selectedItem?.title)
+        next["NetQdisc"] = ConfigStore.value(forTitle: qdiscPopup.selectedItem?.title)
+        next["NetEEE"] = ConfigStore.value(forTitle: eeePopup.selectedItem?.title)
+        next["NetNicOffload"] = ConfigStore.value(forTitle: offloadPopup.selectedItem?.title)
         do {
             try ConfigStore.write(next)
             values = next
@@ -310,7 +442,60 @@ private enum ConfigStore {
         "DeviceName": "pi-Stomp",
         "Workgroup": defaultWorkgroup,
         "JitterFrames": 0,
+        // Pi tuning. Defaults are the pi's present behaviour, so adopting them
+        // changes no timing; "" means "leave that setting alone on the pi",
+        // which is not the same as a default. Mirrors PI_CONFIG_KEYS in
+        // jackbridge/tools/jackbridge-ctl and the JACKBRIDGE_* table in
+        // jackbridge/pi/bin/jackbridge-napi-rt.
+        "NetLatency": 4,
+        "NetRing": 1024,
+        "NetRtNapi": 60,
+        "NetRtIrq": 50,
+        "NetCpuNet": "",
+        "NetCpuDsp": "",
+        "NetGovernor": "",
+        "NetQdisc": "",
+        "NetEEE": "",
+        "NetNicRing": "",
+        "NetNicOffload": "",
     ]
+
+    static let netLatencyChoices = [2, 3, 4, 5, 6, 8]
+    static let netRingChoices = [512, 1024, 2048, 4096]
+    static let governorChoices = ["", "performance", "schedutil", "ondemand", "powersave"]
+    static let qdiscChoices = ["", "pfifo_fast", "fq_codel", "noqueue"]
+    static let onOffChoices = ["", "off", "on"]
+    static let leaveAlone = "Leave unchanged"
+
+    static func title(for value: String) -> String { value.isEmpty ? leaveAlone : value }
+    static func value(forTitle title: String?) -> String {
+        guard let title, title != leaveAlone else { return "" }
+        return title
+    }
+
+    // config.plist is hand-editable, so tolerate either <integer> or <string>.
+    static func int(_ values: [String: Any], _ key: String, _ fallback: Int) -> Int {
+        (values[key] as? Int) ?? (values[key] as? String).flatMap(Int.init) ?? fallback
+    }
+
+    static func string(_ values: [String: Any], _ key: String) -> String {
+        (values[key] as? String) ?? (values[key] as? Int).map(String.init) ?? ""
+    }
+
+    // SCHED_FIFO is 1..99.
+    static func priority(_ text: String) -> Int? {
+        guard let value = Int(text.trimmingCharacters(in: .whitespaces)),
+              (1...99).contains(value) else { return nil }
+        return value
+    }
+
+    // A CPU list as taskset and smp_affinity_list both spell it. Blank is
+    // valid and means "leave the placement alone".
+    static func validCPUList(_ value: String) -> Bool {
+        if value.isEmpty { return true }
+        guard value.count <= 32 else { return false }
+        return value.allSatisfy { $0.isNumber || $0 == "," || $0 == "-" }
+    }
 
     // Mirrors WorkgroupMode in jackbridge/daemon/JackBridge.cpp.
     static let workgroupModes: [(key: String, title: String)] = [

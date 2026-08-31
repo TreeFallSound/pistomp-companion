@@ -27,5 +27,55 @@
          before changing. -->
     <key>JitterFrames</key>
     <integer>320</integer>
+
+    <!-- Pi tuning. The Mac owns every one of these: jackbridge-ctl writes them
+         into /etc/default/jackbridge on the pi before each service start, and
+         the pi keeps no setting of its own, so a reimage costs no
+         configuration. An empty string means "do not touch that setting on the
+         pi" — it is not the same as a default.
+
+         The netadapter loop pair. They are coupled: NetRing / 2 must exceed
+         NetLatency * period, because the resampler drives ring occupancy
+         toward the midpoint. Raise them together. The daemon publishes both to
+         shm, so the DAW's latency figure follows them automatically. -->
+    <key>NetLatency</key>
+    <integer>4</integer>
+    <key>NetRing</key>
+    <integer>1024</integer>
+
+    <!-- SCHED_FIFO priorities on the pi's packet path. Reference points on
+         that machine: jackd audio 75, netadapter 70, mod-host 65. At the
+         defaults below the whole packet path ranks under the work waiting for
+         it; 72/72 puts it above mod-host, which is an unmeasured change (see
+         docs/plan-tuning.md 3.4) and why the defaults are still the present
+         behaviour. -->
+    <key>NetRtNapi</key>
+    <integer>60</integer>
+    <key>NetRtIrq</key>
+    <integer>50</integer>
+
+    <!-- CPU placement, as taskset and smp_affinity_list spell it ("3",
+         "0-2"). NetCpuNet takes the NAPI threads and the eth interrupt
+         together — pinning one without the other costs a cross-core handoff
+         per packet. NetCpuDsp keeps mod-host off that core. -->
+    <key>NetCpuNet</key>
+    <string></string>
+    <key>NetCpuDsp</key>
+    <string></string>
+
+    <!-- Interface and power settings on the pi. Empty = leave alone.
+         Candidates, one at a time with a measurement between (plan 3.5):
+         NetGovernor performance, NetQdisc pfifo_fast, NetEEE off,
+         NetNicRing 128, NetNicOffload off. -->
+    <key>NetGovernor</key>
+    <string></string>
+    <key>NetQdisc</key>
+    <string></string>
+    <key>NetEEE</key>
+    <string></string>
+    <key>NetNicRing</key>
+    <string></string>
+    <key>NetNicOffload</key>
+    <string></string>
 </dict>
 </plist>

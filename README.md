@@ -81,16 +81,16 @@ Fix: `sudo launchctl kickstart -k system/com.treefallsound.companion.route`.
 
 **The audio has clicks or distortion.**
 Usually the netJACK2 loop budget is too small for the cable's worst-case round
-trip. Two values on the pi, in `/etc/default/jackbridge`:
+trip. Both values live in the menu bar under **Settings… → Pi tuning**, and
+the Companion writes them to the pi for you:
 
-    JACKBRIDGE_NET_LATENCY=4    # netadapter -l, cycles of cushion
-    JACKBRIDGE_NET_RING=1024    # netadapter -g, slip-ring frames
+    Net latency (-l)    cycles of cushion
+    Net ring (-g)       slip-ring frames
 
-Raise them **together** — `NET_RING / 2` must stay above
-`NET_LATENCY x period`, or the pi xruns instead of the Mac. Apply with
-`sudo systemctl restart pi-stomp-jackbridge`; check with
-`/usr/local/libexec/jackbridge/jackbridge-pi-status` (want `xruns_1m=0`).
-Every cycle costs monitoring latency, so use the smallest pair that holds.
+Raise them **together** — half the ring must stay above latency × period, or
+the pi glitches instead of the Mac; Settings refuses a pair that cannot hold.
+Click Apply, and give the link a few seconds. Every cycle of cushion costs
+monitoring latency, so use the smallest pair that stays clean.
 
 **No audio over Wi-Fi.**
 This is by design, not a bug. Audio needs the Ethernet cable.

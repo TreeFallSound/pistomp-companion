@@ -105,13 +105,44 @@ int main(int argc, char** argv)
     printf("  slavePortsConnected   %" PRIu64 " of 6\n",
            field(base, JB_OFF_SLAVE_PORTS_CONNECTED));
     printf("  daemonXRuns           %" PRIu64 "\n", field(base, JB_OFF_DAEMON_XRUNS));
-    printf("  resyncRequest         %" PRIu64 "   (app -> driver; reserved for automatic re-anchor)\n",
+    printf("  resyncRequest         %" PRIu64 "   (app -> daemon+driver; both re-anchor on a new nonce)\n",
            field(base, JB_OFF_RESYNC_REQUEST));
+    printf("  reanchorCount         %" PRIu64 "   (re-anchors since the daemon started)\n",
+           field(base, JB_OFF_REANCHOR_COUNT));
+
+    // The timeline health window. These two were os_log-only until protocol
+    // 10, which is how a stack could be hours out of anchor and still show
+    // STARTED, no fault, a live heartbeat and 6 of 6 ports. deltaMax near 0
+    // and snaps at 0 is the only shape that means the timeline is holding --
+    // check them before and after any measurement window.
+    uint64_t deltaMax = field(base, JB_OFF_HEALTH_DELTA_MAX);
+    uint64_t snaps    = field(base, JB_OFF_HEALTH_SNAPS);
+    printf("  healthDeltaMax        %" PRIu64 " frames%s\n", deltaMax,
+           deltaMax ? "   *** timeline is not holding ***" : "");
+    printf("  healthSnaps           %" PRIu64 "%s\n", snaps,
+           snaps ? "   *** timeline is not holding ***" : "");
 
     printf("  halNFrames            %" PRIu64 "\n", field(base, JB_OFF_HAL_NFRAMES));
     printf("  halSampleRate         %" PRIu64 "\n", field(base, JB_OFF_HAL_SAMPLE_RATE));
-    printf("  jackPeriodFrames      %" PRIu64 "\n", field(base, JB_OFF_JACK_PERIOD_FRAMES));
-    printf("  jackSampleRate        %" PRIu64 "\n", field(base, JB_OFF_JACK_SAMPLE_RATE));
+    uint64_t period = field(base, JB_OFF_JACK_PERIOD_FRAMES);
+    uint64_t rate   = field(base, JB_OFF_JACK_SAMPLE_RATE);
+    printf("  jackPeriodFrames      %" PRIu64 "\n", period);
+    printf("  jackSampleRate        %" PRIu64 "\n", rate);
+
+    // The advertised-latency inputs, and the figure they produce. The daemon
+    // and the driver each log this number; if the three disagree, one of them
+    // is running against a stale binary or a stale pair.
+    uint64_t netL = field(base, JB_OFF_NET_LATENCY_CYCLES);
+    uint64_t netG = field(base, JB_OFF_NET_RING_FRAMES);
+    printf("  jitterFrames          %" PRIu64 "   (SafetyOffset)\n",
+           field(base, JB_OFF_JITTER_FRAMES));
+    printf("  netLatencyCycles      %" PRIu64 "   (netadapter -l)%s\n", netL,
+           netL ? "" : "   (daemon has not published yet)");
+    printf("  netRingFrames         %" PRIu64 "   (netadapter -g)%s\n", netG,
+           netG ? "" : "   (daemon has not published yet)");
+    printf("  oneWayLatency         %u frames   (derived; monitoring trip %u)\n",
+           jb_one_way_latency_frames(period, rate, netL, netG),
+           2 * jb_one_way_latency_frames(period, rate, netL, netG));
 
     // The write head advances on a playback or monitoring session. The read
     // head is mInputTime.mSampleTime, which CoreAudio leaves at 0 unless the

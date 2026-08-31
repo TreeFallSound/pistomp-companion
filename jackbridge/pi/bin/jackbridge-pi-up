@@ -78,11 +78,17 @@ done < <(JACK_PROMISCUOUS_SERVER=jack JACK_NO_START_SERVER=1 jack_lsp -l 2>/dev/
 # JACKBRIDGE_NET_LATENCY cycles old (JackNetInterface.cpp fMaxCycleOffset), so
 # it must exceed the worst round trip or the master's client blocks past its
 # deadline every time the link spikes. netadapter's own default is 2 (~2.7 ms
-# at 48k/64), which a USB NIC does not reliably beat. Override in
-# /etc/default/jackbridge.
-NET_LATENCY="${JACKBRIDGE_NET_LATENCY:-2}"
+# at 48k/64), which a USB NIC does not reliably beat — the measured worst-case
+# cable RTT is 7.5 ms.
+#
+# The value comes from the Mac: NetLatency in config.plist, written into
+# /etc/default/jackbridge by jackbridge-ctl before each service start. The
+# default below is the same number config.plist ships, so a pi with no
+# environment file runs the pair the Mac would have asked for. Do not hand-edit
+# that file — the next start overwrites it.
+NET_LATENCY="${JACKBRIDGE_NET_LATENCY:-4}"
 case "$NET_LATENCY" in
-    ''|*[!0-9]*|0) NET_LATENCY=2 ;;
+    ''|*[!0-9]*|0) NET_LATENCY=4 ;;
 esac
 [ "$NET_LATENCY" -le 30 ] || NET_LATENCY=30
 
@@ -95,12 +101,15 @@ esac
 #
 #     required:  (NET_RING / 2)  >  NET_LATENCY * period
 #
-# Raise them together. JB_NETADAPTER_RING_FRAMES and JB_NET_LATENCY_CYCLES in
-# pistomp-companion shared/JackBridge.h mirror both for the advertised-latency
-# model, and do not track these -- change one here, change it there.
-NET_RING="${JACKBRIDGE_NET_RING:-512}"
+# Raise them together. The Mac's advertised-latency model no longer has to be
+# kept in step by hand: the daemon publishes the same NetLatency/NetRing pair
+# from config.plist into shm, and the HAL computes the DAW's latency figure
+# from the published pair. JB_NET_LATENCY_CYCLES / JB_NETADAPTER_RING_FRAMES in
+# pistomp-companion shared/JackBridge.h are fallbacks for a region no daemon
+# has attached to yet, and should equal the config.plist defaults.
+NET_RING="${JACKBRIDGE_NET_RING:-1024}"
 case "$NET_RING" in
-    ''|*[!0-9]*|0) NET_RING=512 ;;
+    ''|*[!0-9]*|0) NET_RING=1024 ;;
 esac
 
 PERIOD=$(jack_bufsize 2>/dev/null | tr -cd '0-9') || PERIOD=""

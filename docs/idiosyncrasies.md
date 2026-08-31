@@ -44,6 +44,38 @@ exactly once, in `_HW_Open`, before IO starts. The device name now lives at
 Add a new field by extending that assert block, not by picking a free-looking
 address.
 
+### The control region is nearly full
+Protocol 10 added five fields at `0x1d8`–`0x1f8`, which is every remaining
+8-byte slot before `JB_OFF_DEVICE_NAME` at `0x200`. The next field cannot be
+appended: move the device name (and its `JB_DEVICE_NAME_MAX` block) up first,
+in the same protocol bump. The `static_assert` block fails the build if you
+forget, which is the point of it.
+
+### A diverged timeline reports itself healthy, and now re-anchors itself
+Observed 2026-08-30: the audio was noise while `driverStatus` was `STARTED`,
+`driverFault` 0, the heartbeat advancing and `slavePortsConnected` 6 of 6. The
+daemon's health line held the whole fault — a deficit of 484136464 frames,
+about 2.8 hours, with the snap firing 52 times in one window and converging on
+nothing. `kSnapThresholdFrames` (512) is a *drift* correction; six orders of
+magnitude above it, snapping is futile.
+
+Two things follow from `syncMode == 1`. The pi cannot repair it: a full restart
+of the pi's jack stack changed the slip rate not at all, because the daemon
+owns the anchor and the pi was transporting correctly against a Mac timeline
+that was hours out. And the only re-anchor used to be process start, which
+costs the user a DAW device re-select.
+
+The daemon now bounds the snap: a deficit past `kReanchorThresholdFrames` for
+`kReanchorWindows` consecutive windows stops snapping and re-anchors in place,
+reaching exactly the state a fresh daemon reaches. `reanchor()` is the single
+path — HAL restart, an app resync request (`JB_OFF_RESYNC_REQUEST`, which the
+daemon reads as well as the driver), and the automatic recovery all go through
+it, and all bump `JB_OFF_REANCHOR_COUNT`.
+
+`healthDeltaMax` and `healthSnaps` are in shm for the same reason: they were
+os_log-only, so every other status surface showed green. Read them with
+`just shm` before and after any measurement window.
+
 ### Protocol mismatch is intentional
 `JACKBRIDGE_PROTOCOL_VERSION` is published into fresh shm and both service
 processes refuse to attach when the observed version differs. Remove the shm

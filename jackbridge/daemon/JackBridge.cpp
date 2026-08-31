@@ -153,6 +153,26 @@ static constexpr long kDefaultJitterFrames = JB_JITTER_FRAMES;
 static constexpr long kMaxJitterFrames = 2048;
 static long g_jitter_frames = kDefaultJitterFrames;
 static constexpr int64_t kSnapThresholdFrames = 512;
+
+// The netadapter loop pair the pi is running, read from config.plist and
+// published to shm so the HAL's latency model uses the live values. The Mac
+// owns both: jackbridge-ctl pushes them into /etc/default/jackbridge before
+// each pi service start. Bounds mirror the clamps in jackbridge-pi-up.
+static long g_net_latency_cycles = JB_NET_LATENCY_CYCLES;
+static long g_net_ring_frames    = JB_NETADAPTER_RING_FRAMES;
+
+// Automatic re-anchor. The snap corrects drift up to kSnapThresholdFrames and
+// nothing corrected anything above it: on 2026-08-30 the daemon snapped 52
+// times in one window against a deficit of 484136464 frames (2.8 hours) and
+// never converged, while every status field read healthy. Only a fresh daemon
+// process re-anchored, which costs the user the DAW device re-select.
+//
+// So: a deficit this far past the snap threshold is not drift, and snapping at
+// it is futile. Hold it for kReanchorWindows consecutive ~5 s windows — long
+// enough that a stopped-then-resumed HAL (which _HW_StartIO re-anchors on its
+// own) does not trip it — then re-anchor in place.
+static constexpr uint64_t kReanchorThresholdFrames = 8 * (uint64_t)kSnapThresholdFrames;
+static constexpr unsigned kReanchorWindows = 3;
 #ifdef _WITH_MIDI_BRIDGE_
 #include <rtmidi/RtMidi.h>
 #define MAX_MIDI_PORTS 256
@@ -216,6 +236,18 @@ public:
         shmDaemonXRuns->store(0, std::memory_order_relaxed);
         shmJitterFrames->store((uint64_t)g_jitter_frames, std::memory_order_release);
 
+        // Protocol-10. The live netadapter pair the HAL's latency model needs,
+        // and a zeroed health window so a reused region cannot show a stale
+        // deficit from the daemon we replaced.
+        shmNetLatencyCycles->store((uint64_t)g_net_latency_cycles, std::memory_order_relaxed);
+        shmNetRingFrames->store((uint64_t)g_net_ring_frames, std::memory_order_release);
+        shmHealthDeltaMax->store(0, std::memory_order_relaxed);
+        shmHealthSnaps->store(0, std::memory_order_relaxed);
+        shmReanchorCount->store(0, std::memory_order_relaxed);
+        // Take the app's current nonce as already-seen: a nonce left in a
+        // region from a previous run is not a request aimed at us.
+        mLastResyncRequest = shmResyncRequest->load(std::memory_order_acquire);
+
         config_audio_ports();
 #ifdef _WITH_MIDI_BRIDGE_
         create_midi_ports(name, num_Min, num_Mout);
@@ -254,14 +286,13 @@ public:
         JB_LOG_INFO(jb_log_daemon(),
             "JackBridge#%u: start sr=%d Hz, bufsize=%u bytes, jitter=%ld frames",
             instance, SampleRate, (unsigned)BufSize, g_jitter_frames);
+        const uint32_t oneWay = jb_one_way_latency_frames(
+            BufSize, SampleRate, (uint64_t)g_net_latency_cycles, (uint64_t)g_net_ring_frames);
         JB_LOG_INFO(jb_log_daemon(),
-            "latency model: period=%u f_s=%d -> one-way=%u frames, monitoring trip=%u frames (%.1f ms)",
-            (unsigned)BufSize, SampleRate,
-            jb_one_way_latency_frames(BufSize, SampleRate),
-            jb_monitoring_trip_frames(BufSize, SampleRate),
-            SampleRate > 0
-                ? 1000.0 * jb_monitoring_trip_frames(BufSize, SampleRate) / SampleRate
-                : 0.0);
+            "latency model: period=%u f_s=%d L=%ld G=%ld -> one-way=%u frames, monitoring trip=%u frames (%.1f ms)",
+            (unsigned)BufSize, SampleRate, g_net_latency_cycles, g_net_ring_frames,
+            oneWay, 2 * oneWay,
+            SampleRate > 0 ? 1000.0 * 2 * oneWay / SampleRate : 0.0);
     }
 
     ~JackBridge() {
@@ -387,20 +418,23 @@ public:
         uint64_t currentStatus = shmDriverStatus->load(std::memory_order_acquire);
         if (currentStatus == JB_DRV_STATUS_STARTED &&
             mLastDriverStatus != JB_DRV_STATUS_STARTED) {
-            // Re-anchor: map current wall-clock time to the current frozen
-            // FrameNumber so the HAL resumes reading from where we're writing.
-            // Do NOT reset FrameNumber — that would create a timeline
-            // discontinuity and break transport progression.
-            shmZeroHostTime->store(mach_absolute_time(),
-                                   std::memory_order_relaxed);
-            shmNumberTimeStamps->store(FrameNumber / FramesPerBuffer,
-                                           std::memory_order_release);
-            shmSeed->fetch_add(1, std::memory_order_release);
-            JB_LOG_INFO(jb_log_jack(),
-                "JackBridge#%u: re-anchored after HAL restart frame=%llu",
-                instance, (unsigned long long)FrameNumber);
+            reanchor("HAL restart");
         }
         mLastDriverStatus = currentStatus;
+
+        // Requested re-anchor. RESYNC_REQUEST is the app's field (the menu
+        // bar writes a nonce into it); the driver honours it for its own
+        // liveness state, and we honour it for the timeline — which is the
+        // half that matters, because syncMode is 1 and the daemon owns the
+        // anchor. Compare against the last value seen so one write fires
+        // exactly once even though the nonce stays visible forever.
+        {
+            uint64_t resync = shmResyncRequest->load(std::memory_order_acquire);
+            if (resync != mLastResyncRequest) {
+                mLastResyncRequest = resync;
+                if (resync != 0) reanchor("resync request");
+            }
+        }
 
         if (currentStatus != JB_DRV_STATUS_STARTED) {
             // Driver isn't working. Just return zero buffer;
@@ -646,6 +680,11 @@ private:
     // halInputReadHead. Snap fires when a stall exceeds kSnapThresholdFrames.
     uint64_t mHealthDeltaMax{0};
     std::atomic<uint32_t> mSnapCount{0};
+    // Consecutive health windows whose deltaMax stayed past
+    // kReanchorThresholdFrames. Reaching kReanchorWindows re-anchors.
+    unsigned mDivergedWindows{0};
+    // Last JB_OFF_RESYNC_REQUEST nonce we acted on.
+    uint64_t mLastResyncRequest{0};
 
     // HAL head cache — written by check_progress() every JACK cycle (before
     // send/recv), read by sendToCoreAudio/receiveFromCoreAudio in the same
@@ -832,6 +871,32 @@ private:
     }
 #endif // _WITH_MIDI_BRIDGE_
 
+    // The one re-anchor path: map wall-clock now to the current frozen
+    // FrameNumber so the HAL resumes reading where we are writing, and bump
+    // the seed so it notices. FrameNumber itself is never reset — that would
+    // be a timeline discontinuity and would break transport progression.
+    //
+    // Every caller reaches the same state a freshly started daemon reaches, so
+    // nothing needs a process restart to recover: HAL restart, an app resync
+    // request, and the automatic divergence re-anchor all land here.
+    //
+    // RT-safe: atomic stores and one os_log line, the same shape the
+    // HAL-restart branch has always had on this thread.
+    void reanchor(const char* reason) {
+        shmZeroHostTime->store(mach_absolute_time(), std::memory_order_relaxed);
+        shmNumberTimeStamps->store(FrameNumber / FramesPerBuffer,
+                                   std::memory_order_release);
+        shmSeed->fetch_add(1, std::memory_order_release);
+        // The deficit is measured from the anchor, so it goes with it.
+        mLastSyncedFrame  = FrameNumber;
+        mHealthDeltaMax   = 0;
+        mDivergedWindows  = 0;
+        shmReanchorCount->fetch_add(1, std::memory_order_relaxed);
+        JB_LOG_INFO(jb_log_jack(),
+            "JackBridge#%u: re-anchored after %{public}s frame=%llu",
+            instance, reason, (unsigned long long)FrameNumber);
+    }
+
     // Health trace. Per-cycle: snapshot the HAL's read head, compute the
     // margin (FrameNumber - halReadHead — should sit at JitterFrames), and
     // accumulate integrated deviation and deficit. Emit one line every ~5s.
@@ -880,11 +945,30 @@ private:
         if (period && FrameNumber / period != lastTraceFrame / period) {
             uint32_t xruns = mXRunCount.exchange(0, std::memory_order_relaxed);
             uint32_t snaps = mSnapCount.exchange(0, std::memory_order_relaxed);
+            // Publish the window before logging it. os_log was the only place
+            // these two ever appeared, which is how a stack could sit hours
+            // out of anchor and still show green in `just shm` and the menu
+            // bar (docs/plan-tuning.md 2.9).
+            shmHealthDeltaMax->store(mHealthDeltaMax, std::memory_order_relaxed);
+            shmHealthSnaps->store((uint64_t)snaps, std::memory_order_release);
             JB_LOG_INFO(jb_log_shm(),
                 "health xruns=%u deltaMax=%llu snaps=%u",
                 (unsigned)xruns,
                 (unsigned long long)mHealthDeltaMax,
                 (unsigned)snaps);
+            // Bound the snap. Below the threshold, snapping converges and this
+            // stays at 0; above it, snapping cannot converge, so stop waiting
+            // for it and re-anchor instead.
+            if (mHealthDeltaMax > kReanchorThresholdFrames) {
+                if (++mDivergedWindows >= kReanchorWindows) {
+                    JB_LOG_DEFAULT(jb_log_shm(),
+                        "timeline diverged: deltaMax=%llu frames for %u windows — re-anchoring",
+                        (unsigned long long)mHealthDeltaMax, kReanchorWindows);
+                    reanchor("divergence");   // clears mHealthDeltaMax/mDivergedWindows
+                }
+            } else {
+                mDivergedWindows = 0;
+            }
             mHealthDeltaMax = 0;
         }
         lastTraceFrame = FrameNumber;
@@ -914,6 +998,11 @@ main(int argc, char** argv)
 
     g_jitter_frames = config_plist_long("JitterFrames", kDefaultJitterFrames,
                                         0, kMaxJitterFrames);
+    // The pi's netadapter pair. We do not run netadapter — jackbridge-ctl
+    // pushes these to the pi — but the HAL's latency model needs them, and
+    // config.plist is the one place they are written down.
+    g_net_latency_cycles = config_plist_long("NetLatency", JB_NET_LATENCY_CYCLES, 1, 30);
+    g_net_ring_frames    = config_plist_long("NetRing", JB_NETADAPTER_RING_FRAMES, 64, 65536);
     g_workgroup_mode = config_workgroup_mode();
 
     // libjack reads JACK_NO_WORKGROUP when the client's realtime thread starts,
@@ -923,8 +1012,10 @@ main(int argc, char** argv)
     } else {
         unsetenv("JACK_NO_WORKGROUP");
     }
-    JB_LOG_DEFAULT(jb_log_daemon(), "config: JitterFrames=%ld Workgroup=%{public}s",
-                   g_jitter_frames, workgroup_mode_name(g_workgroup_mode));
+    JB_LOG_DEFAULT(jb_log_daemon(),
+                   "config: JitterFrames=%ld Workgroup=%{public}s NetLatency=%ld NetRing=%ld",
+                   g_jitter_frames, workgroup_mode_name(g_workgroup_mode),
+                   g_net_latency_cycles, g_net_ring_frames);
 
     while ((ch = getopt(argc, argv, "vi:o:")) != -1) {
         switch (ch) {
