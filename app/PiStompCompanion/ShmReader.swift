@@ -1,7 +1,7 @@
 import Foundation
 
 /// Snapshot of the /JackBridge shm control region. Field offsets are the
-/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 11.
+/// `JB_OFF_*` constants from `jackbridge/shared/JackBridge.h` — protocol version 12.
 /// Every field is a plain aligned uint64_t (compile-time asserted on the
 /// C++ side), so a read of UInt64 at these offsets is exact.
 struct ShmSnapshot {
@@ -33,8 +33,8 @@ struct ShmSnapshot {
     /// Monotonic daemon xrun count. Watch its *rate*: a fast ramp is netmanager
     /// stalling ~2 s per cycle against a pi that is no longer there.
     var daemonXRuns: UInt64 = 0
-    /// Driver fault bitfield. Bit 0 (`JB_FAULT_DEVICE_NOT_ALIVE`) = the DAW is
-    /// being fed bzero silence right now.
+    /// Shared fault bitfield. Bit 0 means the driver feeds silence; bit 1
+    /// means the daemon's ring geometry is unsafe for the current N/P/J.
     var driverFault: UInt64 = 0
     /// Echo of the app's last re-anchor nonce (Phase 4). The driver re-arms its
     /// liveness state on a new nonce; the daemon re-anchors the timeline.
@@ -78,6 +78,7 @@ struct ShmSnapshot {
     /// Full complement of daemon slave ports (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS).
     static let slavePortsFull: UInt64 = 6
     static let faultDeviceNotAlive: UInt64 = 1 << 0
+    static let faultBadRingGeometry: UInt64 = 1 << 1
 }
 
 /// Read-only mapper of the /JackBridge POSIX shm region.

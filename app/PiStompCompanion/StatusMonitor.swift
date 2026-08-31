@@ -264,13 +264,14 @@ final class StatusMonitor {
         // independent signals, all of which must agree:
         //  - every slave port is connected to a live peer (drops to 0 the
         //    instant jackd reaps a departed pi);
-        //  - the driver is not feeding the DAW bzero silence (fault bit 0);
+        //  - the shared fault mask is clear (bit 0 silence, bit 1 geometry);
         //  - netmanager is not stalling cycle after cycle (xrun rate sane).
         // The HAL heads — the old sole basis for "streaming" — say only that a
         // *DAW* is pulling the device. They are deliberately not in this list.
         let piAudioLive =
             snap.slavePortsConnected >= ShmSnapshot.slavePortsFull &&
-            (snap.driverFault & ShmSnapshot.faultDeviceNotAlive) == 0 &&
+            (snap.driverFault & (ShmSnapshot.faultDeviceNotAlive |
+                                 ShmSnapshot.faultBadRingGeometry)) == 0 &&
             !xrunsPathological
 
         let health: Health

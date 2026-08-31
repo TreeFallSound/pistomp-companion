@@ -59,22 +59,21 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 /******************************************************************************
  Audio functions (Generic/CoreAudio)
 ******************************************************************************/
-// FIELD OWNERSHIP. Every control field below has exactly one writer. Everyone
-// else reads it. This is not a style rule -- it is load-bearing, and breaking
-// it cost a permanent-silence bug: the daemon wrote DRIVER_STATUS = INIT from
-// on_shutdown, nothing but _HW_StartIO ever writes STARTED back, and so the
-// replacement daemon read INIT and zeroed its output buffers forever while the
-// link, the ports and the packets all looked healthy.
+// FIELD OWNERSHIP. Every control field below has a defined writer. Everyone
+// else reads it. The fault bitfield is the exception at field granularity:
+// its bits have separate owners. This is load-bearing; breaking it cost a
+// permanent-silence bug when the daemon wrote DRIVER_STATUS = INIT from
+// on_shutdown and the replacement daemon then zeroed its output forever.
 //
-//   Driver (HAL) owns : DRIVER_STATUS, DRIVER_FAULT, HAL_ANCHOR_*,
+//   Driver (HAL) owns : DRIVER_STATUS, HAL_ANCHOR_*,
 //                       HAL_INPUT_READ_HEAD, HAL_OUTPUT_WRITE_HEAD,
 //                       HAL_NFRAMES, HAL_SAMPLE_RATE,
-//                       READ/WRITE_FRAME_NUMBER(i)
+//                       READ/WRITE_FRAME_NUMBER(i), DRIVER_FAULT bit 0
 //   Daemon owns       : DAEMON_ALIVE, SLAVE_PORTS_CONNECTED, DAEMON_XRUNS,
 //                       JITTER_FRAMES, NET_LATENCY_CYCLES, NET_RING_FRAMES,
 //                       HEALTH_DELTA_MAX, HEALTH_SNAPS, REANCHOR_COUNT,
 //                       DUP_READ_CYCLES, SKIP_READ_FRAMES, DUP_WRITE_CYCLES,
-//                       SKIP_WRITE_FRAMES, RECV_RESYNCS
+//                       SKIP_WRITE_FRAMES, RECV_RESYNCS, DRIVER_FAULT bit 1
 //   App owns          : RESYNC_REQUEST (write-only; the driver and the daemon
 //                       both read it and re-anchor their own side)
 //   Mode-dependent    : NUMBER_TIMESTAMPS, ZERO_HOST_TIME, SEED. SYNC_MODE
@@ -177,8 +176,9 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 //   DAEMON_XRUNS           daemon: monotonic xrun count (mXRunCount), published
 //                          so the app can show "audio came back but is glitching"
 //                          without tailing os_log.
-//   DRIVER_FAULT           driver: bitfield. bit 0 = mDeviceIsAlive == false
-//                          (the DAW is being fed bzero silence right now).
+//   DRIVER_FAULT           bitfield. The driver owns bit 0 (mDeviceIsAlive
+//                          false); the daemon owns bit 1 (ring geometry
+//                          invalid).
 //   RESYNC_REQUEST         app -> driver AND daemon: the app stores a nonce
 //                          here. The driver re-anchors gDevice and re-arms its
 //                          liveness state in GetZeroTimeStamp; the daemon
@@ -219,8 +219,9 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 #define JB_OFF_HEALTH_SNAPS          (0x1f0)
 #define JB_OFF_REANCHOR_COUNT        (0x1f8)
 
-// Bit definitions for JB_OFF_DRIVER_FAULT.
+// Bit definitions for JB_OFF_DRIVER_FAULT. Writers own disjoint bits.
 #define JB_FAULT_DEVICE_NOT_ALIVE   (1u << 0)
+#define JB_FAULT_BAD_RING_GEOMETRY  (1u << 1)
 
 // Device display name the HAL reports via kAudioObjectPropertyName (derived
 // from PiHostname in config.plist). Bounded bytes plus a NUL, not a sync field.
@@ -308,11 +309,11 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // Daemon write-ahead safety margin in frames. Reported via
 // kAudioDevicePropertySafetyOffset; the DAW adds it on top of the one-way
 // latency, so it must NOT be included in jb_one_way_latency_frames().
-// This is a real latency cost, not free headroom: RingProjector reads at
-// (write_head - JB_JITTER_FRAMES), so the daemon hands the DAW audio that is
-// JB_JITTER_FRAMES old. A value of 0 does NOT mean "no cushion" — it lands on
-// the slot one past the newest, which still holds the previous lap, so it
-// costs a FULL ring (4096 frames, 85 ms per direction). Keep it ≥ 1.
+// This is a real latency cost, not free headroom: the daemon positions its
+// cursors one block plus JB_JITTER_FRAMES clear of each HAL head. J=0 is the
+// tightest correct alignment. The ring must still satisfy the strict daemon
+// safety condition `ring_frames > 2 * max(N, P) + J`; with this 4096-frame
+// ring and J=128, the supported maximum is below 1984 frames.
 //
 // 128 chosen 2026-08-30. The previous 320 was sized to cover the maximum
 // observed CoreAudio IOProc burst (maxBurst=272 in a 2-hour live session).
@@ -520,7 +521,7 @@ protected:
     std::atomic<uint64_t> *shmSlavePortsConnected; // daemon writes
     std::atomic<uint64_t> *shmDaemonXRuns;         // daemon writes
     std::atomic<uint64_t> *shmRecvResyncs;         // daemon writes (upstream cursor corrections)
-    std::atomic<uint64_t> *shmDriverFault;         // driver writes
+    std::atomic<uint64_t> *shmDriverFault;         // driver bit 0, daemon bit 1
     std::atomic<uint64_t> *shmResyncRequest;       // app writes, driver echoes
     std::atomic<uint64_t> *shmJitterFrames;        // daemon writes (protocol 9)
     // Protocol-10. The live netadapter pair and the timeline-health window.

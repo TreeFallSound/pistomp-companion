@@ -1603,7 +1603,8 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
                 mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
                 mLastDaemonAliveHostTime = mach_absolute_time();
                 mDaemonLive.store(true, std::memory_order_release);
-                shmDriverFault->store(0, std::memory_order_release);
+                shmDriverFault->fetch_and(~(uint64_t)JB_FAULT_DEVICE_NOT_ALIVE,
+                                          std::memory_order_release);
             }
         }
     }
@@ -1634,7 +1635,8 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
         mLastDaemonAliveHostTime = now;
         if (!mDaemonLive.load(std::memory_order_acquire)) {
             mDaemonLive.store(true, std::memory_order_release);
-            shmDriverFault->store(0, std::memory_order_release);
+            shmDriverFault->fetch_and(~(uint64_t)JB_FAULT_DEVICE_NOT_ALIVE,
+                                      std::memory_order_release);
             JB_LOG_INFO(jb_log_driver(),
                 "daemon heartbeat resumed - ending silence");
         }
@@ -1657,7 +1659,8 @@ void	SA_Device::GetZeroTimeStamp(Float64& outSampleTime, UInt64& outHostTime, UI
         UInt64 threshold = (UInt64)(5.0 * theHostTicksPerRingBuffer);
         if (now - mLastDaemonAliveHostTime > threshold) {
             mDaemonLive.store(false, std::memory_order_release);
-            shmDriverFault->store(JB_FAULT_DEVICE_NOT_ALIVE, std::memory_order_release);
+            shmDriverFault->fetch_or(JB_FAULT_DEVICE_NOT_ALIVE,
+                                     std::memory_order_release);
             JB_LOG_ERR(jb_log_driver(),
                 "daemon heartbeat stalled >%llu host ticks - feeding silence",
                 (unsigned long long)threshold);
@@ -2035,10 +2038,9 @@ void	SA_Device::_HW_Open()
 
     shmSeed->store(1, std::memory_order_relaxed);
     shmSyncMode->store(0, std::memory_order_relaxed);
-    // Protocol-8 fault word — start clean. Bit 0 is raised only when the
-    // daemon-heartbeat watchdog flips mDaemonLive=0 (see GetZeroTimeStamp),
-    // i.e. when the DAW is actively being fed bzero silence.
-    shmDriverFault->store(0, std::memory_order_release);
+    // Reset the driver-owned liveness bit; the daemon owns the geometry bit.
+    shmDriverFault->fetch_and(~(uint64_t)JB_FAULT_DEVICE_NOT_ALIVE,
+                              std::memory_order_release);
     mDriverStatus.store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     shmDriverStatus->store(JB_DRV_STATUS_ACTIVE, std::memory_order_release);
     mRingBufferFrameSize = STRBUFNUM / 2;
@@ -2112,7 +2114,8 @@ kern_return_t	SA_Device::_HW_StartIO()
     mLastDaemonAlive = shmDaemonAlive->load(std::memory_order_acquire);
     mLastDaemonAliveHostTime = mach_absolute_time();
     mDaemonLive.store(true, std::memory_order_release);
-    shmDriverFault->store(0, std::memory_order_release);
+    shmDriverFault->fetch_and(~(uint64_t)JB_FAULT_DEVICE_NOT_ALIVE,
+                              std::memory_order_release);
 
     // The Pi's period and sample rate are discovered at startup and can change
     // across a daemon restart, so re-derive the advertised latency here rather

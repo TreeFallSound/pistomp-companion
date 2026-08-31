@@ -250,6 +250,9 @@ public:
         shmHealthDeltaMax->store(0, std::memory_order_relaxed);
         shmHealthSnaps->store(0, std::memory_order_relaxed);
         shmReanchorCount->store(0, std::memory_order_relaxed);
+        // The daemon owns only the geometry bit in the shared fault word.
+        shmDriverFault->fetch_and(~(uint64_t)JB_FAULT_BAD_RING_GEOMETRY,
+                                  std::memory_order_release);
         // Cadence counters, same treatment: a reused region must not show
         // the previous daemon's counts.
         shmDupReadCycles->store(0, std::memory_order_relaxed);
@@ -431,7 +434,7 @@ public:
         uint64_t currentStatus = shmDriverStatus->load(std::memory_order_acquire);
         if (currentStatus == JB_DRV_STATUS_STARTED &&
             mLastDriverStatus != JB_DRV_STATUS_STARTED) {
-            reanchor("HAL restart");
+            reanchor("HAL restart", (int)nframes);
         }
         mLastDriverStatus = currentStatus;
 
@@ -445,7 +448,7 @@ public:
             uint64_t resync = shmResyncRequest->load(std::memory_order_acquire);
             if (resync != mLastResyncRequest) {
                 mLastResyncRequest = resync;
-                if (resync != 0) reanchor("resync request");
+                if (resync != 0) reanchor("resync request", (int)nframes);
             }
         }
 
@@ -477,6 +480,16 @@ public:
                         - block_clearance((int)nframes) - (uint64_t)g_jitter_frames;
             mRecvCursorSeeded = true;
 
+            // Seed the send cursor beside the recv cursor: its target
+            // depends on the HAL's read head, which reads 0 before the HAL
+            // has run a cycle. Planted at the send target of the CURRENT
+            // head, so the walk starts aligned and the head's next jump is
+            // a full group away — the steady regime the snap rule was
+            // derived for.
+            mSendCursor = mCachedHalInputReadHead
+                        + block_clearance((int)nframes) + (uint64_t)g_jitter_frames;
+            mSendCursorSeeded = true;
+
             isActive = true;
             // FIXME(rt-safety): os_log on the JACK process callback path is
             // not strictly RT-safe (may take internal locks). Fires once per
@@ -488,11 +501,21 @@ public:
                 (unsigned long long)shmZeroHostTime->load(std::memory_order_acquire));
         }
 
+        // Per-lap timeline refresh (syncMode 1): the driver relays
+        // ZeroHostTime/NumberTimeStamps to build its timestamps on every IO
+        // cycle (SA_Device.cpp GetZeroTimeStamp), so these two fields are the
+        // live timeline, not a one-shot. Republishing at each lap boundary
+        // bounds how far a JACK xrun (which drops FrameNumber but not the
+        // wall clock) can offset the HAL's extrapolated timeline from the
+        // daemon's: without this refresh the offset persists until the next
+        // re-anchor. Relaxed store for the host time, release store for the
+        // sample-time count so a reader never sees the new count with the
+        // old anchor.
         if ((FrameNumber % RingFrames) == 0) {
             shmZeroHostTime->store(mach_absolute_time(),
                                    std::memory_order_relaxed);
             shmNumberTimeStamps->store(FrameNumber / RingFrames,
-                                           std::memory_order_release);
+                                       std::memory_order_release);
         }
 
         if ((!isSyncMode) && isVerbose && ((ncalls++) % 100) == 0) {
@@ -711,17 +734,25 @@ private:
     // cycle. Single-writer (JACK process thread), no atomic needed.
     uint64_t mCachedHalInputReadHead{0};   // HAL mInputTime.mSampleTime
     uint64_t mCachedHalOutputWriteHead{0}; // HAL mOutputTime.mSampleTime
-    // frame_cursor value at the last time halInputReadHead advanced. Used by
-    // RingProjector::send_offset() to compute the daemon's delta during a
-    // HAL stall, so it keeps writing sequentially rather than overwriting.
-    //
-    // This pairs with mCachedHalInputReadHead and must keep pairing with it:
-    // send_offset() reconstructs the HAL's current read position as
-    // hal_input_read_head + jitter + (frame_cursor - last_synced_read_frame),
-    // which is only meaningful while last_synced_read_frame is the cursor
-    // value at which that head took that value. Do not repurpose it as a
-    // liveness signal.
-    uint64_t mLastSyncedReadFrame{0};
+    // The daemon's downstream write position, in absolute frames — the
+    // mirror of mRecvCursor. The old code reconstructed this position every
+    // cycle from the HAL's read head plus an open-loop delta term
+    // (mLastSyncedReadFrame, now deleted); the cursor accumulates that walk
+    // itself: advanced by nframes once per JACK cycle in sendToCoreAudio(),
+    // written at `mSendCursor & (RingFrames - 1)`, and snapped to
+    // RingProjector::send_target() only when it leaves the safe window (see
+    // check_progress). Seeded on the first active cycle and re-seeded in
+    // reanchor(). A stalled consumer is absorbed open-loop — the same
+    // behaviour the delta term existed for — so only the two hard hazards
+    // snap: a write that would tear into the consumer's live block, or one
+    // that would wrap a full ring onto it.
+    uint64_t mSendCursor{0};
+    bool     mSendCursorSeeded{false};
+    // Send-side snap count, published on the 5s os_log health line. It needs
+    // a shm slot in the next protocol bump; ShmReader and the runbook must be
+    // updated with it at the same time. Until then, the audio cost is visible
+    // in dupWrite/skipWrite (event count for backward snaps, frames for skips).
+    uint64_t mSendResyncs{0};
 
     // The daemon's upstream read position, in absolute frames — the same
     // domain as FrameNumber and the HAL heads, because syncMode is 1 and
@@ -745,21 +776,24 @@ private:
     // either direction, so it answers "is the HAL alive" without any claim
     // about ring positions.
     uint64_t mCachedHalAnchorSample{0};
+    // FrameNumber at the last HAL anchor advance — the health delta's
+    // reference point (see check_progress).
     uint64_t mLastHalProgressFrame{0};
-
     // The HAL's block size, which is NOT the JACK period: any host can set
     // kAudioDevicePropertyBufferFrameSize anywhere in [32, 2048]
     // (SA_Device.cpp:1069-1081), and nothing reconfigures the ring when it
-    // does. send_offset must clear the block the HAL is reading, which is this
-    // size; the upstream read must clear the block the daemon itself reads,
-    // the JACK period. Passing the larger of the two satisfies both. 0 until
-    // the HAL has run a cycle.
+    // does. The send write must clear the block the HAL is reading, which
+    // is this size; the upstream read must clear the block the daemon
+    // itself reads, the JACK period. Passing the larger of the two
+    // satisfies both. 0 until the HAL has run a cycle.
     uint32_t mCachedHalNFrames{0};
+    bool mRingGeometryFaulted{false};
 
-    // Cadence counters and the previous cycle's ring positions. Single-writer
-    // (JACK process thread); the shm copies are the published mirror.
-    uint32_t mPrevSendOffset{0};
-    uint32_t mPrevRecvOffset{0};
+    // Cadence counters and the previous cycle's absolute cursor positions.
+    // Single-writer (JACK process thread); the shm copies are the published
+    // mirror.
+    uint64_t mPrevSendCursor{0};
+    uint64_t mPrevRecvCursor{0};
     uint64_t mDupReadCycles{0};
     uint64_t mSkipReadFrames{0};
     uint64_t mDupWriteCycles{0};
@@ -778,21 +812,26 @@ private:
     // of the copy paths while they project from identical inputs.
     RingProjector projector(int nframes) const {
         return RingProjector{
-            (uint32_t)RingFrames, block_clearance(nframes), FrameNumber,
+            (uint32_t)RingFrames, block_clearance(nframes), mCachedHalNFrames,
             mCachedHalInputReadHead, mCachedHalOutputWriteHead,
             (uint32_t)(nframes > 0 ? nframes : 0),
-            mLastSyncedReadFrame, (int32_t)g_jitter_frames
+            (int32_t)g_jitter_frames
         };
     }
 
     int sendToCoreAudio(float** in, int nframes) {
-        const RingProjector proj = projector(nframes);
-        const uint32_t offset = proj.send_offset();
+        // The downstream write is free-running, mirroring the read side:
+        // write at the cursor's ring position, then advance it by one
+        // period. check_progress() has already snapped the cursor to its
+        // target if it left the safe window, so the position here is always
+        // the corrected one.
+        const uint32_t offset = mSendCursor & ((uint32_t)RingFrames - 1);
         for (int j = 0; j < NUM_INPUT_STREAMS; j++) {
             ring_write_stereo_interleaved(
                 buf_down[j], (uint32_t)RingFrames, offset,
                 in[j*2 + 0], in[j*2 + 1], nframes);
         }
+        mSendCursor += (uint64_t)nframes;
         return nframes;
     }
 
@@ -967,16 +1006,17 @@ private:
     //
     // RT-safe: atomic stores and one os_log line, the same shape the
     // HAL-restart branch has always had on this thread.
-    void reanchor(const char* reason) {
+    void reanchor(const char* reason, int nframes) {
         shmZeroHostTime->store(mach_absolute_time(), std::memory_order_relaxed);
         shmNumberTimeStamps->store(FrameNumber / RingFrames,
                                    std::memory_order_release);
         shmSeed->fetch_add(1, std::memory_order_release);
         // The deficit is measured from the anchor, so it goes with it. The
-        // read cursor is a timeline position, so it re-seeds here too.
-        mLastSyncedReadFrame  = FrameNumber;
+        // cursors are timeline positions, so they re-seed here too.
+        mSendCursor = mCachedHalInputReadHead
+                    + block_clearance(nframes) + (uint64_t)g_jitter_frames;
         mRecvCursor = mCachedHalOutputWriteHead
-                    - block_clearance(0) - (uint64_t)g_jitter_frames;
+                    - block_clearance(nframes) - (uint64_t)g_jitter_frames;
         mLastHalProgressFrame = FrameNumber;
         mHealthDeltaMax   = 0;
         mDivergedWindows  = 0;
@@ -1018,17 +1058,65 @@ private:
             s2 = shmHalAnchorSeq->load(std::memory_order_acquire);
         } while ((s1 & 1) || s1 != s2);
 
-        // Update cached heads before send/recv use them this cycle. Track when
-        // the downstream read head advances so send_offset() can apply the
-        // daemon's open-loop delta during a HAL stall.
-        if (halReadHead != mCachedHalInputReadHead) {
-            mLastSyncedReadFrame = FrameNumber;
+        // Update cached heads before send/recv use them this cycle. The
+        // moved-boolean is captured BEFORE the cache write because the snap
+        // rules below gate on it: a head that published no new position
+        // since last cycle means no IO op ran in that direction (a
+        // playback-only session never runs ReadInput; a recording-only
+        // session never runs WriteMix), so there is no live block to tear
+        // into and the error is measured against a stale target. Snapping
+        // against a frozen head produced a false steady snap rate in
+        // one-direction sessions — on the recv side this shipped in v12
+        // and read as a phantom clock-rate error. The cursor's open-loop
+        // walk is correct while the head is frozen; on resume CoreAudio's
+        // sample time is host-clock-derived, so the head jumps by exactly
+        // the elapsed frames, the walk's error is preserved, and no snap
+        // or cost occurs.
+        const bool sendHeadMoved = (halReadHead != mCachedHalInputReadHead);
+        const bool recvHeadMoved = (halWriteHead != mCachedHalOutputWriteHead);
+        if (sendHeadMoved) {
             mCachedHalInputReadHead = halReadHead;
         }
-        if (halWriteHead != mCachedHalOutputWriteHead) {
+        if (recvHeadMoved) {
             mCachedHalOutputWriteHead = halWriteHead;
         }
         mCachedHalNFrames = (uint32_t)halNFrames;
+
+        // Anchor liveness, tracked separately from the ring pair above: the
+        // anchor advances on EVERY IO operation in either direction
+        // (DoIOOperation publishes it for both ReadInput and WriteMix),
+        // so it answers "is the HAL alive" for a whole class of sessions
+        // where a head stands still — a playback-only client never runs
+        // ReadInput, so the input head says nothing about the HAL's
+        // health. When the anchor advances, the health delta's reference
+        // point moves with it: the delta measures how far the daemon has
+        // run past the last observed HAL activity, and an advancing anchor
+        // resets that to now. Without this reset the delta grows without
+        // bound on a perfectly healthy stack (its only writer was
+        // reanchor), crosses kReanchorThresholdFrames in 85 ms, and
+        // forced a spurious re-anchor every three windows.
+        if (halAnchorSample != mCachedHalAnchorSample) {
+            mCachedHalAnchorSample = halAnchorSample;
+            mLastHalProgressFrame = FrameNumber;
+        }
+        // The first comparison above captures whether each head moved this
+        // cycle. Do not recompute it after updating the caches.
+        const RingProjector cadence = projector(nframes);
+        const bool geometryValid = cadence.geometry_valid();
+        if (!geometryValid && !mRingGeometryFaulted) {
+            mRingGeometryFaulted = true;
+            shmDriverFault->fetch_or(JB_FAULT_BAD_RING_GEOMETRY,
+                                     std::memory_order_release);
+            JB_LOG_ERR(jb_log_shm(),
+                "invalid ring geometry: ring=%u block=%u hal=%u period=%u jitter=%d",
+                cadence.ring_frames, cadence.block_frames,
+                cadence.hal_block_frames, cadence.period_frames,
+                cadence.jitter_frames);
+        } else if (geometryValid && mRingGeometryFaulted) {
+            mRingGeometryFaulted = false;
+            shmDriverFault->fetch_and(~(uint64_t)JB_FAULT_BAD_RING_GEOMETRY,
+                                      std::memory_order_release);
+        }
 
         // Resync rule for the free-running upstream cursor. Runs before the
         // copy paths and the cadence counters, so this cycle reads at the
@@ -1063,73 +1151,105 @@ private:
         // recvResyncs first: if it moved, it explains any same-window
         // movement in the other counters.
         //
-        // Not applied before the first active cycle seeds the cursor: the
-        // target depends on the HAL heads, and counting the seed as a
-        // resync would put a start transient in the counter.
-        const RingProjector cadence = projector(nframes);
-        if (isActive && mRecvCursorSeeded) {
+        // Gated on recvHeadMoved: with the head frozen there is no live
+        // write block to collide with (see the cache-update comment above),
+        // so the snap rule waits for the head to move again. This is what
+        // keeps a recording-only session's dupReadCycles flat instead of
+        // climbing from phantom rate-error snaps.
+        if (isActive && geometryValid && mRecvCursorSeeded && recvHeadMoved) {
             const int64_t recvErr = cadence.recv_error(mRecvCursor);
-            const int64_t forwardLimit = (int64_t)cadence.block_frames
-                                       + cadence.jitter_frames
-                                       - (int64_t)cadence.period_frames;
-            if (recvErr > forwardLimit ||
-                recvErr < -(int64_t)cadence.block_frames) {
+            if (cadence.recv_outside_window(recvErr)) {
                 mRecvCursor += (uint64_t)(-recvErr);
                 mRecvResyncs++;
                 shmRecvResyncs->store(mRecvResyncs, std::memory_order_relaxed);
             }
         }
 
-        // Cadence, measured on the ring positions themselves rather than on
-        // the HAL's heads. The positions are what the copy loops actually
-        // use, so they answer the audible question directly: a cycle that
-        // lands on the position it landed on last time re-reads a slot
-        // ring_consume_stereo_interleaved already zeroed, which hands the pi
-        // silence; a cycle that lands more than one period past the last one
-        // steps over frames nothing ever read.
+
+        // Resync rule for the free-running downstream cursor — the mirror
+        // of the recv rule above, same placement and same honesty. The
+        // window comes from the two ways a write can be wrong:
+        //   Backward (torn) edge  err < N - block - jitter: this cycle's
+        //                 write of [pos, pos+P) would land inside the
+        //                 consumer's live block [H, H+N). Torn audio —
+        //                 snap. N is the TRUE HAL block
+        //                 (cadence.hal_block_frames), not the clearance.
+        //   Forward (lap) edge    err > ring - block - jitter - P: the
+        //                 write would wrap a full ring onto the consumer's
+        //                 current or next block — overwrite audio it has
+        //                 not consumed. Snap.
+        // There is deliberately no forward discipline edge like recv's: a
+        // stalled consumer is absorbed by the cursor walking ahead
+        // open-loop (the delta term's one good behaviour, kept), so the
+        // window is wide and a snap means a real hazard, not a hiccup.
+        // A reanchor that plants the cursor just before a head jump can
+        // cross the torn edge once — one bounded snap — then healthy.
         //
-        // Keyed on positions, not heads: both projections walk forward on
+        // Gated on sendHeadMoved for the same reason as the recv rule: a
+        // playback-only session never runs ReadInput, the head is frozen,
+        // there is no live read block to tear into, and the cursor's
+        // open-loop walk is correct. Snapping against the frozen head would
+        // lap the ring every few hundred cycles and climb dupWriteCycles in
+        // a healthy session.
+        //
+        // Send snaps remain os_log-only until the next protocol bump adds a
+        // control slot and updates ShmReader and the runbook. Their audio cost
+        // remains visible in dupWrite/skipWrite on the snap cycle.
+        if (isActive && geometryValid && mSendCursorSeeded && sendHeadMoved) {
+            const int64_t sendErr = cadence.send_error(mSendCursor);
+            if (cadence.send_outside_window(sendErr)) {
+                mSendCursor += (uint64_t)(-sendErr);
+                mSendResyncs++;
+            }
+        }
+        // Cadence is measured from the absolute cursor positions used by the
+        // copy loops. A delta of P is healthy; a smaller delta is a duplicate
+        // event, and a larger delta counts skipped frames.
+        //
+        // A forward snap contributes its displacement to skip frames. A
+        // backward snap is one dup event because that counter has no frame
+        // magnitude. The old masked-position gap misread it as a huge forward
+        // skip of ring - k.
+        //
+        // Keyed on positions, not heads: both cursors walk forward on
         // their own while a head stands still (a playback-only session
         // never advances the input head at all), so "the head did not
         // move" says nothing about whether the position repeated.
         //
-        // Counted here, once per JACK cycle, from the snapshot already taken
-        // above. Pure projections and at most two relaxed stores -- no
-        // allocation, no syscall, no lock, so the audio path keeps its
-        // guarantees.
+        // Counted here, once per JACK cycle. Pure arithmetic and at most
+        // two relaxed stores -- no allocation, no syscall, no lock.
         //
-        // Skips are counted in frames, not events: one cycle that stepped over
-        // four blocks matters four times as much as one that stepped over a
-        // single block, and an event count hides that.
-        const uint32_t sendPos = cadence.send_offset();
-        const uint32_t recvPos = mRecvCursor & ((uint32_t)RingFrames - 1);
+        // Skips are counted in frames, not events: one cycle that stepped
+        // over four blocks matters four times as much as one that stepped
+        // over a single block, and an event count hides that.
         if (isActive && mCadencePrimed) {
-            const uint32_t mask = (uint32_t)RingFrames - 1;
-            const uint32_t period = (uint32_t)(nframes > 0 ? nframes : 0);
+            const int64_t period = (int64_t)(nframes > 0 ? nframes : 0);
 
-            const uint32_t recvGap = (recvPos - mPrevRecvOffset) & mask;
-            if (recvGap == 0) {
+            const int64_t recvGap =
+                (int64_t)(mRecvCursor - mPrevRecvCursor);
+            if (recvGap < period) {
                 mDupReadCycles++;
                 shmDupReadCycles->store(mDupReadCycles, std::memory_order_relaxed);
             } else if (recvGap > period) {
-                mSkipReadFrames += recvGap - period;
+                mSkipReadFrames += (uint64_t)(recvGap - period);
                 shmSkipReadFrames->store(mSkipReadFrames, std::memory_order_relaxed);
             }
 
-            const uint32_t sendGap = (sendPos - mPrevSendOffset) & mask;
-            if (sendGap == 0) {
+            const int64_t sendGap =
+                (int64_t)(mSendCursor - mPrevSendCursor);
+            if (sendGap < period) {
                 mDupWriteCycles++;
                 shmDupWriteCycles->store(mDupWriteCycles, std::memory_order_relaxed);
             } else if (sendGap > period) {
-                mSkipWriteFrames += sendGap - period;
+                mSkipWriteFrames += (uint64_t)(sendGap - period);
                 shmSkipWriteFrames->store(mSkipWriteFrames, std::memory_order_relaxed);
             }
         }
-        // Prime on the first active cycle: the jump from 0 to the first live
-        // position is not a skip, and counting it would put a large constant in
-        // every reading.
-        mPrevRecvOffset = recvPos;
-        mPrevSendOffset = sendPos;
+        // Prime on the first active cycle: the jump from 0 to the first
+        // live position is not a skip, and counting it would put a large
+        // constant in every reading.
+        mPrevRecvCursor = mRecvCursor;
+        mPrevSendCursor = mSendCursor;
         if (isActive) mCadencePrimed = true;
 
         // Liveness, tracked separately from the ring pair above. The anchor
@@ -1167,10 +1287,12 @@ private:
             shmHealthDeltaMax->store(mHealthDeltaMax, std::memory_order_relaxed);
             shmHealthSnaps->store((uint64_t)snaps, std::memory_order_release);
             JB_LOG_INFO(jb_log_shm(),
-                "health xruns=%u deltaMax=%llu snaps=%u",
+                "health xruns=%u deltaMax=%llu snaps=%u sendResyncs=%llu recvResyncs=%llu",
                 (unsigned)xruns,
                 (unsigned long long)mHealthDeltaMax,
-                (unsigned)snaps);
+                (unsigned)snaps,
+                (unsigned long long)mSendResyncs,
+                (unsigned long long)mRecvResyncs);
             // Bound the snap. Below the threshold, snapping converges and this
             // stays at 0; above it, snapping cannot converge, so stop waiting
             // for it and re-anchor instead.
@@ -1179,7 +1301,7 @@ private:
                     JB_LOG_DEFAULT(jb_log_shm(),
                         "timeline diverged: deltaMax=%llu frames for %u windows — re-anchoring",
                         (unsigned long long)mHealthDeltaMax, kReanchorWindows);
-                    reanchor("divergence");   // clears mHealthDeltaMax/mDivergedWindows
+                    reanchor("divergence", nframes);   // clears the health window
                 }
             } else {
                 mDivergedWindows = 0;

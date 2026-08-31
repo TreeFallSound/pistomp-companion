@@ -60,7 +60,9 @@ clock B). Drift between A and B is absorbed by the netadapter slip ring
 
 The monitoring path's timing is runtime-discovered from the Pi at 44.1, 48,
 or 96 kHz. Mac JACK uses the same sample rate and period, so one symbol `P`
-covers both sides. `JitterFrames` is fixed at 0. Every term below is either a
+covers both sides. `JitterFrames` is config-driven (`config.plist`, default
+J=128 since 2026-08-30) and is a real per-direction cost on top of the
+advertised figure — see the T_jf row. Every other term below is either a
 multiple of `P`, a multiple of the netadapter ring `G`, or a fixed constant —
 which is why the advertised figure is computed at runtime rather than baked in.
 
@@ -69,13 +71,13 @@ which is why the advertised figure is computed at runtime rather than baked in.
 | T_adc  | Codec ADC          | Fixed group delay through the IQaudIO ADC | 1 | 1 | ~0.02 |
 | T_alsa | ALSA capture       | `period_size × nperiods` on the pi ALSA backend (`-p × -n`) | N_pi · P | 128 | 2.67 |
 | T_pj   | Pi jackd cycle     | One JACK period on the pi | P | 64 | 1.33 |
-| T_g    | netadapter ring    | Slip-ring steady-state fill, `G/2` (see the note below) | G/2 | 256 | 5.33 |
-| T_l    | netadapter cycles  | Network latency in cycles (`-l N` → N · P). **jack2 1.9.22 default = 2 cycles, max 30** (verified on-device via `Network latency : N cycles` log). | L · P | 128 | 2.67 |
+| T_g    | netadapter ring    | Slip-ring steady-state fill, `G/2` (see the note below) | G/2 | 512 | 10.67 |
+| T_l    | netadapter cycles  | Network latency in cycles (`-l N` → N · P). **Deployed default = 4 cycles, max 30** (verified on-device via `Network latency : N cycles` log). | L · P | 256 | 5.33 |
 | T_wire | UDP transit        | LAN one-way, direct cable. Dominated by NIC + switch fabric; ~0.35 ms on a direct cable, ~0.5–1 ms through one consumer switch (the model assumes direct cable). | 354 µs · f_s | 17 | ~0.35 |
 | T_nm   | Mac netmanager     | One netjack cycle on the master side (≈ P_mac) | P | 64 | 1.33 |
 | T_mj   | Mac jackd cycle    | One JACK period on the Mac (equal to P_pi) | P | 64 | 1.33 |
+| T_jf   | HAL safety lead    | `JitterFrames`, config-driven (default J=128), returned as `kAudioDevicePropertySafetyOffset`. A real delay, not headroom: the daemon writes/reads one block ± this cushion clear of the HAL's head. | J | 128 | 2.67 |
 | T_d    | Daemon shm publish | memcpy + atomic release — nanoseconds, ignore | 0 | 0 | 0 |
-| T_jf   | HAL safety lead    | Fixed `JitterFrames=0`, returned as `kAudioDevicePropertySafetyOffset` | 0 | 0 | 0 |
 | T_dac  | Codec DAC          | Fixed group delay through the IQaudIO DAC | 1 | 1 | ~0.02 |
 
 ### The one-way leg
@@ -86,13 +88,13 @@ stages. So a single expression covers both:
 
 ```
 one-way = 1 + (N_pi + L + 3)·P + G/2 + T_wire
-        = 1 + 7·P + 256 + T_wire        (with N_pi = 2, L = 2, G = 512)
+        = 1 + 9·P + 512 + T_wire        (with N_pi = 2, L = 4, G = 1024)
 ```
 
-At the reference config (P = 64, f_s = 48 kHz) that is
-`1 + 448 + 256 + 17 = 722 frames`. That number is the *reference value*, not a
-constant — at P = 128 the same expression gives 1170 frames, and at
-P = 128 / 96 kHz it gives 1187.
+At the deployed reference config (P = 64, f_s = 48 kHz) that is
+`1 + 576 + 512 + 17 = 1106 frames`. That number is the *reference value*, not
+a constant — at P = 128 the same expression gives 1682 frames, and at
+P = 128 / 96 kHz it gives 1699.
 
 This is implemented once, in `jb_one_way_latency_frames()`
 (`jackbridge/shared/JackBridge.h`), and used by both the daemon's startup log
@@ -110,13 +112,17 @@ The HAL splits the advertised latency across two CoreAudio properties:
 - `kAudioDevicePropertyLatency` = the one-way leg, reported for **both** input
   and output scope (CoreAudio's per-scope semantics). Each scope is genuinely
   one-way, so the DAW summing them gives the correct round trip.
-- `kAudioDevicePropertySafetyOffset` = `JitterFrames` = **0**. It is reported
-  for completeness and is inert at its fixed value. Note that it does *not*
-  currently function as a producer-side write lead: the daemon never consumes
-  it (`docs/investigation-bug1.md`, verified), and raising it to 192/1024/4096
-  had no measurable effect on click rate or on the driver's `nearMiss` counter
-  (`docs/JITTER.md` — "the SafetyOffset experiment"). Treat it as a reported
-  constant, not as a working knob.
+- `kAudioDevicePropertySafetyOffset` = `JitterFrames` (config-driven, live
+  J=128; the HAL adopts the daemon's published value in
+  `_RefreshSafetyOffset`, `SA_Device.cpp:1965`). It is a real per-direction
+  delay — the daemon holds each cursor one block ± this cushion clear of
+  the HAL's head — and the DAW adds it on top of the one-way figure, so
+  the model excludes it from `jb_one_way_latency_frames()` to avoid
+  double-counting. Note it does not function as a producer-side write
+  lead the daemon reacts to: the daemon owns J, the HAL only reports it
+  (raising SafetyOffset in the DAW does nothing; raising `JitterFrames`
+  in `config.plist` does — see `docs/investigation-bug1.md` and
+  `docs/JITTER.md`'s SafetyOffset experiment for the history).
 
 The DAW sums Latency(in) + Latency(out) + SafetyOffset×2 + its own buffers.
 
@@ -128,17 +134,18 @@ The DAW sums Latency(in) + Latency(out) + SafetyOffset×2 + its own buffers.
 
 Σ is what a guitarist monitoring through the Mac hears: a signal that enters
 the pi's ADC, traverses the whole chain to the Mac, and comes back out the
-pi's DAC. At the reference config that is **1444 frames / 30.1 ms @ 48 kHz**.
+pi's DAC. At the deployed reference config that is **2212 frames / 46.1 ms @
+48 kHz** before the separately reported SafetyOffset.
 There is no de-duplication to apply — the forward leg carries T_adc and the
 return leg carries T_dac, one codec pass each, and every other stage is
 genuinely traversed twice.
 
 | Measurement scenario | What to expect |
 |----------------------|----------------|
-| **Monitoring** (pi ADC → Mac → pi DAC)  | Σ = 2 × one-way = **1444 frames / 30.1 ms** at reference |
-| **One-way recording** (pi ADC → Mac DAW, no return) | one-way = **722 frames / 15.0 ms** at reference |
+| **Monitoring** (pi ADC → Mac → pi DAC)  | Σ = 2 × one-way = **2212 frames / 46.1 ms** at reference |
+| **One-way recording** (pi ADC → Mac DAW, no return) | one-way = **1106 frames / 23.0 ms** at reference |
 | **One-way playback** (Mac DAW → pi DAC) | one-way, same figure (the legs are symmetric) |
-| **Pure-digital round-trip** (Mac plays → returns via JackBridge loopback, no codec) | Σ − T_adc − T_dac ≈ **1442 frames** |
+| **Pure-digital round-trip** (Mac plays → returns via JackBridge loopback, no codec) | Σ − T_adc − T_dac ≈ **2210 frames** |
 | **Hardware loopback round-trip** (pi DAC cabled into pi ADC) | ≈ 2 × Σ — the monitoring trip, twice |
 
 The DAW's own internal buffer (typically 128–512 frames) sits on top of all of
@@ -230,12 +237,12 @@ delta you get per unit of change.
 
 | Symbol | Knob | Where | Default | Impact on latency (frames per unit) |
 |--------|------|-------|---------|-------------------------------------|
-| G | netadapter ring size (`-g N`) | `jackbridge/pi/bin/jackbridge-pi-up:70` (deployed: `/usr/local/libexec/jackbridge/jackbridge-pi-up`) | `512` (was adaptive) | **0.5** — half a frame steady-state per ring frame; full frame in burst headroom |
+| G | netadapter ring size (`-g N`) | `jackbridge/pi/bin/jackbridge-pi-up:70` (deployed: `/usr/local/libexec/jackbridge/jackbridge-pi-up`) | `1024` (was adaptive) | **0.5** — half a frame steady-state per ring frame; full frame in burst headroom |
 | P_pi | Pi JACK period (`-p N`) | Pi image JACK configuration | discovered live from the Pi | T_pj scales 1:1, T_alsa scales N_pi:1 — **the largest knob** |
 | N_pi | ALSA periods (`-n N`) | `pistomp-arch/files/jackdrc:19` (hardcoded `-n 2`) | `2` | P_pi frames per period — biggest non-G one-shot saving if dropped to 1 (but risky) |
-| L | netadapter network latency (`-l N`, cycles, range 0–30) | `jackbridge/pi/bin/jackbridge-pi-up:70` (currently unset → default) | `2` (jack2 1.9.22, verified on-device) | P_pi frames per cycle |
+| L | netadapter network latency (`-l N`, cycles, range 0–30) | `jackbridge/pi/bin/jackbridge-pi-up:70` | `4` | P_pi frames per cycle |
 | P_mac | Mac JACK period | coordinator runtime arguments | equal to discovered P_pi | Must equal P_pi or netJACK2 resampler chokes |
-| J | HAL safety lead (`JitterFrames`) | fixed runtime default in driver and daemon | `0` | Reported via `kAudioDevicePropertySafetyOffset`, but not consumed as a write lead — see "J is reported, not enforced" below |
+| J | HAL safety lead (`JitterFrames`) | `config.plist` `JitterFrames`, adopted by driver and daemon at runtime | `128` | Real per-direction delay (2×J round trip), reported via `kAudioDevicePropertySafetyOffset`; the daemon enforces it as the cushion in both ring projections |
 | f_s | Sample rate | discovered live from the Pi | `44100`, `48000`, or `96000` | All times are `frames / f_s` |
 | Q | netadapter resampler quality (`-q N`, **0 = lowest, 4 = highest**) | `jackbridge/pi/bin/jackbridge-pi-up:70` | `0` (we set it explicitly) | No latency impact — only CPU/fidelity |
 | MTU | netJACK MTU | Pi runtime | `1500` | Affects T_wire only at jumbo-frame scale |
@@ -291,11 +298,12 @@ tolerance:
 
 J = **128 frames** as of 2026-08-30 (`JB_JITTER_FRAMES`, lowered from 320 the
 same day). It is user-set in `config.plist`, so read the live value from
-`just shm` rather than assuming the default. The daemon writes at
-`(halInputReadHead + block + J + delta) % ring_frames` and reads at
-`(halOutputWriteHead − block − J) % ring_frames`, with `delta` tracking the
-daemon's open-loop advance since the HAL's read head last moved. This
-absorbs HAL stalls without overwriting the ring.
+`just shm` rather than assuming the default.
+
+The daemon seeds the send cursor at `halInputReadHead + block + J` and the recv
+cursor at `halOutputWriteHead − block − J`. Both advance by one JACK period;
+the daemon snaps either cursor only when its shared projector window reports a
+hard hazard.
 
 `block` is `max(HAL buffer size, JACK period)`, and it is separate from J on
 purpose. Both heads are published *before* the HAL copies that cycle's block,
@@ -319,27 +327,22 @@ fully-correlated case. At the current J=128 (2×P) the same burst produces a
 344-frame starvation, so lowering J widened this risk rather than closing it.
 **Open risk — needs measurement.**
 
-**J=0 used to be the worst setting. It is now the tightest correct one.**
-The upstream read position is a free-running cursor whose target is
-`(halOutputWriteHead − block − J) % ring_frames`. The HAL has written up to
-the write head, exclusive, so the newest *complete block* is `[W−block, W)`.
-The read is a block, not a slot, so the whole block has to land in written
-data. The `block` term places it there, and J trails further back from it.
-The cursor free-runs between corrections, so J is also the forward slack of
-the resync window: past it, the read would touch the live block and the
-cursor snaps back.
+**J=0 is the tightest correct alignment.** The upstream read position is a
+free-running cursor whose target is `halOutputWriteHead − block − J`. The HAL
+has written up to the write head, exclusive, so the newest complete block is
+`[W−block, W)`. The block term is mandatory clearance; J is cushion on top.
 
-Before the block term existed the read was `(W − J)`, and J paid for the
-alignment before it bought any cushion. J=0 then read `[W, W+block)` — frames
-the HAL had not written on this lap — so the data was a full ring old: 4096
-frames, 85 ms, in each direction. A J between 1 and one block tore, part fresh
-and part stale. The earlier claim here that "J=1 reads the newest sample" was
-per-slot reasoning, and it does not hold for a block-sized read.
-`send_offset()` had the same form and paid the same lap.
+The same geometry applies to the send cursor. The daemon requires:
 
-None of that appears in the advertised figure. The model excludes J on purpose,
-and `SafetyOffset` reports 0 when J is 0, so the DAW compensates for nothing
-while the real delay is at its largest. Keep J ≥ 1.
+    ring_frames > 2 × max(HAL block, JACK period) + J
+
+This is a strict safety condition, not a tuning clamp. With the 4096-frame ring,
+J=128 requires `max(N, P) < 1984`; J=0 permits values below 2048. The daemon
+raises a fault and logs the geometry when a host requests an invalid size.
+
+J is reported via `kAudioDevicePropertySafetyOffset`. The DAW adds it on top of
+the one-way latency from `kAudioDevicePropertyLatency`, so it must NOT appear in
+`jb_one_way_latency_frames()`.
 
 ### Q is free latency-wise but not CPU-wise
 
@@ -355,11 +358,11 @@ Pi CPU helps the netadapter cycle hit its budget under mod-host load.
 All Σ figures are **monitoring trip** (pi ADC → Mac → pi DAC) = 2 × one-way.
 
 **Current runtime behavior (deployed 2026-08-30, P=64, f_s=48000):**
-- L=2 (`JACKBRIDGE_NET_LATENCY=2`), G=1024 (`JACKBRIDGE_NET_RING=1024`), J=320 (`JitterFrames` in `~/Library/Application Support/JackBridge/config.plist`)
-- One-way latency advertised by HAL = `jb_one_way_latency_frames()` = 978 frames = 20.4 ms
-- SafetyOffset = J = 320 frames = 6.67 ms
-- DAW total one-way = 978 + 320 = **1298 frames = 27.0 ms**
-- Monitoring trip (Σ) = 2 × 1298 = **2596 frames = 54.1 ms**
+- L=4 (`JACKBRIDGE_NET_LATENCY=4`), G=1024 (`JACKBRIDGE_NET_RING=1024`), J=128 (`JitterFrames` in `~/Library/Application Support/JackBridge/config.plist`, lowered from 320 on 2026-08-30)
+- One-way latency advertised by HAL = `jb_one_way_latency_frames()` = 1106 frames = 23.0 ms
+- SafetyOffset = J = 128 frames = 2.67 ms
+- DAW total one-way = 1106 + 128 = **1234 frames = 25.7 ms**
+- Monitoring trip (Σ) = 2 × 1234 = **2468 frames = 51.4 ms**
 - Pi sample rate and period are discovered at startup; Mac JACK receives the same values.
 - The advertised latency follows the discovered timing automatically.
 
@@ -373,13 +376,14 @@ just logs   # daemon: "latency model: period=… f_s=… -> one-way=… monitori
             # driver: "health … leadJitter=… daemonXruns=…"
 ```
 
-Reference values from the model (L=2, G=1024, J=0 for simplicity), for orientation:
+Reference values from the model (L=4, G=1024, J=128 — the live default),
+for orientation:
 
-| P | f_s | one-way (excl J) | + J=320 | monitoring trip |
+| P | f_s | one-way (excl J) | + J=128 | monitoring trip |
 |---|-----|-----------------|---------|-----------------|
-| 64 | 48000 | 978 | 1298 | **2596 (54.1 ms)** |
-| 128 | 48000 | 1426 | 1746 | 3492 (72.7 ms) |
-| 64 | 44100 | 978 | 1298 | 2596 (58.9 ms) |
+| 64 | 48000 | 1106 | 1234 | **2468 (51.4 ms)** |
+| 128 | 48000 | 1682 | 1810 | 3620 (75.4 ms) |
+| 64 | 44100 | 1105 | 1233 | 2466 (55.9 ms) |
 
 **Diagnose where latency lives in YOUR setup:**
 - Send a known transient (handclap, click track) from DAW to pi headphones, record back.
@@ -392,7 +396,7 @@ Reference values from the model (L=2, G=1024, J=0 for simplicity), for orientati
 
 - T_alsa, T_pj, T_mj, T_nm are from the JACK / ALSA buffer math (frames ÷ sample rate).
 - T_g midpoint behavior is documented in jack2's `JackAudioAdapter::PushAndPull` — the controller targets midpoint via the resampler ratio.
-- T_jf (JitterFrames) defaults to J=128 (`JB_JITTER_FRAMES`, changed from 320 on 2026-08-30), enforced as a write lead in `RingProjector::send_offset` and a read trail in `recv_offset`. It is user-set in `config.plist`, so read the live value from `just shm` rather than assuming the default. `J = 0` now means the tightest correct alignment and costs nothing beyond the mandatory block clearance; before the block term was separated out it cost a full ring (4096 frames, 85 ms) in each direction, invisible to both the advertised figure and SafetyOffset. Subtract accordingly when reading a measurement taken before that fix. See `docs/investigation-bug1.md` for the original bug and `jackbridge/daemon/RingProjector.hpp` for the implementation.
+- T_jf (JitterFrames) defaults to J=128 (`JB_JITTER_FRAMES`, changed from 320 on 2026-08-30), enforced as a write lead ahead of the send cursor's target and a read trail behind the recv cursor's target in `RingProjector.hpp`. It is user-set in `config.plist`, so read the live value from `just shm` rather than assuming the default. `J = 0` now means the tightest correct alignment and costs nothing beyond the mandatory block clearance; before the block term was separated out it cost a full ring (4096 frames, 85 ms) in each direction, invisible to both the advertised figure and SafetyOffset. Subtract accordingly when reading a measurement taken before that fix. See `docs/investigation-bug1.md` for the original bug and `jackbridge/daemon/RingProjector.hpp` for the implementation.
 - The model itself lives in `jb_one_way_latency_frames()` in `jackbridge/shared/JackBridge.h`, alongside the constants it uses (`JB_ALSA_PERIODS_PI`, `JB_NET_LATENCY_CYCLES`, `JB_NETADAPTER_RING_FRAMES`, `JB_WIRE_TRANSIT_MICROS`, `JB_JITTER_FRAMES`). L and G no longer have to be kept in step by hand: the four-argument form takes the pair the daemon published from `config.plist` (`NetLatency`, `NetRing`), and the HAL uses that. `JB_NET_LATENCY_CYCLES` / `JB_NETADAPTER_RING_FRAMES` are the fallback for a region no daemon has attached to yet — keep them equal to the `config.plist` defaults. The other constants are still hand-maintained: change a Pi-side knob they describe and you must change them, or the advertised figure drifts from reality. `just shm` prints the published pair and the resulting one-way figure.
 - Network latency default (`-l 2`, max 30) verified on the live pi by loading netadapter under a probe client name and reading the `Network latency : N cycles` line from `journalctl -u jack` (jack2 1.9.22 on Arch).
 - T_adc / T_dac are codec group-delay values from the IQaudIO datasheet (low ms).

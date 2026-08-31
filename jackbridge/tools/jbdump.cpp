@@ -47,6 +47,7 @@ void print_fault(uint64_t v)
     if (v == 0) { printf("  driverFault           0 (none)\n"); return; }
     printf("  driverFault           0x%" PRIx64, v);
     if (v & JB_FAULT_DEVICE_NOT_ALIVE) printf(" DEVICE_NOT_ALIVE(feeding silence)");
+    if (v & JB_FAULT_BAD_RING_GEOMETRY) printf(" BAD_RING_GEOMETRY");
     printf("\n");
 }
 

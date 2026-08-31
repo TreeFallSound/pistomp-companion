@@ -1,11 +1,14 @@
-# Plan: a free-running upstream read cursor
+# Plan: a free-running read cursor — both directions
 
-This plan removes the last cadence defect on the playback path. The defect is
-small. Read `docs/DEBUGGING.md` section 6 for the measurement that found it.
+This plan removes the last cadence defect on the playback path, and then
+the mirror defect on the capture path. Read `docs/DEBUGGING.md` section 6
+for the measurement that found the first one.
 
 ---
 
-> **Status: implemented.** The cursor, `recv_target()`/`recv_error()`, the
+> **Status: implemented, both directions.**
+>
+> **Recv (playback) side:** the cursor, `recv_target()`/`recv_error()`, the
 > `RECV_RESYNCS` counter and the unit-test harness
 > (`jackbridge/daemon/RingProjector_test.cpp`, `just test-projector`) all
 > landed. One deviation from this plan, found by the test: the forward
@@ -13,8 +16,58 @@ small. Read `docs/DEBUGGING.md` section 6 for the measurement that found it.
 > jumps the cursor legitimately runs up to `block − period` ahead of the
 > target; a tighter edge snaps mid-walk and re-reads zeroed slots every few
 > cycles. Section 4's table is superseded by the window in
-> `RingProjector.hpp` and in `check_progress()`. The hardware measurement of
-> section 5 still needs to be taken against the four N/P ratios.
+> `RingProjector.hpp` and in `check_progress()`.
+>
+> **Send (capture) side:** implemented as the exact mirror — `mSendCursor`,
+> `send_target()`/`send_error()`, replacing the delta-term `send_offset()`
+> and `mLastSyncedReadFrame` entirely. The window differs from recv in one
+> deliberate way: **no forward discipline edge.** A stalled consumer is
+> absorbed open-loop (the delta term's one good behaviour, kept); the only
+> snaps are the two hard hazards:
+>
+>   torn edge:  `err < N − B − J`    (write would land in the consumer's
+>                                     live block [H, H+N); N is the TRUE
+>                                     HAL block, not max(N, P))
+>   lap edge:   `err > ring − B − J − P`  (write would wrap a full ring
+>                                     onto it)
+>
+> Snaps are counted in `mSendResyncs`, published on the 5 s health os_log
+> line (`sendResyncs=`/`recvResyncs=`) — no shm slot was free before
+> `STRBUF_U0`, and the audio cost already lands in dupWrite/skipWrite.
+>
+> **The head-moved gate (both rules, found by session-shape fuzz):** each
+> snap rule fires only on cycles where its head published a new position.
+> A head that never moves means no IO op ran in that direction — a
+> playback-only session never runs ReadInput, a recording-only one never
+> runs WriteMix — so there is no live block to collide with and the
+> open-loop walk is correct. Ungated, the rules snapped against frozen
+> heads in a steady rhythm: the v12 recv rule produced a phantom
+> clock-rate error (~6666 false snaps in a 27 s recording-only window)
+> and the send rule would have done the mirror in playback-only. With
+> the gate: zero false snaps, and a clock-tracked resume preserves the
+> walk's error so a paused direction costs nothing on the way back.
+>
+> **Error representation (both sides):** plain absolute-frame differences.
+> The send lap edge (`ring − B − J − P ≈ 3840` at the live config) lies
+> beyond ring/2, where a shortest-way-around-ring comparison folds negative
+> and inverts the snap direction — the mid-implementation simulation caught
+> exactly that. ALSA and WASAPI solve the same problem the same way:
+> unbounded position counters, ring offset taken by `%` at the point of
+> use, never by folding the comparison.
+>
+> **Cadence counters:** now measured as signed absolute deltas between
+> consecutive cursor positions. The old masked-position gap could not represent
+> a backward snap — it read as a huge forward skip of `ring − k`. Forward snap
+> displacement lands in the skip-frame counters; backward snaps increment the
+> dup-cycle counter, which does not retain their magnitude.
+>
+> **Degenerate N=2048:** ring = 2N leaves the send window with exactly the
+> walk's sawtooth amplitude (N−P) and zero margin — any one-frame
+> perturbation snaps. Cap `kMaxIOBufferFrames` at 1024 (driver note; the
+> plugin side needs a coreaudiod restart, deliberately not done here).
+>
+> The hardware measurement of section 5 still needs to be taken against
+> the four N/P ratios.
 
 ## 1. The defect
 
@@ -46,7 +99,10 @@ each cycle stays in phase. It needs a correction only for jitter, not for drift.
 
 ## 3. The change
 
-Four steps. Keep the capture path alone; `send_offset()` is correct.
+Four steps. (The original plan stopped at the recv side and left
+`send_offset()` alone; the capture side later developed the same defect —
+`dupWriteCycles` climbing at 2.2/s in the clean regime — and gained the
+mirror cursor. See the status header.)
 
 **Step 1. Add the cursor.** Add `uint64_t mRecvCursor{0}` beside
 `mLastSyncedWriteFrame` (`jackbridge/daemon/JackBridge.cpp:716`). The cursor
@@ -125,3 +181,36 @@ error, and a rate error needs a different fix.
 
 Do not add SRC to repair this. `CLAUDE.md` rule 3 holds: both sides share the
 CoreAudio clock, and netJACK2 owns the cross-clock resampling.
+
+## 7. Driver-architecture simplifications enabled (notes only)
+
+The cursor work clarified two driver-side simplifications. Neither is
+implemented here — both touch the plugin (`SA_Device.cpp`), which requires
+a coreaudiod restart to reload, and the device was not available.
+
+1. **Cap `kMaxIOBufferFrames` at `(STRBUFNUM/2)/4 = 1024`**
+   (`SA_Device.cpp:87`, currently `(STRBUFNUM/2)/2 = 2048`). At N = 2048
+   the ring is exactly 2N, and the send window
+   `[N−B−J, ring−B−J−P]` has width exactly equal to the steady walk's
+   sawtooth amplitude N−P: zero margin, so any one-frame perturbation —
+   a late head observation, a single missed cycle — snaps. The old
+   delta-term `send_offset()` had the same geometry and would have torn
+   there too; the cursor merely makes the arithmetic visible
+   (`test_send_window_no_margin_at_N2048` pins it). At N = 1024 the
+   window has 2048 frames of margin over the walk — the cap costs
+   nothing legitimate and removes an unsupportable configuration.
+
+2. **Delete the dead syncMode-0 path in `SA_Device::GetZeroTimeStamp`**
+   (`SA_Device.cpp:1679-1683`). `isSyncMode` is hardcoded `true` in the
+   daemon (`JackBridge.cpp:226`, FIXME noted there), so `shmSyncMode` is
+   always 1 once the daemon activates, and the driver's else-branch is
+   unreachable in practice. Removing it also retires the
+   `gDevice_AnchorHostTime` / `gDevice_NumberTimeStamps` /
+   `theHostTicksPerRingBuffer` maintenance that feeds only that branch
+   (1580, 1666-1672, 2106) — while keeping the `theHostTicksPerRingBuffer`
+   value itself, which the daemon-heartbeat watchdog threshold at 1657
+   also uses. No shm layout change, so no protocol bump.
+
+Both are pure simplifications — simpler software has fewer bugs — and both
+should land as one driver commit the next time a coreaudiod restart is
+convenient.

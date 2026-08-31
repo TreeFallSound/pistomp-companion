@@ -278,9 +278,9 @@ final class SettingsWindowController: NSWindowController {
         let jitter = (values["JitterFrames"] as? Int)
             ?? (values["JitterFrames"] as? String).flatMap(Int.init)
             ?? ConfigStore.defaultJitterFrames
-        // A value we do not offer (e.g. a hand-edited 320) must fall back to the
-        // default, NOT to item 0 — item 0 is "0 frames", which costs a full ring
-        // lap in each direction and would be written back on the next Save.
+        // A value we do not offer (e.g. a hand-edited 320) must fall back to
+        // the default, not to item 0. J=0 is valid but provides no burst
+        // cushion, so it should remain an explicit operator choice.
         jitterPopup.selectItem(withTitle: String(jitter))
         if jitterPopup.selectedItem == nil {
             jitterPopup.selectItem(withTitle: String(ConfigStore.defaultJitterFrames))

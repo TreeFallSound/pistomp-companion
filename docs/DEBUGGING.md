@@ -40,7 +40,7 @@ healthy line.
 |-------|---------|------------------------|
 | `protocolVersion` | equals the header | The daemon and the driver are different builds. Run `just rmshm`. |
 | `driverStatus` | `2 (STARTED)` | `1 (ACTIVE)` means no host holds the device. This is correct when nothing plays. |
-| `driverFault` | `0 (none)` | `DEVICE_NOT_ALIVE` means the driver feeds the DAW silence right now. |
+| `driverFault` | `0 (none)` | `DEVICE_NOT_ALIVE` means the driver feeds silence; `BAD_RING_GEOMETRY` means the current N/P/J cannot fit safely in the ring. |
 | `daemonAlive` | advances | A frozen counter means the daemon died or blocked. |
 | `slavePortsConnected` | `6 of 6` | `0 of 6` means the pi's netadapter is absent. Read the pi's journal. |
 | `deviceName` | the pi's name | An empty name means no daemon has attached. |
@@ -57,7 +57,7 @@ anything, or you measure an idle stack.
 | `healthSnaps` | `0` | The stall passed the snap threshold. |
 | `reanchorCount` | stable | A climbing count means the timeline diverges and cannot converge. |
 
-Read these two before and after every measurement. A diverged timeline
+Read these fields before and after every measurement. A diverged timeline
 reports `STARTED`, no fault, a live heartbeat and 6 of 6 ports while the audio
 is noise. It voids the measurement silently.
 
@@ -87,11 +87,22 @@ over a known window**. Section 4 gives the arithmetic.
 
 `recvResyncs` reads differently from the other four. The upstream read
 position is a free-running cursor: it advances every cycle and is snapped
-back to the HAL's write head only when it leaves the safe window. An
-occasional snap absorbs a scheduling hiccup and is harmless. A snap rate that
-holds steady over minutes means the cursor is masking a clock-rate error as
-periodic corrections — read `recvResyncs` first whenever the other four move,
-because a snap explains them.
+back to its target only when it leaves the safe window **and** the HAL's
+write head moved that cycle (the head-moved gate — see section 3.4). An
+occasional snap absorbs a scheduling hiccup and is harmless. A snap rate
+that holds steady over minutes means the cursor is masking a clock-rate
+error as periodic corrections — read `recvResyncs` first whenever the
+other four move, because a snap explains them.
+
+**Session-shape caveat.** A session that uses only one direction of the
+device never advances the other direction's head (a playback-only client
+never runs ReadInput; a recording-only client never runs WriteMix). The
+snap rules are gated on the head moving, and the counters only measure
+the cursor's own walk — so in a one-direction session the *idle*
+direction's counters read flat, which is correct but proves nothing about
+that direction. Do not read a flat idle-direction counter as "healthy
+capture path"; it is flat because nothing is happening there. The
+heartbeat and the anchor (section 2.2) remain the liveness signals.
 
 ### 2.4 Is the latency what you asked for?
 
@@ -113,29 +124,39 @@ the pi's `xruns_1m` beside these fields.
 
 ### 3.1 What they measure
 
-The daemon positions both rings in `RingProjector`
+The daemon positions both rings with free-running cursors
 (`jackbridge/daemon/RingProjector.hpp`):
 
-- `send_offset()` — where the daemon **writes** the pi's audio, for the HAL
-  to read. This is the capture direction, pi to DAW. Recomputed every cycle
-  from the HAL's read head.
-- The upstream read position — where the daemon **reads** the DAW's audio,
-  to send to the pi. This is the playback direction, DAW to pi. It is a
-  free-running cursor: it advances by P every cycle and is snapped to
-  `recv_target()` (one settled block behind the HAL's write head) only when
-  it leaves the safe window. `recvResyncs` counts those snaps.
+- The send position — where the daemon **writes** the pi's audio, for the
+  HAL to read. This is the capture direction, pi to DAW. A free-running
+  cursor (`mSendCursor`): it advances by P every cycle and is snapped to
+  `send_target()` (one block plus cushion ahead of the HAL's read head)
+  only when it leaves the safe window. This replaced the old delta-term
+  `send_offset()`, which reconstructed the position from the last head
+  sync and beat against the head's jumps. `sendResyncs` (on the 5 s
+  `health` os_log line) counts those snaps.
+- The recv position — where the daemon **reads** the DAW's audio, to send
+  to the pi. This is the playback direction, DAW to pi. The same design:
+  a free-running cursor (`mRecvCursor`) snapped to `recv_target()` (one
+  settled block behind the HAL's write head) only when it leaves the safe
+  window. `recvResyncs` counts those snaps.
 
-The counters compare each position against the position of the previous
-cycle. The comparison answers the audible question directly:
+The counters compare each cursor against the previous cycle's, as a
+signed absolute-frame difference. The comparison answers the audible
+question directly:
 
-- The position **repeated**. `ring_consume_stereo_interleaved` zeroes each
-  slot as it copies it, so a repeat on the read side sends silence.
-  This increments `dupReadCycles`.
-- The position **advanced by more than one period**. The frames in between
-  were never read. This increments `skipReadFrames` by that count.
+- The position **advanced by less than one period** (repeated or went
+  backward). `ring_consume_stereo_interleaved` zeroes each slot as it
+  copies it, so a repeat on the read side sends silence. This increments
+  `dupReadCycles` / `dupWriteCycles`.
+- The position **advanced by more than one period**. The frames in
+  between were never copied. This increments `skipReadFrames` /
+  `skipWriteFrames` by that count.
 
-`dupWriteCycles` and `skipWriteFrames` are the same two tests on
-`send_offset()`.
+The send and recv pairs are the same two tests on the two cursors. A forward
+snap advances farther than one period and its displacement lands in the skip
+counter. A backward snap is recorded as one dup cycle; that counter records the
+event, not its frame magnitude.
 
 ### 3.2 Why they count positions, not heads
 
@@ -159,6 +180,26 @@ Read `recvResyncs` before any of the four: a snap has a real audio cost and
 explains a same-window movement in the others. Occasional snaps absorb
 scheduling jitter; a steady snap rate means the two clock rates differ, and
 that needs a different fix (see section 6).
+
+### 3.4 The head-moved gate
+
+Both snap rules fire only on cycles where their head published a new
+position (`sendHeadMoved` / `recvHeadMoved`, captured in `check_progress`
+before the head cache updates). A head that has not moved means no IO op
+ran in that direction, so there is no live block to tear into and the
+cursor's open-loop walk is correct. This is what keeps a one-direction
+session healthy: before the gate, the frozen head made the error ramp look
+like a fault, and the rules snapped against it in a steady rhythm — the
+recv rule shipped that way in v12 and read as a phantom clock-rate error in
+recording-only sessions (dupReadCycles climbing ~6666 over a 27 s window,
+per the session-shape fuzz).
+
+The gate does not weaken the rules on the cycles that matter: when the
+head moves again, CoreAudio's sample time is host-clock-derived, so a
+resumed head jumps by exactly the frames the clock advanced and the
+walk's error is preserved — no snap, no cost. Only a head that genuinely
+dropped frames (a device reset, not a pause) presents a real hazard at
+resume, and the first moved-head cycle snaps it back.
 
 ---
 
@@ -291,13 +332,18 @@ to ring positions.
 
 The loss fell from 87.5% of frames to 0.1%.
 
-**Residual, closed.** The 12 remaining events were a beat: eight JACK
-cycles and one HAL cycle do not divide evenly in time, so the walk hit its
-clamp while the head had not moved, one cycle repeated, and the next jumped
-two periods. The free-running read cursor removed the beat: the position
-now advances uniformly every cycle, and `docs/plan-free-running-cursor.md`
-records the design. Its successor risk is a clock-rate mismatch, which
-surfaces as a steady `recvResyncs` rate — the symptom index above covers it.
+**Residual, closed in two stages.** The 12 remaining events were a beat:
+eight JACK cycles and one HAL cycle do not divide evenly in time, so the
+walk hit its clamp while the head had not moved, one cycle repeated, and
+the next jumped two periods. The free-running read cursor removed the beat
+on the playback side. The capture side later showed the same family of
+defect through the delta term (`dupWriteCycles` climbing 2.2/s in the
+clean regime): `send_offset()` reconstructed the write position from the
+last head sync, and the reconstruction beat against the head's jumps. The
+send cursor closed it — both directions now hold the same design, recorded
+in `docs/plan-free-running-cursor.md`. Its successor risk is a clock-rate
+mismatch, which surfaces as a steady `sendResyncs`/`recvResyncs` rate on
+the 5 s health os_log line — the symptom index above covers it.
 
 ---
 
