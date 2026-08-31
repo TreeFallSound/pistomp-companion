@@ -123,10 +123,11 @@ cursor work adds no latency — verify nothing moved by comparing against
 
 ## 7. After the live pass
 
-- Close the blocked verification todo.
-- The driver simplifications (§7 of the plan doc) can land as one commit
-  with a convenient coreaudiod restart: cap `kMaxIOBufferFrames` at 1024,
-  delete the dead syncMode-0 path.
+- The HAL buffer cap is implemented. A coreaudiod restart is still required
+  for hosts to observe the new 32..1024 range.
+- The remaining driver simplification is the syncMode-0 timestamp cleanup;
+  do not land it without the bootstrap and daemon-death checks described in
+  the plan.
 - Optionally revisit J sizing with the new counters (the J=128-vs-maxBurst
   question in LATENCY-MODEL.md) — that is a measurement campaign, not a
   code change.

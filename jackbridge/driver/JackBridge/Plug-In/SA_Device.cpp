@@ -75,16 +75,13 @@
 #include <CoreAudio/AudioHardware.h>
 
 //	IO buffer size bounds, in frames (kAudioDevicePropertyBufferFrameSizeRange).
-//
-//	The maximum is half the shm ring (STRBUFNUM/2 frames): the daemon writes
-//	JitterFrames ahead of the HAL read head inside that same ring, so a cycle
-//	that consumed more than half of it would read across the write head.
-//	The default matches the JACK period the pi runs, so a host that never asks
-//	gets the size the link is actually built around instead of CoreAudio's
-//	generic 128 — _HW_Open narrows it to the daemon's published period when
-//	there is one.
+// The maximum is one quarter of the shm ring: the daemon's cursor geometry
+// requires ring_frames > 2 * max(HAL block, JACK period) + JitterFrames, and
+// the live 4096-frame ring with JitterFrames=128 needs margin below 1984.
+// The default matches the JACK period the pi runs, so a host that never asks
+// gets the size the link is built around instead of CoreAudio's generic 128.
 static constexpr UInt32 kMinIOBufferFrames     = 32;
-static constexpr UInt32 kMaxIOBufferFrames     = (STRBUFNUM / 2) / 2;
+static constexpr UInt32 kMaxIOBufferFrames     = (STRBUFNUM / 2) / 4;
 static constexpr UInt32 kDefaultIOBufferFrames = JB_REFERENCE_PERIOD_FRAMES;
 
 //==================================================================================================

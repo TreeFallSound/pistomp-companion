@@ -61,10 +61,9 @@ for the measurement that found the first one.
 > displacement lands in the skip-frame counters; backward snaps increment the
 > dup-cycle counter, which does not retain their magnitude.
 >
-> **Degenerate N=2048:** ring = 2N leaves the send window with exactly the
-> walk's sawtooth amplitude (N−P) and zero margin — any one-frame
-> perturbation snaps. Cap `kMaxIOBufferFrames` at 1024 (driver note; the
-> plugin side needs a coreaudiod restart, deliberately not done here).
+> **HAL buffer cap:** `kMaxIOBufferFrames` is now 1024. The 2048-frame
+> degenerate geometry is no longer advertised; the plugin needs a
+> coreaudiod restart before the new range takes effect.
 >
 > The hardware measurement of section 5 still needs to be taken against
 > the four N/P ratios.
@@ -182,35 +181,23 @@ error, and a rate error needs a different fix.
 Do not add SRC to repair this. `CLAUDE.md` rule 3 holds: both sides share the
 CoreAudio clock, and netJACK2 owns the cross-clock resampling.
 
-## 7. Driver-architecture simplifications enabled (notes only)
+## 7. Driver-architecture simplifications
 
-The cursor work clarified two driver-side simplifications. Neither is
-implemented here — both touch the plugin (`SA_Device.cpp`), which requires
-a coreaudiod restart to reload, and the device was not available.
+The cursor work clarified two driver-side simplifications. The HAL buffer cap
+is implemented; the timestamp-mode cleanup remains deferred because it changes
+the bootstrap path and requires a coreaudiod restart.
 
-1. **Cap `kMaxIOBufferFrames` at `(STRBUFNUM/2)/4 = 1024`**
-   (`SA_Device.cpp:87`, currently `(STRBUFNUM/2)/2 = 2048`). At N = 2048
-   the ring is exactly 2N, and the send window
-   `[N−B−J, ring−B−J−P]` has width exactly equal to the steady walk's
-   sawtooth amplitude N−P: zero margin, so any one-frame perturbation —
-   a late head observation, a single missed cycle — snaps. The old
-   delta-term `send_offset()` had the same geometry and would have torn
-   there too; the cursor merely makes the arithmetic visible
-   (`test_send_window_no_margin_at_N2048` pins it). At N = 1024 the
-   window has 2048 frames of margin over the walk — the cap costs
-   nothing legitimate and removes an unsupportable configuration.
+1. **Implemented: cap `kMaxIOBufferFrames` at `(STRBUFNUM/2)/4 = 1024`.**
+   The 4096-frame ring with J=128 requires `max(N, P) < 1984`. At N=2048,
+   the send walk has no safety margin; at N=1024 it has ample margin.
 
-2. **Delete the dead syncMode-0 path in `SA_Device::GetZeroTimeStamp`**
+2. **Deferred: delete syncMode 0 as an operating mode.**
    (`SA_Device.cpp:1679-1683`). `isSyncMode` is hardcoded `true` in the
-   daemon (`JackBridge.cpp:226`, FIXME noted there), so `shmSyncMode` is
-   always 1 once the daemon activates, and the driver's else-branch is
-   unreachable in practice. Removing it also retires the
-   `gDevice_AnchorHostTime` / `gDevice_NumberTimeStamps` /
-   `theHostTicksPerRingBuffer` maintenance that feeds only that branch
-   (1580, 1666-1672, 2106) — while keeping the `theHostTicksPerRingBuffer`
-   value itself, which the daemon-heartbeat watchdog threshold at 1657
-   also uses. No shm layout change, so no protocol bump.
+   daemon (`JackBridge.cpp:226`), so `shmSyncMode` is 1 once the daemon
+   activates. The driver must still retain a local self-anchor for bootstrap
+   and stale-daemon recovery; freshness, not this field, should select between
+   the daemon anchor and that fallback. Keep the field for diagnostics until a
+   protocol bump can reclaim it.
 
-Both are pure simplifications — simpler software has fewer bugs — and both
-should land as one driver commit the next time a coreaudiod restart is
-convenient.
+The remaining timestamp cleanup should land only with a convenient coreaudiod
+restart and explicit bootstrap/recovery validation.
