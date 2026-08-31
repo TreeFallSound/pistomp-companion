@@ -132,19 +132,14 @@ mod-host.
 | hal | 64 | 2 | 7.3 |
 
 The buffer size moved the result by a factor of 5. The workgroup choice moved
-it by a factor of 2. The buffer size is the larger effect, and it is not
-under our control: **the driver implements neither
-`kAudioDevicePropertyBufferFrameSize` nor
-`kAudioDevicePropertyBufferFrameSizeRange`.** `SA_Device.cpp` handles neither
-selector. CoreAudio therefore gives every host its generic 128 frame default,
-and a host cannot ask for 64.
+it by a factor of 2. The buffer size is the larger effect. The HAL driver now
+advertises `kAudioDevicePropertyBufferFrameSize` and its `32..1024` range,
+with a 512-frame default independent of the JACK/netJACK period. A host may
+choose another HAL N without changing the matched JACK P.
 
-At a matched 64 frame buffer, `hal` beat `backend` by a factor of 1.7.
-`config.plist` ships `backend`.
-
-This has a consequence for the order of work. You cannot settle the workgroup
-question while the largest term is unpinned and the shipped default disagrees
-with the only matched measurement. Paragraph 3.3 handles this.
+The table above is historical: it measured the old generic 128-frame default
+and the experimental matched 64-frame setting. Re-run the workgroup comparison
+after installing this driver, using the active HAL N as part of the test label.
 
 ### 2.9 The timeline can diverge, and nothing brings it back
 

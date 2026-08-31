@@ -216,6 +216,29 @@ if [ -z "$CLOCK_UID" ]; then
     [ -x "$DETECT" ] || { echo "jackd-launch: clock device detector missing" >&2; exit 1; }
     CLOCK_UID=$("$DETECT") || { echo "jackd-launch: no usable CoreAudio clock device" >&2; exit 1; }
 fi
+
+# JACK's CoreAudio driver silently falls back to the system default when a
+# configured UID has disappeared. If that default is JackBridge, this creates
+# a feedback loop: jackd clocks itself from the bridge it is supposed to feed.
+# Validate explicit UIDs before starting JACK so a disconnected device fails
+# loudly instead of selecting JackBridge.
+if [ -n "$CLOCK_UID" ]; then
+    if ! "$JACKD" -n "jackbridge-clock-probe-$$" -d coreaudio -l 2>&1 |
+        /usr/bin/awk -v wanted="$CLOCK_UID" '
+            /internal name =/ {
+                line = $0
+                sub(/^.*internal name = '\''/, "", line)
+                sub(/'\''.*/, "", line)
+                if (line == wanted) found = 1
+            }
+            END { exit found ? 0 : 1 }
+        '
+    then
+        echo "jackd-launch: configured CoreAudio clock device is unavailable: $CLOCK_UID" >&2
+        echo "jackd-launch: clear ClockDeviceUID or select an available UID; refusing fallback" >&2
+        exit 1
+    fi
+fi
 [ -n "$PERIOD" ] || { echo "jackd-launch: period was not supplied by coordinator" >&2; exit 1; }
 echo "jackd-launch: using ClockDeviceUID=$CLOCK_UID rate=$RATE period=$PERIOD" >&2
 

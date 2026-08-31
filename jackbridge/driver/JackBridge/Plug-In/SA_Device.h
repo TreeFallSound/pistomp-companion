@@ -184,15 +184,12 @@ private:
 	UInt64						mStartCount;
 	UInt64						mSampleRateShadow;
 	UInt32						mRingBufferFrameSize;
-	//	The IO buffer size the host asked for, in frames
-	//	(kAudioDevicePropertyBufferFrameSize). Until this device implemented the
-	//	selector, CoreAudio handed every host its generic 128-frame default and
-	//	no host could ask for 64 — which is the single largest term in the
-	//	Mac-side xrun rate (docs/plan-tuning.md 2.8).
-	UInt32						mIOBufferFrameSize;
-	//	Read on the IO thread (GetZeroTimeStamp reconciles shmDriverStatus
-	//	against it), written on the control threads by _HW_Open / _HW_StartIO /
-	//	_HW_StopIO / _HW_Close. Atomic so that read is not a data race.
+	//	The current host-side HAL buffer size N, in frames. N is independent
+	//	from the JACK/netJACK period P; the daemon receives the actual N on each
+	//	IO callback and projects it in its ring geometry.
+	std::atomic<UInt32>			mIOBufferFrameSize;
+	//	The value is read by property queries and written by the buffer-size
+	//	setter; relaxed ordering is sufficient because it is local driver state.
 	std::atomic<UInt32>     	mDriverStatus;
 
 	// Daemon liveness — see SA_Device.cpp:GetZeroTimeStamp for the staleness

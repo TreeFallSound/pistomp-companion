@@ -183,15 +183,18 @@ CoreAudio clock, and netJACK2 owns the cross-clock resampling.
 
 ## 7. Driver-architecture simplifications
 
-The cursor work clarified two driver-side simplifications. The HAL buffer cap
-is implemented; the timestamp-mode cleanup remains deferred because it changes
-the bootstrap path and requires a coreaudiod restart.
+The cursor work clarified three driver-side changes. The HAL buffer cap and
+local HAL default are now independent of the JACK period.
 
 1. **Implemented: cap `kMaxIOBufferFrames` at `(STRBUFNUM/2)/4 = 1024`.**
    The 4096-frame ring with J=128 requires `max(N, P) < 1984`. At N=2048,
    the send walk has no safety margin; at N=1024 it has ample margin.
 
-2. **Deferred: delete syncMode 0 as an operating mode.**
+2. **Implemented: default the HAL buffer to 512 frames independently of JACK.**
+   The Pi and Mac JACK/netJACK engines still share P, while CoreAudio may use
+   any N in the advertised 32..1024 range. The daemon projects the actual HAL
+   block size on each IO callback.
+3. **Deferred: delete syncMode 0 as an operating mode.**
    (`SA_Device.cpp:1679-1683`). `isSyncMode` is hardcoded `true` in the
    daemon (`JackBridge.cpp:226`), so `shmSyncMode` is 1 once the daemon
    activates. The driver must still retain a local self-anchor for bootstrap

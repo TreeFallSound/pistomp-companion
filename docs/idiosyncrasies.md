@@ -111,9 +111,13 @@ HAL anchor published in shared memory. Mac jackd must use the CoreAudio
 backend; netJACK2 performs the Pi↔Mac clock crossing at the network boundary.
 There is no SRC inside JackBridge.
 
-### Frames-per-buffer and JACK period must agree
-The package defaults both sides to 64-frame periods. Changing one side alone
-can make netJACK2's resampler unstable; change the Pi and Mac settings together.
+### JACK periods and HAL buffer are separate
+The Pi and Mac JACK/netJACK periods must agree: changing one JACK period alone
+can make the netJACK2 resampler unstable, so change those two settings together.
+The CoreAudio HAL buffer is different. The driver advertises 32..1024 frames
+and defaults to 512; a host may choose a larger or smaller HAL buffer without
+changing either JACK period. The daemon's cursor projection handles that N/P
+mismatch.
 
 ## CoreAudio / HAL
 

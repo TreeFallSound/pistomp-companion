@@ -2,9 +2,9 @@
 
 Run this when the pi-stomp is back on the network. Everything below is
 observation only except the two reload steps. Expected state: protocol v12
-daemon built from this worktree (`just daemon` succeeded), driver untouched
-(no plugin changes — the driver notes in `plan-free-running-cursor.md` §7
-are deliberately NOT implemented and need a coreaudiod restart when done).
+daemon and HAL driver built from this worktree (`just daemon` and `just driver`
+succeeded), with the Pi and Mac JACK periods matched while the CoreAudio HAL
+buffer remains independently selectable. No plugin changes.
 
 ## 0. Reload the stack
 
@@ -123,8 +123,9 @@ cursor work adds no latency — verify nothing moved by comparing against
 
 ## 7. After the live pass
 
-- The HAL buffer cap is implemented. A coreaudiod restart is still required
-  for hosts to observe the new 32..1024 range.
+- The HAL buffer cap and independent 512-frame default are implemented. A
+  coreaudiod restart is required for hosts to observe the new default and the
+  32..1024 range. Confirm the active N through the host or driver log.
 - The remaining driver simplification is the syncMode-0 timestamp cleanup;
   do not land it without the bootstrap and daemon-death checks described in
   the plan.
