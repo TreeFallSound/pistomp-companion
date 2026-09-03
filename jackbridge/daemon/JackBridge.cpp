@@ -260,6 +260,9 @@ public:
         shmDupWriteCycles->store(0, std::memory_order_relaxed);
         shmSkipWriteFrames->store(0, std::memory_order_relaxed);
         shmRecvResyncs->store(0, std::memory_order_relaxed);
+        shmSendResyncs->store(0, std::memory_order_relaxed);
+        shmDaemonSendCursor->store(0, std::memory_order_relaxed);
+        shmDaemonRecvCursor->store(0, std::memory_order_relaxed);
         // Take the app's current nonce as already-seen: a nonce left in a
         // region from a previous run is not a request aimed at us.
         mLastResyncRequest = shmResyncRequest->load(std::memory_order_acquire);
@@ -438,6 +441,15 @@ public:
         }
         mLastDriverStatus = currentStatus;
 
+        // Re-assert the mode we own. _HW_Open stores 0 unconditionally, so a
+        // plug-in reload under a live daemon used to leave it 0 permanently:
+        // the old store(1) ran only on first activation and isActive never
+        // clears. Same defence the driver runs for driverStatus.
+        if (isActive && isSyncMode &&
+            shmSyncMode->load(std::memory_order_relaxed) != 1) {
+            shmSyncMode->store(1, std::memory_order_relaxed);
+        }
+
         // Requested re-anchor. RESYNC_REQUEST is the app's field (the menu
         // bar writes a nonce into it); the driver honours it for its own
         // liveness state, and we honour it for the timeline — which is the
@@ -456,7 +468,7 @@ public:
             // Driver isn't working. Just return zero buffer;
             for(int i=0; i<NUM_OUTPUT_CHANNELS; i++) {
                 aout[i] = (sample_t*)jack_port_get_buffer(audioOut[i], nframes);
-                bzero(aout[i], STRBUFSZ);
+                bzero(aout[i], (size_t)nframes * sizeof(sample_t));
             }
             return 0;
         }
@@ -466,11 +478,16 @@ public:
 
         if (!isActive) {
             ncalls = 0;
-            FrameNumber = 0;
+            // Continue the region's timeline instead of restarting it. Under
+            // syncMode 1 the driver reports NUMBER_TIMESTAMPS as the device
+            // sample time, so seeding 0 here walked it backwards on every
+            // daemon restart — a discontinuity no host re-acquires from.
+            FrameNumber = shmNumberTimeStamps->load(std::memory_order_acquire)
+                        * RingFrames;
+            mNextAnchorFrame = FrameNumber;
 
             if (isSyncMode) {
                 shmSyncMode->store(1, std::memory_order_relaxed);
-                shmNumberTimeStamps->store(0, std::memory_order_relaxed);
                 shmSeed->fetch_add(1, std::memory_order_release);
             }
             // Seed the upstream read cursor on the first active cycle: the
@@ -511,11 +528,15 @@ public:
         // re-anchor. Relaxed store for the host time, release store for the
         // sample-time count so a reader never sees the new count with the
         // old anchor.
-        if ((FrameNumber % RingFrames) == 0) {
+        // Boundary, not a modulus: FrameNumber steps by nframes, so a period
+        // that does not divide RingFrames (jackd accepts -p 480) hit the old
+        // test once at 0 and never again.
+        if (FrameNumber >= mNextAnchorFrame) {
             shmZeroHostTime->store(mach_absolute_time(),
                                    std::memory_order_relaxed);
             shmNumberTimeStamps->store(FrameNumber / RingFrames,
                                        std::memory_order_release);
+            mNextAnchorFrame = FrameNumber + RingFrames;
         }
 
         if ((!isSyncMode) && isVerbose && ((ncalls++) % 100) == 0) {
@@ -574,6 +595,11 @@ public:
     void auto_wire() {
         wire_direction("from_slave", JackPortIsOutput, audioIn, nAudioIn);
         wire_direction("to_slave",   JackPortIsInput,  audioOut, nAudioOut);
+    }
+
+    // Idempotent: on_shutdown already did this on the jackd-stop path.
+    void mark_departed() {
+        shmDaemonAlive->store(0, std::memory_order_release);
     }
 
     void on_shutdown() override {
@@ -701,6 +727,7 @@ private:
     }
 
     bool isActive, isSyncMode, isVerbose;
+    uint64_t mNextAnchorFrame{0};
     uint64_t lastTraceFrame;
     int64_t ncalls;
     uint64_t mLastDriverStatus;
@@ -832,6 +859,7 @@ private:
                 in[j*2 + 0], in[j*2 + 1], nframes);
         }
         mSendCursor += (uint64_t)nframes;
+        shmDaemonSendCursor->store(mSendCursor, std::memory_order_release);
         return nframes;
     }
 
@@ -847,6 +875,7 @@ private:
                 out[j*2 + 0], out[j*2 + 1], nframes);
         }
         mRecvCursor += (uint64_t)nframes;
+        shmDaemonRecvCursor->store(mRecvCursor, std::memory_order_relaxed);
         return nframes;
     }
 
@@ -1011,6 +1040,7 @@ private:
         shmNumberTimeStamps->store(FrameNumber / RingFrames,
                                    std::memory_order_release);
         shmSeed->fetch_add(1, std::memory_order_release);
+        mNextAnchorFrame = FrameNumber + RingFrames;
         // The deficit is measured from the anchor, so it goes with it. The
         // cursors are timeline positions, so they re-seed here too.
         mSendCursor = mCachedHalInputReadHead
@@ -1200,6 +1230,7 @@ private:
             if (cadence.send_outside_window(sendErr)) {
                 mSendCursor += (uint64_t)(-sendErr);
                 mSendResyncs++;
+                shmSendResyncs->store(mSendResyncs, std::memory_order_relaxed);
             }
         }
         // Cadence is measured from the absolute cursor positions used by the
@@ -1412,6 +1443,11 @@ main(int argc, char** argv)
         break;
     }
     JB_LOG_DEFAULT(jb_log_daemon(), "caught signal %d, shutting down", sig);
+
+    // Before teardown: the HAL needs ~426 ms to call a frozen heartbeat stale,
+    // and it records the ring as live audio for all of it. on_shutdown does
+    // this; SIGTERM (jackbridge-ctl stop, launchctl bootout) did not.
+    jackBridge[0]->mark_departed();
 
     delete jackBridge[0];
     // Don't shm_unlink — the HAL is the shm owner; unlinking would force a

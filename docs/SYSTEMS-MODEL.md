@@ -337,13 +337,17 @@ symptom.
 
 ### 5.2 B11 — the `J` cushion
 
-`J` must cover the worst-case *relative lateness* of the two threads. Under
-a fully-correlated stall model, `J` must equal the observed `maxBurst`.
+`J` must cover the worst-case *relative lateness* of the two threads, plus
+any excess of `maxBurst` over `N`.
 
-**The two recorded `maxBurst` values disagree.** `docs/LATENCY-MODEL.md:319`
-says 472 frames. `jackbridge/shared/JackBridge.h:319` says 272. Both cite "a
-2-hour live session". Resolve this from a live driver health line before you
-size `J` from either number.
+**`maxBurst` is the largest IO block CoreAudio delivered in the window**
+(`SA_Device.cpp:1745`), not a stall depth. Two values are on record, 472 and
+272 frames, in two different sessions. Neither has been reproduced.
+
+**Measured 2026-09-02 at N=64, P=64, J=128:** `maxBurst=64` across 40
+consecutive windows, with `starveBlocks=0` and `lead=192` pinned. CoreAudio
+did not bunch, so `J` was 2× the requirement. **At this `N` the boundary is
+not under-cushioned.** Reproduce the bunching before buying cushion for it.
 
 The ring is not the obstacle. At `N` = 1024, `2E + J` = 2560 against 4096
 available, so about **1900 frames are free**. `J` = 128 uses 7 % of the
@@ -398,7 +402,7 @@ decides that a controller is needed. Jitter decides how big the ring is.
 | B4 `G/2` | 512 fr | ~1028 fr | **UNDER by ~516** |
 | B8 `L x P` | 256 fr | 384 fr | **UNDER by 128** |
 | B11 `E` | `max(N,P)` | `N+P-gcd(N,P)` | **UNDER up to 56 for odd `N`** |
-| B11 `J` | 128 fr | see 5.2 | **UNDER, amount disputed** |
+| B11 `J` | 128 fr | see 5.2 | **adequate at N=64; unmeasured under bunching** |
 | shm ring | 4096 fr | 2560 fr worst | **OVER by ~1500 — free** |
 | socket buffers, wire | kernel default | ~1 KB/cycle | **OVER ~100x — not the constraint** |
 
@@ -520,7 +524,7 @@ closes.
 | §5.1 | `E(N,P)` is absent from the advertised latency. | arithmetic only |
 | §5.1 | The clearance uses `max(N,P)`, exact only for power-of-two `N`. | small, latent |
 | P5 | The re-anchor requires 3 consecutive windows. The snap fires on `k` = 1. | small |
-| P1, §5.2 | `J`, `L` and `G` are unmeasured against the tails, and the two `maxBurst` records disagree. | a measurement campaign |
+| P1, §5.2 | `L` and `G` are unmeasured against the tails. `J` is measured adequate at N=64 (2026-09-02) and unmeasured under CoreAudio bunching. | a measurement campaign |
 | P2 | The Mac side has only position corrections. Rule 3 forbids a rate correction there, so this deviation is accepted by design. | accepted |
 | P3, P4, 6.2.3, 6.2.4 | The netadapter resets both rings and grows `G` on failure. | jack2 fork |
 | 6.2.5 | One PI controller serves two rings, and the uncontrolled one faces the larger measured jitter. | jack2 fork |

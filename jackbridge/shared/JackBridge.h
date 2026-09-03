@@ -42,7 +42,7 @@
 // IPC contract version. Bump on every shm layout change (sizes, offsets, field
 // types, sync semantics). Phase 2.3 wires the handshake — daemon and HAL both
 // refuse to attach on mismatch.
-#define JACKBRIDGE_PROTOCOL_VERSION 12
+#define JACKBRIDGE_PROTOCOL_VERSION 13
 
 // shm sync fields are std::atomic<uint64_t> placed by reinterpret_cast over the
 // mapped region. Both targets must agree that the type is lock-free and the
@@ -68,12 +68,15 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 //   Driver (HAL) owns : DRIVER_STATUS, HAL_ANCHOR_*,
 //                       HAL_INPUT_READ_HEAD, HAL_OUTPUT_WRITE_HEAD,
 //                       HAL_NFRAMES, HAL_SAMPLE_RATE,
-//                       READ/WRITE_FRAME_NUMBER(i), DRIVER_FAULT bit 0
+//                       READ/WRITE_FRAME_NUMBER(i), DRIVER_FAULT bit 0,
+//                       HAL_INPUT_STARVE_BLOCKS, HAL_INPUT_STARVE_FRAMES
 //   Daemon owns       : DAEMON_ALIVE, SLAVE_PORTS_CONNECTED, DAEMON_XRUNS,
 //                       JITTER_FRAMES, NET_LATENCY_CYCLES, NET_RING_FRAMES,
 //                       HEALTH_DELTA_MAX, HEALTH_SNAPS, REANCHOR_COUNT,
 //                       DUP_READ_CYCLES, SKIP_READ_FRAMES, DUP_WRITE_CYCLES,
-//                       SKIP_WRITE_FRAMES, RECV_RESYNCS, DRIVER_FAULT bit 1
+//                       SKIP_WRITE_FRAMES, RECV_RESYNCS, SEND_RESYNCS,
+//                       DAEMON_SEND_CURSOR, DAEMON_RECV_CURSOR,
+//                       DRIVER_FAULT bit 1
 //   App owns          : RESYNC_REQUEST (write-only; the driver and the daemon
 //                       both read it and re-anchor their own side)
 //   Mode-dependent    : NUMBER_TIMESTAMPS, ZERO_HOST_TIME, SEED. SYNC_MODE
@@ -131,6 +134,11 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 // 0x0290      :    cadence: daemon cycles that re-wrote against an unchanged read head (daemon)
 // 0x0298      :    cadence: frames the read head skipped past one block (daemon)
 // 0x02a0      :    cadence: upstream cursor snap-to-target corrections (daemon)
+// 0x02a8      :    cadence: downstream cursor snap-to-target corrections (daemon)
+// 0x02b0      :    daemon send cursor, absolute frames (daemon)
+// 0x02b8      :    daemon recv cursor, absolute frames (daemon)
+// 0x02c0      :    HAL capture blocks read past the send cursor (driver)
+// 0x02c8      :    HAL capture frames read past the send cursor (driver)
 // 0x10000     : Upstream buffer #0 (Driver -> Application)
 // 0x18000     : Downstream buffer #0 (Application -> Driver)
 // 0x20000     : Upstream buffer #0 (Driver -> Application)
@@ -265,6 +273,23 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 #define JB_OFF_DUP_WRITE_CYCLES    (0x290)
 #define JB_OFF_SKIP_WRITE_FRAMES   (0x298)
 #define JB_OFF_RECV_RESYNCS        (0x2a0)
+#define JB_OFF_SEND_RESYNCS        (0x2a8)
+
+// Protocol 13. The stock, not the transition. The four cadence counters above
+// and RECV/SEND_RESYNCS all record *events*; none of them says how full the
+// ring is, so a boundary holding with no margin reads identically to one
+// holding comfortably. These two publish the daemon's absolute cursors, which
+// with the HAL heads give the live ring occupancy on both sides.
+#define JB_OFF_DAEMON_SEND_CURSOR  (0x2b0)
+#define JB_OFF_DAEMON_RECV_CURSOR  (0x2b8)
+
+// Driver-owned capture starvation. The HAL cannot otherwise tell a fresh
+// block from one a lap old: below the ~426ms heartbeat threshold it memcpy's
+// whatever the ring holds, so a short daemon stall put stale audio into the
+// DAW's take with nothing recording that it happened. A block whose end lies
+// past the published send cursor was not fully written when it was read.
+#define JB_OFF_HAL_INPUT_STARVE_BLOCKS (0x2c0)
+#define JB_OFF_HAL_INPUT_STARVE_FRAMES (0x2c8)
 #define JB_DEVICE_NAME_FALLBACK    "pi-Stomp"
 
 /******************************************************************************
@@ -461,7 +486,18 @@ static_assert(JB_OFF_DUP_READ_CYCLES >= JB_OFF_DEVICE_NAME + JB_DEVICE_NAME_MAX,
 static_assert(JB_OFF_RECV_RESYNCS >= JB_OFF_SKIP_WRITE_FRAMES + 8 &&
               (JB_OFF_RECV_RESYNCS % 8) == 0,
               "resync counter overlaps or is misaligned");
-static_assert(JB_OFF_RECV_RESYNCS + 8 <= STRBUF_U0,
+static_assert(JB_OFF_SEND_RESYNCS        >= JB_OFF_RECV_RESYNCS + 8 &&
+              JB_OFF_DAEMON_SEND_CURSOR  >= JB_OFF_SEND_RESYNCS + 8 &&
+              JB_OFF_DAEMON_RECV_CURSOR  >= JB_OFF_DAEMON_SEND_CURSOR + 8 &&
+              JB_OFF_HAL_INPUT_STARVE_BLOCKS >= JB_OFF_DAEMON_RECV_CURSOR + 8 &&
+              JB_OFF_HAL_INPUT_STARVE_FRAMES >= JB_OFF_HAL_INPUT_STARVE_BLOCKS + 8 &&
+              (JB_OFF_SEND_RESYNCS % 8) == 0 &&
+              (JB_OFF_DAEMON_SEND_CURSOR % 8) == 0 &&
+              (JB_OFF_DAEMON_RECV_CURSOR % 8) == 0 &&
+              (JB_OFF_HAL_INPUT_STARVE_BLOCKS % 8) == 0 &&
+              (JB_OFF_HAL_INPUT_STARVE_FRAMES % 8) == 0,
+              "protocol 13 fields must not overlap and must stay 8-byte aligned");
+static_assert(JB_OFF_HAL_INPUT_STARVE_FRAMES + 8 <= STRBUF_U0,
               "resync counter runs into the first ring buffer");
 static_assert(JB_OFF_SKIP_READ_FRAMES  >= JB_OFF_DUP_READ_CYCLES + 8 &&
               JB_OFF_DUP_WRITE_CYCLES  >= JB_OFF_SKIP_READ_FRAMES + 8 &&
@@ -521,6 +557,11 @@ protected:
     std::atomic<uint64_t> *shmSlavePortsConnected; // daemon writes
     std::atomic<uint64_t> *shmDaemonXRuns;         // daemon writes
     std::atomic<uint64_t> *shmRecvResyncs;         // daemon writes (upstream cursor corrections)
+    std::atomic<uint64_t> *shmSendResyncs;         // daemon writes (downstream cursor corrections)
+    std::atomic<uint64_t> *shmDaemonSendCursor;    // daemon writes (absolute frames)
+    std::atomic<uint64_t> *shmDaemonRecvCursor;    // daemon writes (absolute frames)
+    std::atomic<uint64_t> *shmHalInputStarveBlocks;// driver writes
+    std::atomic<uint64_t> *shmHalInputStarveFrames;// driver writes
     std::atomic<uint64_t> *shmDriverFault;         // driver bit 0, daemon bit 1
     std::atomic<uint64_t> *shmResyncRequest;       // app writes, driver echoes
     std::atomic<uint64_t> *shmJitterFrames;        // daemon writes (protocol 9)
@@ -631,6 +672,11 @@ protected:
         shmDupWriteCycles      = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DUP_WRITE_CYCLES);
         shmSkipWriteFrames     = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_SKIP_WRITE_FRAMES);
         shmRecvResyncs         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_RECV_RESYNCS);
+        shmSendResyncs         = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_SEND_RESYNCS);
+        shmDaemonSendCursor    = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DAEMON_SEND_CURSOR);
+        shmDaemonRecvCursor    = reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_DAEMON_RECV_CURSOR);
+        shmHalInputStarveBlocks= reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_INPUT_STARVE_BLOCKS);
+        shmHalInputStarveFrames= reinterpret_cast<std::atomic<uint64_t>*>(shm_base+JB_OFF_HAL_INPUT_STARVE_FRAMES);
 
         for(int i=0; i<MAX_STREAMS; i++) {
             buf_up[i]   = (sample_t*)(shm_base + STRBUF_UP(i));

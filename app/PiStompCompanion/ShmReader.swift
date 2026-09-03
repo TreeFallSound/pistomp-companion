@@ -67,13 +67,18 @@ struct ShmSnapshot {
     /// Occasional snaps absorb scheduling jitter; a steady climb means the
     /// two clock rates differ.
     var recvResyncs: UInt64 = 0
+    var sendResyncs: UInt64 = 0
+    var daemonSendCursor: UInt64 = 0
+    var daemonRecvCursor: UInt64 = 0
+    var halStarveBlocks: UInt64 = 0
+    var halStarveFrames: UInt64 = 0
 
     /// Hardcoded on purpose, and it must stay that way. The offsets below are
     /// hand-copied literals the compiler cannot check against
     /// shared/JackBridge.h, so this constant is the tripwire that forces
     /// someone to re-verify them on a layout change. Deriving it from the
     /// header would let the app recompile past a bump and read stale offsets.
-    static let expectedProtocolVersion: UInt64 = 12
+    static let expectedProtocolVersion: UInt64 = 13
     static let driverStatusStarted: UInt64 = 2
     /// Full complement of daemon slave ports (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS).
     static let slavePortsFull: UInt64 = 6
@@ -215,6 +220,11 @@ final class ShmReader {
         s.dupWriteCycles      = field(0x290)
         s.skipWriteFrames     = field(0x298)
         s.recvResyncs         = field(0x2a0)
+        s.sendResyncs         = field(0x2a8)
+        s.daemonSendCursor    = field(0x2b0)
+        s.daemonRecvCursor    = field(0x2b8)
+        s.halStarveBlocks     = field(0x2c0)
+        s.halStarveFrames     = field(0x2c8)
         return s
     }
 }

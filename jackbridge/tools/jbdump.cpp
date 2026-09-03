@@ -154,6 +154,34 @@ int main(int argc, char** argv)
            skipWrite ? "   (ring positions the daemon never wrote)" : "");
     printf("  recvResyncs           %" PRIu64 "%s\n", resyncs,
            resyncs ? "   (read-cursor snaps: a steady climb means a rate mismatch)" : "");
+    uint64_t sendResyncs = field(base, JB_OFF_SEND_RESYNCS);
+    printf("  sendResyncs           %" PRIu64 "%s\n", sendResyncs,
+           sendResyncs ? "   (write-cursor snaps)" : "");
+
+    // The stock, not the transition. Every counter above records an event;
+    // these give the live occupancy of the shm boundary. sendLead is what
+    // JitterFrames is supposed to hold: the daemon writes one block plus J
+    // ahead of the HAL's read head, so a lead collapsing toward 0 is the
+    // starvation that the blocks/frames counters then record.
+    uint64_t sendCur   = field(base, JB_OFF_DAEMON_SEND_CURSOR);
+    uint64_t recvCur   = field(base, JB_OFF_DAEMON_RECV_CURSOR);
+    uint64_t inHead    = field(base, JB_OFF_HAL_INPUT_READ_HEAD);
+    uint64_t outHead   = field(base, JB_OFF_HAL_OUTPUT_WRITE_HEAD);
+    uint64_t starveB   = field(base, JB_OFF_HAL_INPUT_STARVE_BLOCKS);
+    uint64_t starveF   = field(base, JB_OFF_HAL_INPUT_STARVE_FRAMES);
+    uint64_t jf        = field(base, JB_OFF_JITTER_FRAMES);
+    if (sendCur || recvCur) {
+        printf("  sendLead              %+" PRId64 " frames   (want ~block+%" PRIu64 ")\n",
+               (int64_t)(sendCur - inHead), jf);
+        printf("  recvLag               %+" PRId64 " frames   (want ~-(block+%" PRIu64 "))\n",
+               (int64_t)(recvCur - outHead), jf);
+    } else {
+        printf("  sendLead              (daemon has not published yet)\n");
+    }
+    printf("  halStarveBlocks       %" PRIu64 "%s\n", starveB,
+           starveB ? "   (capture blocks read before the daemon wrote them)" : "");
+    printf("  halStarveFrames       %" PRIu64 "%s\n", starveF,
+           starveF ? "   (stale frames delivered to the DAW - takes are suspect)" : "");
 
     printf("  halNFrames            %" PRIu64 "\n", field(base, JB_OFF_HAL_NFRAMES));
     printf("  halSampleRate         %" PRIu64 "\n", field(base, JB_OFF_HAL_SAMPLE_RATE));

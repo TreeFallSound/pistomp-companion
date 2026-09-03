@@ -315,17 +315,30 @@ J is reported via `kAudioDevicePropertySafetyOffset`. The DAW adds it on
 top of the one-way latency from `kAudioDevicePropertyLatency`, so it must
 NOT appear in `jb_one_way_latency_frames()`.
 
-**Sizing constraint:** J must cover `maxBurst` in the worst case where JACK
-and HAL stall together. A 2-hour live session observed `maxBurst=472`
-(7.4×P). The correlation between `daemonXruns` and `maxBurst` in that
-session was inconclusive (G=512 was causing independent JACK xruns). A
-stable session with `daemonXruns=0` in quiet windows is needed to measure
-true correlation. If stalls are uncorrelated, J can shrink to
-`maxBurst − stall_cycles×P`; if correlated, J must equal `maxBurst`.
-At J=320 (5×P) the 472-frame burst produces a 152-frame starvation in the
-fully-correlated case. At the current J=128 (2×P) the same burst produces a
-344-frame starvation, so lowering J widened this risk rather than closing it.
-**Open risk — needs measurement.**
+**What `maxBurst` is.** It is the largest `inIOBufferFrameSize` CoreAudio
+handed the driver in the window (`SA_Device.cpp:1745`) — the size of the
+biggest IO block, not the depth of a stall. `maxBurst == N` means CoreAudio
+asked for exactly the negotiated buffer every cycle. A value above `N` means
+CoreAudio bunched, and J must cover the excess.
+
+**Sizing constraint:** J must cover `maxBurst − N`, plus any JACK-side stall
+that lands in the same window. Two sessions are on record and they are not
+the same session: `maxBurst=472` (7.4×P) and `maxBurst=272`. Neither is
+reproducible on demand, and the correlation with `daemonXruns` was
+inconclusive in both (G=512 was causing independent JACK xruns).
+
+**Measured 2026-09-02, protocol 13, N=64, P=64, J=128:** 40 consecutive 5 s
+windows with `maxBurst=64`, `nearMiss=0`, `starveBlocks=0`, `starveFrames=0`
+and `lead=192` pinned. CoreAudio did not bunch at all, so J was 2× the
+requirement for the whole session. **Do not raise J on the strength of the
+472 figure without first reproducing the bunching that produced it** — at
+N=64 with no bunching there is nothing for the extra cushion to cover, and
+it costs 2.67 ms per direction per 128 frames.
+
+The starvation counters are the instrument for this now: `halStarveBlocks`
+and `halStarveFrames` in `just shm`, and `starveBlocks`/`starveFrames` in
+the driver's 5 s health line. A J that is too small shows up there before it
+is audible.
 
 **J=0 is the tightest correct alignment.** The upstream read position is a
 free-running cursor whose target is `halOutputWriteHead − block − J`. The HAL
