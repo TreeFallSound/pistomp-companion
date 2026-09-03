@@ -14,6 +14,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var restartItem: NSMenuItem!
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
+    private var deployMenu: NSMenu!
+    private var deployItem: NSMenuItem!
+    private var deployRefreshGeneration = 0
 
     /// Monotonic nonce for JB_OFF_RESYNC_REQUEST. The driver compares the
     /// value against the last one it saw and acts only on a change, and the
@@ -135,6 +138,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusLineItem.title = pendingStackOperation.map(Self.progressLine(for:)) ?? state.detailLine
         moduiItem.action = state.piReachable ? #selector(openModUI(_:)) : nil
         sshItem.action = state.piReachable ? #selector(openSSH(_:)) : nil
+        deployItem.isEnabled = state.piReachable
 
         if state.jackCondition == .ourServer && previousJackCondition != .ourServer {
             confirmExistingJackServer()
@@ -207,6 +211,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func confirmDestructiveDeployment(for pullRequest: GitHubPullRequest) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Deploy PR #\(pullRequest.number) and discard local changes?"
+        alert.informativeText = "Deployment replaces the checked-out pi-Stomp working copy on the pi. It removes untracked and ignored files and discards tracked changes before checking out this pull request."
+        alert.addButton(withTitle: "Deploy and Discard Changes")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     // MARK: - menu
 
     private func buildMenu() -> NSMenu {
@@ -229,8 +243,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         moduiItem = item("Open MOD-UI", #selector(openModUI(_:)))
         sshItem = item("SSH to pi-Stomp", #selector(openSSH(_:)))
+        deployMenu = NSMenu()
+        deployMenu.delegate = self
+        deployItem = NSMenuItem(title: "Deploy", action: nil, keyEquivalent: "")
+        deployItem.submenu = deployMenu
         m.addItem(moduiItem)
         m.addItem(sshItem)
+        m.addItem(deployItem)
         m.addItem(.separator())
 
         m.addItem(item("Network Diagnostics…", #selector(runDiagnostics(_:))))
@@ -409,5 +428,134 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit(_ s: Any?) {
         NSApp.terminate(nil)
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === deployMenu else { return }
+        refreshDeployMenu()
+    }
+
+    private func refreshDeployMenu() {
+        deployRefreshGeneration += 1
+        let generation = deployRefreshGeneration
+        deployMenu.removeAllItems()
+        let loading = NSMenuItem(title: "Loading…", action: nil, keyEquivalent: "")
+        loading.isEnabled = false
+        deployMenu.addItem(loading)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = GitHubPullRequests.loadOpen()
+            DispatchQueue.main.async {
+                guard let self, generation == self.deployRefreshGeneration else { return }
+                self.showDeployMenu(result)
+            }
+        }
+    }
+
+    private func showDeployMenu(_ result: Result<[GitHubPullRequest], GitHubPullRequests.LoadError>) {
+        deployMenu.removeAllItems()
+        switch result {
+        case .success(let pullRequests) where pullRequests.isEmpty:
+            let empty = NSMenuItem(title: "No open pi-Stomp PRs", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            deployMenu.addItem(empty)
+        case .success(let pullRequests):
+            for pullRequest in pullRequests {
+                let entry = item(pullRequest.menuTitle, #selector(deployPullRequest(_:)))
+                entry.representedObject = pullRequest
+                deployMenu.addItem(entry)
+            }
+        case .failure(let error):
+            NSLog("Cannot list pi-Stomp pull requests: %@", error.description)
+            let title: String
+            switch error {
+            case .unavailable:
+                title = "GitHub CLI not installed"
+            case .authenticationFailed:
+                title = "GitHub CLI authentication failed"
+            case .commandFailed, .invalidOutput:
+                title = "Unable to load pull requests"
+            }
+            let failure = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            failure.isEnabled = false
+            deployMenu.addItem(failure)
+        }
+    }
+
+    @objc private func deployPullRequest(_ sender: NSMenuItem) {
+        guard let pullRequest = sender.representedObject as? GitHubPullRequest,
+              confirmDestructiveDeployment(for: pullRequest) else { return }
+        openDeploymentTerminal(for: pullRequest)
+    }
+    private func openDeploymentTerminal(for pullRequest: GitHubPullRequest) {
+        let target = Self.shellQuote("pistomp@\(JackTools.piHostname)")
+        let script = """
+        #!/bin/sh
+        set -u
+        TARGET=\(target)
+        PR_NUMBER=\(pullRequest.number)
+
+        echo "Deploying pi-Stomp PR #$PR_NUMBER to $TARGET"
+        echo
+        ssh -tt "$TARGET" /bin/sh -s -- "$PR_NUMBER" <<'REMOTE_SCRIPT'
+        set -eu
+        PR_NUMBER="$1"
+        SRC="$HOME/pi-stomp"
+
+        if [ ! -d "$SRC/.git" ]; then
+            echo "==> Expanding pi-Stomp Git repository"
+            "$SRC/util/expand-git.sh"
+        fi
+
+        cd "$SRC"
+        echo "==> Removing local pi-Stomp source changes"
+        git clean -fdx -e .git-meta/
+        echo "==> Fetching refs/pull/$PR_NUMBER/head"
+        git fetch --force origin "refs/pull/$PR_NUMBER/head"
+        echo "==> Checking out PR head"
+        git checkout --detach --force FETCH_HEAD
+        echo "==> Restarting mod-ala-pi-stomp"
+        sudo systemctl restart mod-ala-pi-stomp
+        if ! sudo systemctl is-active --quiet mod-ala-pi-stomp; then
+            echo "ERROR: mod-ala-pi-stomp failed to start." >&2
+            sudo systemctl status --no-pager mod-ala-pi-stomp || true
+            exit 1
+        fi
+        echo "==> pi-Stomp PR #$PR_NUMBER is deployed."
+        REMOTE_SCRIPT
+
+        status=$?
+        echo
+        if [ "$status" -eq 0 ]; then
+            echo "Deployment complete."
+        else
+            echo "Deployment failed (exit $status)." >&2
+        fi
+        /bin/rm -f -- "$0"
+        exit "$status"
+        """
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiStompCompanion-deploy-\(pullRequest.number)-\(UUID().uuidString).command")
+        do {
+            try script.write(to: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path.path)
+        } catch {
+            NSLog("Cannot prepare deployment Terminal command: %@", error.localizedDescription)
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ProcessRunner.run("/usr/bin/open", args: ["-a", "Terminal", path.path], timeout: 5)
+            if result.launchError != nil || result.status != 0 {
+                try? FileManager.default.removeItem(at: path)
+                NSLog("Cannot open deployment in Terminal: %@", result.combined)
+            }
+        }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

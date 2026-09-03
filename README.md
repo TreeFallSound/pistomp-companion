@@ -30,7 +30,7 @@ They do not run on Intel Macs.
 
 The app has no Dock icon and no window. Find the pi-Stomp icon in the menu
 bar. The icon shows the connection state. The menu has start, stop, restart,
-SSH, MOD-UI, and diagnostics.
+SSH, Deploy, MOD-UI, and diagnostics.
 
 ### Audio channels in your DAW
 
