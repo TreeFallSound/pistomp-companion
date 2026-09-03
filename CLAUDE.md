@@ -383,8 +383,8 @@ a value that disappears when audio restarts is worse than no value.
 |------------------|----------|---------|---------|
 | `NetLatency` | `JACKBRIDGE_NET_LATENCY` | netadapter `-l`, cycles of loop cushion | 4 |
 | `NetRing` | `JACKBRIDGE_NET_RING` | netadapter `-g`, slip-ring frames | 1024 |
-| `NetRtNapi` | `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | 60 |
-| `NetRtIrq` | `JACKBRIDGE_RT_IRQ` | `chrt -f` on the eth interrupt thread | 50 |
+| `NetRtNapi` | `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | 72 |
+| `NetRtIrq` | `JACKBRIDGE_RT_IRQ` | `chrt -f` on the eth interrupt thread | 73 |
 | `NetCpuNet` | `JACKBRIDGE_CPU_NET` | `taskset` for NAPI + `smp_affinity_list` for the interrupt | empty |
 | `NetCpuDsp` | `JACKBRIDGE_CPU_DSP` | `taskset` for mod-host | empty |
 | `NetGovernor` | `JACKBRIDGE_GOVERNOR` | `scaling_governor` | empty |
@@ -395,8 +395,11 @@ a value that disappears when audio restarts is worse than no value.
 
 Empty means *do not touch that setting on the pi* — not "apply a default". A
 value we never write is one a measurement does not have to account for. The
-numeric defaults are the pi's pre-existing behaviour, so adopting this
-mechanism changed no timing.
+numeric defaults were the pi's pre-existing behaviour, so adopting this
+mechanism changed no timing. `NetRtNapi` and `NetRtIrq` are the exception: they
+were 60/50 for that reason and are now 72/73, which lifts the packet path above
+the plugin graph. The rationale, and why both stay below jackd's 75, is in
+Step 3 of `jackbridge/pi/bin/jackbridge-napi-rt`.
 
 The user-facing path is the Settings window's **Pi tuning** section, then
 Apply. The maintainer path is the same file plus:
@@ -440,6 +443,59 @@ just logs
 
 Use format-string literals only. Use `%{public}s` for caller-supplied
 strings.
+
+### Reading past logs — two traps
+
+`just logs` streams from now. To read a session that already happened you
+need `log show`, and both of these will otherwise waste your time:
+
+```sh
+/usr/bin/log show --last 20m --info --debug \
+  --predicate 'subsystem == "com.treefallsound.companion" AND category == "driver"' \
+  --style compact
+```
+
+- **`/usr/bin/log`, not `log`.** zsh has a `log` builtin. Calling the bare
+  name gives `(eval):log:1: too many arguments`, which reads like a quoting
+  mistake in your predicate rather than the wrong program.
+- **`--info --debug`, always.** Every health line is `JB_LOG_INFO`, and
+  `log show` drops info- and debug-level messages by default. Without the
+  flags you get an empty result from a system that is logging normally, and
+  an empty result is indistinguishable from a stack that never started.
+
+### The driver health line
+
+One line every 5 s, category `driver`, from the plug-in host process
+(`Core Audio Driver (JackBridgePlugIn.driver)`), so it appears under
+`com.apple.audio.Core-Audio-Driver-Service.helper`, not under `JackBridged`.
+
+```
+health cycles=3750 maxBurst=64 nearMiss=0 leadJitter=3850 daemonXruns=0 \
+       starveBlocks=0 starveFrames=0 lead=192 recvLag=-192
+```
+
+| Field | Healthy | What a bad value means |
+|-------|---------|------------------------|
+| `cycles` | `f_s * 5 / N`, exactly, every window | Below it, the IO proc missed wakes. 3750 at N=64/48k. |
+| `maxBurst` | `== N` | Above `N`, CoreAudio bunched. **It is the largest IO block in the window, not a stall depth.** J must cover the excess. |
+| `nearMiss` | 0 | Cycles that came within 16 frames of the deadline. |
+| `leadJitter` | ~1 frame per cycle | Σ abs(lead − nominal). Divide by `cycles` before you read it. |
+| `daemonXruns` | 0 | Δ over the window. Derivative of a netmanager stall — see §4b before you blame the daemon. |
+| `starveBlocks` | 0 | Capture blocks read before the daemon finished writing them. |
+| `starveFrames` | 0 | Stale frames delivered to the DAW. **Non-zero means a take is suspect.** |
+| `lead` | `block + JitterFrames` | Send-side occupancy. `block` is `max(N,P)`. Collapsing toward 0 is the starvation that `starve*` then records. |
+| `recvLag` | `-(block + JitterFrames)` | Recv-side occupancy, same rule with the sign reversed. |
+
+`lead` and `recvLag` are the **stocks**; everything else on the line is a
+transition. A boundary holding with no margin and one holding comfortably
+look identical in the transition counters and differ plainly in these two.
+`just shm` prints the same pair as `sendLead`/`recvLag`, but it reads the
+fields sequentially from another process, so its figures can skew by a
+cycle. The driver's own numbers cannot. **Prefer the health line when the
+two disagree.**
+
+The daemon's own 5 s line is category `shm`. Both are `JB_LOG_INFO`, so both
+need the flags above.
 
 The menu-bar "Network Diagnostics…" collects probes into
 `~/Library/Logs/JackBridge/`. Run it when the pi does not connect, and attach

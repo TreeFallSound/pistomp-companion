@@ -1795,17 +1795,28 @@ void	SA_Device::BeginIOOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSiz
 	mHealthPrevDaemonXRuns = daemonXrunsNow;
 
 	JB_LOG_INFO(jb_log_driver(),
-	    "health cycles=%llu maxBurst=%u nearMiss=%u leadJitter=%llu daemonXruns=%llu",
+	    "health cycles=%llu maxBurst=%u nearMiss=%u leadJitter=%llu daemonXruns=%llu starveBlocks=%u starveFrames=%llu lead=%lld recvLag=%lld",
 	    (unsigned long long)mHealthCycleCount,
 	    (unsigned)mHealthMaxNFrames,
 	    (unsigned)mHealthNearMiss,
 	    (unsigned long long)mHealthLeadJitter,
-	    (unsigned long long)daemonXrunsDelta);
+	    (unsigned long long)daemonXrunsDelta,
+	    (unsigned)mHealthStarveBlocks,
+	    (unsigned long long)mHealthStarveFrames,
+	    // Both pairs are read back-to-back on this thread. jbdump reads the
+	    // same fields sequentially from another process, so its figures can
+	    // skew by a cycle; these cannot.
+	    (long long)((SInt64)shmDaemonSendCursor->load(std::memory_order_relaxed)
+	              - (SInt64)shmHalInputReadHead->load(std::memory_order_relaxed)),
+	    (long long)((SInt64)shmDaemonRecvCursor->load(std::memory_order_relaxed)
+	              - (SInt64)shmHalOutputWriteHead->load(std::memory_order_relaxed)));
 
 	mHealthCycleCount = 0;
 	mHealthMaxNFrames = 0;
 	mHealthNearMiss   = 0;
 	mHealthLeadJitter = 0;
+	mHealthStarveBlocks = 0;
+	mHealthStarveFrames = 0;
 }
 
 void	SA_Device::DoIOOperation(AudioObjectID inStreamObjectID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo& inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer)
@@ -1859,6 +1870,21 @@ void	SA_Device::ReadInputData(int streamId, UInt32 inIOBufferFrameSize, Float64 
         // itself once the daemon is back. No DAW re-selection, no user ritual.
         bzero(theDestination, inIOBufferFrameSize * 8);
     } else {
+        // Was this block fully written before we read it? The daemon publishes
+        // its send cursor in the same absolute-frame domain as inSampleTime
+        // (protocol 13), so a cursor short of the block end means the tail of
+        // this copy is a lap-old sample, not silence — inaudible as a fault
+        // and indistinguishable from real audio once it is in the take.
+        // Count only; do not branch the audio on it. Two relaxed RMWs.
+        UInt64 theSendCursor = shmDaemonSendCursor->load(std::memory_order_acquire);
+        UInt64 theBlockEnd   = theSampleTime + inIOBufferFrameSize;
+        if (theSendCursor != 0 && theSendCursor < theBlockEnd) {
+            shmHalInputStarveBlocks->fetch_add(1, std::memory_order_relaxed);
+            shmHalInputStarveFrames->fetch_add(theBlockEnd - theSendCursor,
+                                               std::memory_order_relaxed);
+            ++mHealthStarveBlocks;
+            mHealthStarveFrames += (theBlockEnd - theSendCursor);
+        }
         memcpy(theDestination, RingBuffer+theStartFrameOffset*2, theNumberFramesToCopy1 * 8);
         if(theNumberFramesToCopy2 > 0)
         {

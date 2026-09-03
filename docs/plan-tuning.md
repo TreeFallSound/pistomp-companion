@@ -254,8 +254,8 @@ file, so the change is safe on its own.
 |----------|---------|--------|---------|
 | `JACKBRIDGE_NET_LATENCY` | netadapter `-l` | `jackbridge-pi-up` | 4 |
 | `JACKBRIDGE_NET_RING` | netadapter `-g` | `jackbridge-pi-up` | 1024 |
-| `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | `jackbridge-napi-rt` | 60 |
-| `JACKBRIDGE_RT_IRQ` | `chrt -f` on `irq/<n>-$IFACE` | `jackbridge-napi-rt` | 50 |
+| `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | `jackbridge-napi-rt` | 72 |
+| `JACKBRIDGE_RT_IRQ` | `chrt -f` on `irq/<n>-$IFACE` | `jackbridge-napi-rt` | 73 |
 | `JACKBRIDGE_CPU_NET` | `taskset` for NAPI, and `smp_affinity_list` for the eth0 interrupt | `jackbridge-napi-rt` | empty, meaning no change |
 | `JACKBRIDGE_CPU_DSP` | `taskset` for mod-host | `jackbridge-napi-rt` | empty, meaning no change |
 | `JACKBRIDGE_GOVERNOR` | `scaling_governor` | `jackbridge-napi-rt` | empty, meaning no change |
@@ -432,16 +432,36 @@ buffer size behind it. `config.plist` holds it.
 ### 3.4 Phase 4 — correct the priority of the packet path
 
 Paragraph 2.5 gives the fault. The eth0 interrupt thread is at priority 50 and
-the NAPI threads are at 60. mod-host is at 65, so mod-host preempts both. The
+the NAPI threads are at 60. mod-host is at 70, so mod-host preempts both. The
 work that delivers a packet ranks below the work that is waiting for it.
 
-**Step 4.1 — raise the packet path above mod-host.**
+**Step 4.1 — raise the packet path above mod-host.** *(done — these are now
+the defaults in `config.plist` and in `jackbridge-napi-rt`.)*
 
-    JACKBRIDGE_RT_IRQ  = 72
+    JACKBRIDGE_RT_IRQ  = 73
     JACKBRIDGE_RT_NAPI = 72
 
-Target order: jackd audio 75, netadapter 70, **interrupt and NAPI 72**,
-mod-host 65.
+Observed ladder on a Pi 5, after the change:
+
+    90  irq/<n>-dw_axi_dmac_platform   the DAC's DMA (pi-Stomp owns it)
+    80  ttymidi (serial reader)        pi-Stomp owns it
+    75  jackd                          backend + graph dispatch (-P 75)
+    73  irq/<n>-eth*                   JACKBRIDGE_RT_IRQ
+    72  napi/eth0-*                    JACKBRIDGE_RT_NAPI
+    70  mod-host, ttymidi (jack)       the plugin graph
+
+IRQ one step above NAPI because the interrupt is what schedules the poll.
+
+**Step 4.1a — a prerequisite that was silently failing.** `iface_irqs()` looked
+only at `/sys/class/net/$IFACE/device/{msi_irqs,irq}`. On a Pi 5 the onboard
+port is an OF platform device (`raspberrypi,rp1-gem` / `cdns,macb`) with
+neither attribute, so the lookup returned nothing, the loop body never ran, and
+every log line lived *inside* that loop — `JACKBRIDGE_RT_IRQ` was accepted on
+the Mac, pushed to `/etc/default/jackbridge`, and applied to nothing, without a
+word. It now falls back to the last column of `/proc/interrupts` (the one name
+in the system that reads `eth0` rather than the driver's unexpanded `eth%d`)
+and reports the empty case. Any `NetRtIrq` measurement taken before this fix
+measured nothing.
 
 This change is nearly free, and that is the reason to make it first. An
 interrupt handler and a NAPI poll each do a small, bounded amount of work and

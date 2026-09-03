@@ -10,13 +10,19 @@
 # THE MAC OWNS EVERY VALUE HERE. Each knob is a JACKBRIDGE_* variable read from
 # /etc/default/jackbridge, which jackbridge-ctl writes from config.plist on the
 # Mac before each service start. Nothing in this file is a setting the pi keeps
-# on its own: the defaults below are exactly the present behaviour, so a pi with
-# no environment file behaves as it always did, and a reimaged pi costs no
-# configuration. Do not hand-edit /etc/default/jackbridge — the next start
-# overwrites it.
+# on its own, and a reimaged pi therefore costs no configuration. Do not
+# hand-edit /etc/default/jackbridge — the next start overwrites it.
 #
-#   JACKBRIDGE_RT_NAPI      chrt -f priority for napi/$IFACE-*        (60)
-#   JACKBRIDGE_RT_IRQ       chrt -f priority for irq/<n>-*            (50)
+# The RT defaults below are NOT the pi's original behaviour. They were 60/50,
+# chosen to reproduce it exactly so that adopting this mechanism changed no
+# timing; they are now 72/73, which places the packet path above the plugin
+# graph. See Step 3 for the reasoning. Keep them equal to the NetRtNapi /
+# NetRtIrq defaults in jackbridge/installer/config.plist and in
+# SettingsWindowController.defaults — a pi with no environment file must behave
+# like a Mac that has never opened the Settings window.
+#
+#   JACKBRIDGE_RT_NAPI      chrt -f priority for napi/$IFACE-*        (72)
+#   JACKBRIDGE_RT_IRQ       chrt -f priority for irq/<n>-*            (73)
 #   JACKBRIDGE_CPU_NET      CPU list for NAPI + the eth interrupt     (unset)
 #   JACKBRIDGE_CPU_DSP      CPU list for mod-host                     (unset)
 #   JACKBRIDGE_GOVERNOR     cpufreq scaling_governor                  (unset)
@@ -53,8 +59,8 @@ if [ ! -r "$STATE" ]; then
 fi
 IFACE=$(cat "$STATE")
 
-RT_NAPI="${JACKBRIDGE_RT_NAPI:-60}"
-RT_IRQ="${JACKBRIDGE_RT_IRQ:-50}"
+RT_NAPI="${JACKBRIDGE_RT_NAPI:-72}"
+RT_IRQ="${JACKBRIDGE_RT_IRQ:-73}"
 CPU_NET="${JACKBRIDGE_CPU_NET:-}"
 CPU_DSP="${JACKBRIDGE_CPU_DSP:-}"
 GOVERNOR="${JACKBRIDGE_GOVERNOR:-}"
@@ -65,8 +71,8 @@ NIC_OFFLOAD="${JACKBRIDGE_NIC_OFFLOAD:-}"
 
 # SCHED_FIFO is 1..99. Anything else is a typo in config.plist, and a typo must
 # not silently become a priority.
-case "$RT_NAPI" in ''|*[!0-9]*|0) RT_NAPI=60 ;; esac
-case "$RT_IRQ"  in ''|*[!0-9]*|0) RT_IRQ=50 ;; esac
+case "$RT_NAPI" in ''|*[!0-9]*|0) RT_NAPI=72 ;; esac
+case "$RT_IRQ"  in ''|*[!0-9]*|0) RT_IRQ=73 ;; esac
 [ "$RT_NAPI" -le 99 ] || RT_NAPI=99
 [ "$RT_IRQ"  -le 99 ] || RT_IRQ=99
 
@@ -100,16 +106,55 @@ pids_by_comm_prefix() {
     done
 }
 
-# The IRQs of this interface, from sysfs rather than by grepping
-# /proc/interrupts for the interface name — see the comm note above for why
-# the name in that table cannot be trusted to be $IFACE.
+# The IRQs of this interface. Three sources, in order of how much they can be
+# trusted, because no single one covers every NIC we run on:
+#
+#   1. $dev/msi_irqs      PCIe NICs (a USB-Ethernet dongle's host controller,
+#                         a real card). One directory entry per vector.
+#   2. $dev/irq           a platform device that exports the attribute.
+#   3. /proc/interrupts   everything else — and on a Pi 5 that is the *onboard*
+#                         port, which is the case that matters most. eth0 there
+#                         is an OF platform device (raspberrypi,rp1-gem /
+#                         cdns,macb) under the RP1, and it has neither msi_irqs
+#                         nor an irq attribute, so 1 and 2 both come back empty.
+#
+# Falling back to the name in /proc/interrupts contradicts the comm note above,
+# so be precise about what that note actually says: the *thread* comm is the
+# driver's unexpanded format string ("irq/104-eth%d"), and so is the action
+# directory under /proc/irq/104/. The last column of /proc/interrupts is not —
+# it says "eth0". That column is therefore the one name in the system that can
+# be matched against $IFACE, and it is why the thread is still found by number.
+#
+# A shared line lists several comma-separated names, so match a whole field,
+# never a substring: "eth0" must not match "eth0-tx" on some future driver.
+irqs_from_proc_interrupts() {
+    awk -v ifc="$IFACE" '
+        /^[ \t]*[0-9]+:/ {
+            n = $1; sub(/:$/, "", n)
+            split($NF, parts, ",")
+            for (i in parts) if (parts[i] == ifc) { print n; next }
+        }' /proc/interrupts 2>/dev/null || true
+}
+
+# Note the plain "if" rather than a "[ -z ] && x=y" chain: under set -e, such a
+# chain exits the script when the test is false, which here is the ordinary
+# case of sysfs having answered.
 iface_irqs() {
+    found=""
     dev=/sys/class/net/$IFACE/device
-    [ -d "$dev" ] || return 0
-    if [ -d "$dev/msi_irqs" ]; then
-        ls "$dev/msi_irqs" 2>/dev/null || true
+    if [ -d "$dev" ]; then
+        if [ -d "$dev/msi_irqs" ]; then
+            found=$(ls "$dev/msi_irqs" 2>/dev/null || true)
+        fi
+        if [ -z "$found" ] && [ -r "$dev/irq" ]; then
+            found=$(cat "$dev/irq" 2>/dev/null || true)
+        fi
     fi
-    [ -r "$dev/irq" ] && cat "$dev/irq" 2>/dev/null || true
+    if [ -z "$found" ]; then
+        found=$(irqs_from_proc_interrupts)
+    fi
+    [ -n "$found" ] && echo "$found"
+    return 0
 }
 
 # Step 1: Remove interrupt coalescing (~49 µs per direction by default on the
@@ -182,15 +227,34 @@ fi
 # The eth interrupt thread: priority, and the CPU the interrupt itself lands
 # on. Both, or the packet path is split — NAPI pinned to the last core while
 # the interrupt still fires on CPU0 costs a cross-core handoff per packet.
-for irq in $(iface_irqs | sort -u); do
+#
+# Report the empty case. Every log line in this loop used to be inside it, so a
+# NIC whose IRQs could not be found applied neither the priority nor the
+# affinity and said nothing at all — the operator sets NetRtIrq on the Mac,
+# sees it arrive in /etc/default/jackbridge, and has no way to learn that half
+# the packet path stayed at the kernel's default 50 on an unpinned core. That
+# is a measurement quietly voided, so say it.
+IRQS=$(iface_irqs | sort -u)
+if [ -z "$IRQS" ]; then
+    echo "jackbridge-napi-rt: no IRQ found for $IFACE — RT_IRQ $RT_IRQ${CPU_NET:+ and cpu $CPU_NET} NOT applied to the interrupt thread" >&2
+fi
+for irq in $IRQS; do
+    applied=0
     for pid in $(pids_by_comm_prefix "irq/$irq-"); do
-        chrt -f -p "$RT_IRQ" "$pid" 2>/dev/null || true
+        chrt -f -p "$RT_IRQ" "$pid" 2>/dev/null && applied=1
         [ -n "$CPU_NET" ] && taskset -cp "$CPU_NET" "$pid" >/dev/null 2>&1 || true
     done
     if [ -n "$CPU_NET" ] && [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
         echo "$CPU_NET" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
     fi
-    echo "jackbridge-napi-rt: irq $irq → SCHED_FIFO $RT_IRQ${CPU_NET:+ cpu $CPU_NET}" >&2
+    if [ "$applied" -eq 1 ]; then
+        echo "jackbridge-napi-rt: irq $irq → SCHED_FIFO $RT_IRQ${CPU_NET:+ cpu $CPU_NET}" >&2
+    else
+        # The line exists but has no kthread: the kernel is not running threaded
+        # interrupts for it, so there is nothing to prioritise. The affinity
+        # above still landed.
+        echo "jackbridge-napi-rt: irq $irq has no IRQ thread — priority not applied${CPU_NET:+ (affinity → cpu $CPU_NET)}" >&2
+    fi
 done
 
 # Step 2: Move NAPI polling from softirq into a schedulable kthread.
@@ -205,16 +269,50 @@ echo "jackbridge-napi-rt: $IFACE threaded NAPI enabled" >&2
 # Step 3: Priority and placement for the napi/$IFACE-* kthreads. Wait up to
 # 500 ms for them to appear — on first enable they may not exist yet.
 #
-# On the priority itself: 60 was chosen so the audio threads (jackd 75,
-# mod-host 65) finish their cycle before NAPI delivers the next batch. That is
-# a design decision that has never been measured, and the opposite case is at
-# least as strong — at 60 the whole packet path ranks below the work waiting
-# for it, so a packet can wait a plugin quantum before the kernel looks at it,
-# and a plugin quantum is bounded by nothing. Raising both to 72 is nearly
-# free, because an interrupt handler and a NAPI poll each do a small bounded
-# amount of work and then yield: it removes a preemption, not a share of the
-# CPU. That is what JACKBRIDGE_RT_NAPI / JACKBRIDGE_RT_IRQ are for. Measure it
-# (docs/plan-tuning.md 3.4) and record the result in docs/JITTER.md.
+# On the priority itself. The ladder this targets, measured on a Pi 5:
+#
+#   90  irq/138-dw_axi_dmac_platform   the DAC's DMA — pi-Stomp owns it
+#   80  ttymidi (serial reader)        pi-Stomp owns it
+#   75  jackd                          backend + graph dispatch (-P 75)
+#   73  irq/<n>-eth*                   JACKBRIDGE_RT_IRQ
+#   72  napi/$IFACE-*                  JACKBRIDGE_RT_NAPI
+#   70  mod-host, ttymidi (jack)       the plugin graph
+#
+# The old defaults were 60/50, which put the whole packet path *below* the work
+# waiting for it: a packet could wait a mod-host DSP quantum before the kernel
+# looked at it. Raising both above 70 is nearly free, because an interrupt
+# handler and a NAPI poll each do a small bounded amount of work and then
+# yield — it removes a preemption, not a share of the CPU. On this link that is
+# doubly true: netJACK2 sends one small packet per period, so a poll never
+# approaches its 64-packet budget and is nearly as short as the interrupt.
+#
+# IRQ above NAPI because the interrupt is what schedules the poll; putting the
+# worker above its own dispatcher delays the dispatch you were waiting for.
+#
+# Both stay BELOW jackd's 75, and the reason is specific to this topology
+# rather than general. The tempting argument is that the eth IRQ carries the
+# packet jackd needs, exactly as the DAC's DMA IRQ at 90 does — so it should
+# outrank the graph for the same reason. It does not, because the pi's jackd is
+# ALSA-clocked ("-d alsa -d hw:0"): the DMA interrupt starts the cycle, and
+# netadapter is a *slave* internal client behind a resampler and a NET_RING
+# slip ring. A late packet never delays a cycle; it lowers ring occupancy, and
+# the resampler pulls it back. Absorption downstream of the eth IRQ is
+# NET_RING/2 ≈ 10.7 ms at the defaults, against a worst case of one period
+# (1.33 ms) — 8x inside the buffer built to hold it. The DAC IRQ has no such
+# absorption, which is why it, and not this one, belongs above jackd.
+#
+# The decisive counter: $IFACE is not single-purpose. It carries netJACK2 and
+# also ssh, mDNS, ARP and any other host on the LAN, and the interrupt fires
+# before anything knows which. Above 75, a stranger's traffic can preempt the
+# audio graph.
+#
+# If a DAC-less variant ever runs "jackd -d net", the packet does start the
+# cycle, absorption is zero, and this conclusion flips. Re-derive it there;
+# do not inherit it.
+#
+# Still unmeasured (docs/plan-tuning.md 3.4): the benefit has no clean
+# instrument. Ring occupancy variance is what moves, nothing exposes it, and
+# xruns stay 0 either way. Record anything you do learn in docs/JITTER.md.
 DEADLINE=$(( $(date +%s%3N) + 500 ))
 while true; do
     mapfile -t PIDS < <(pgrep "napi/$IFACE" 2>/dev/null || true)

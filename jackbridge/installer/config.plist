@@ -50,9 +50,9 @@
          docs/plan-tuning.md 3.4) and why the defaults are still the present
          behaviour. -->
     <key>NetRtNapi</key>
-    <integer>60</integer>
+    <integer>72</integer>
     <key>NetRtIrq</key>
-    <integer>50</integer>
+    <integer>73</integer>
 
     <!-- CPU placement, as taskset and smp_affinity_list spell it ("3",
          "0-2"). NetCpuNet takes the NAPI threads and the eth interrupt

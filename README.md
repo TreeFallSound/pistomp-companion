@@ -30,7 +30,7 @@ They do not run on Intel Macs.
 
 The app has no Dock icon and no window. Find the pi-Stomp icon in the menu
 bar. The icon shows the connection state. The menu has start, stop, restart,
-SSH, MOD-UI, and diagnostics.
+SSH, Deploy, MOD-UI, and diagnostics.
 
 ### Audio channels in your DAW
 
@@ -97,6 +97,21 @@ This is by design, not a bug. Audio needs the Ethernet cable.
 Fix: connect the cable, or attach a USB Ethernet adapter.
 
 Full diagnostics and rare cases: `docs/macos-setup.md`.
+
+### Reporting a problem
+
+The menu bar has **Network Diagnostics…**. It collects the state of the link
+and the audio engine into a file in `~/Library/Logs/JackBridge/` and shows you
+where it went.
+
+Run it **while the problem is happening**, not after you restart. The engine
+records what its buffers are doing at the time; a restart clears it.
+
+Attach that file to the bug report, and say what you heard and when. If a
+recorded take is affected, name the take and the approximate time — the log
+carries timestamps, so the two can be lined up.
+
+Maintainers: the terminal side of this is `CLAUDE.md` §5.
 
 ---
 

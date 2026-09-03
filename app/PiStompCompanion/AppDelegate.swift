@@ -14,6 +14,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var restartItem: NSMenuItem!
     private var moduiItem: NSMenuItem!
     private var sshItem: NSMenuItem!
+    private var deployMenu: NSMenu!
+    private var deployItem: NSMenuItem!
+    private var deployRefreshGeneration = 0
+    /// True from the click on a PR until its confirmation is answered. The
+    /// working-copy survey is an ssh round trip behind a modal progress
+    /// window, and the menu is already closed by then — without this a user
+    /// who reopens the menu can stack a second survey and a second alert
+    /// behind the first.
+    private var deploySurveyRunning = false
 
     /// Monotonic nonce for JB_OFF_RESYNC_REQUEST. The driver compares the
     /// value against the last one it saw and acts only on a change, and the
@@ -135,6 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusLineItem.title = pendingStackOperation.map(Self.progressLine(for:)) ?? state.detailLine
         moduiItem.action = state.piReachable ? #selector(openModUI(_:)) : nil
         sshItem.action = state.piReachable ? #selector(openSSH(_:)) : nil
+        deployItem.isEnabled = state.piReachable
 
         if state.jackCondition == .ourServer && previousJackCondition != .ourServer {
             confirmExistingJackServer()
@@ -207,6 +217,127 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The deploy is destructive only when the pi has something to lose, and
+    /// `PiWorkingCopy.survey` is what settles which case this is. A warning
+    /// that fired on every deploy — the old behaviour — told the user nothing
+    /// and trained them to click through the one deploy that mattered. So a
+    /// surveyed-clean tree gets a plain confirmation in the informational
+    /// style, and every other case gets a warning that says what is at stake.
+    ///
+    /// The two cases we could not survey warn *without* claiming to know the
+    /// cost. Unsurveyed is never rendered as clean.
+    private func confirmDeployment(of pullRequest: GitHubPullRequest,
+                                   given outcome: PiWorkingCopy.Outcome) -> Bool {
+        let alert = NSAlert()
+        let proceedTitle: String
+        var destructive = true
+
+        switch outcome {
+        case .surveyed(let survey) where survey.isClean:
+            // Nothing to discard. This is still a confirmation, because the
+            // deploy restarts mod-ala-pi-stomp and cuts audio — but it is not
+            // a warning, and it must not carry a warning's styling.
+            destructive = false
+            alert.alertStyle = .informational
+            alert.messageText = "Deploy PR #\(pullRequest.number) to pi-Stomp?"
+            alert.informativeText = """
+            \(Self.workingCopyPhrase(survey)) has no local changes, so nothing is discarded.
+
+            \(Self.audioNotice)
+            """
+            proceedTitle = "Deploy"
+
+        case .surveyed(let survey):
+            let total = survey.trackedChangeCount + survey.removalCount
+            alert.alertStyle = .warning
+            alert.messageText = "Deploy PR #\(pullRequest.number) and discard "
+                + "\(total) local \(total == 1 ? "change" : "changes") on the pi?"
+            alert.informativeText = Self.lossDetail(survey)
+            proceedTitle = "Deploy and Discard Changes"
+
+        case .unexpanded:
+            alert.alertStyle = .warning
+            alert.messageText = "Deploy PR #\(pullRequest.number) to an unexpanded pi-Stomp tree?"
+            alert.informativeText = """
+            The pi's ~/pi-stomp carries no Git repository yet, so its local changes cannot be listed. \
+            Deploying expands the repository, then deletes every untracked and ignored file and \
+            discards tracked changes.
+
+            Any edit made to the shipped source is lost, and it cannot be shown here first.
+
+            \(Self.audioNotice)
+            """
+            proceedTitle = "Deploy and Discard Changes"
+
+        case .unreadable(let reason):
+            alert.alertStyle = .warning
+            alert.messageText = "Deploy PR #\(pullRequest.number) without checking the pi?"
+            alert.informativeText = """
+            The pi's working copy could not be read: \(reason).
+
+            Deploying still deletes every untracked and ignored file in ~/pi-stomp and discards \
+            tracked changes. What that costs is unknown.
+
+            \(Self.audioNotice)
+            """
+            proceedTitle = "Deploy and Discard Changes"
+        }
+
+        alert.addButton(withTitle: proceedTitle)
+        alert.addButton(withTitle: "Cancel")
+        if destructive {
+            // Return must not fire an unrecoverable deploy. Hand the default
+            // to Cancel; Escape already maps there by title.
+            alert.buttons[0].keyEquivalent = ""
+            alert.buttons[1].keyEquivalent = "\r"
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private static let audioNotice =
+        "Deploying checks out the pull request and restarts mod-ala-pi-stomp, which interrupts audio."
+
+    /// "The pi's working copy on main at a1b2c3d", degrading through
+    /// "detached at a1b2c3d" to the bare phrase as fields go unknown.
+    private static func workingCopyPhrase(_ survey: PiWorkingCopy.Survey) -> String {
+        var parts = ["The pi's working copy"]
+        if let branch = survey.branch {
+            parts.append("on \(branch)")
+        } else if survey.head != nil {
+            parts.append("detached")
+        }
+        if let head = survey.head { parts.append("at \(head)") }
+        return parts.joined(separator: " ")
+    }
+
+    private static func lossDetail(_ survey: PiWorkingCopy.Survey) -> String {
+        var blocks = ["\(Self.workingCopyPhrase(survey)) carries changes this deploy destroys."]
+        if survey.trackedChangeCount > 0 {
+            blocks.append(Self.section("Discarded — tracked edits",
+                                       count: survey.trackedChangeCount,
+                                       shown: survey.trackedChanges))
+        }
+        if survey.removalCount > 0 {
+            blocks.append(Self.section("Deleted — untracked and ignored",
+                                       count: survey.removalCount,
+                                       shown: survey.removals))
+        }
+        blocks.append(Self.audioNotice)
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// `count` is the pi's exact total; `shown` is already capped twice — once
+    /// for transport, once here. Never report `shown.count` as the total.
+    private static func section(_ heading: String, count: Int, shown: [String]) -> String {
+        let visible = shown.prefix(8)
+        var lines = ["\(heading) (\(count)):"]
+        lines.append(contentsOf: visible.map { "    \($0)" })
+        let remainder = count - visible.count
+        if remainder > 0 { lines.append("    …and \(remainder) more") }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - menu
 
     private func buildMenu() -> NSMenu {
@@ -229,8 +360,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         moduiItem = item("Open MOD-UI", #selector(openModUI(_:)))
         sshItem = item("SSH to pi-Stomp", #selector(openSSH(_:)))
+        deployMenu = NSMenu()
+        deployMenu.delegate = self
+        deployItem = NSMenuItem(title: "Deploy", action: nil, keyEquivalent: "")
+        deployItem.submenu = deployMenu
         m.addItem(moduiItem)
         m.addItem(sshItem)
+        m.addItem(deployItem)
         m.addItem(.separator())
 
         m.addItem(item("Network Diagnostics…", #selector(runDiagnostics(_:))))
@@ -409,5 +545,166 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit(_ s: Any?) {
         NSApp.terminate(nil)
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === deployMenu else { return }
+        refreshDeployMenu()
+    }
+
+    private func refreshDeployMenu() {
+        deployRefreshGeneration += 1
+        let generation = deployRefreshGeneration
+        deployMenu.removeAllItems()
+        let loading = NSMenuItem(title: "Loading…", action: nil, keyEquivalent: "")
+        loading.isEnabled = false
+        deployMenu.addItem(loading)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = GitHubPullRequests.loadOpen()
+            DispatchQueue.main.async {
+                guard let self, generation == self.deployRefreshGeneration else { return }
+                self.showDeployMenu(result)
+            }
+        }
+    }
+
+    private func showDeployMenu(_ result: Result<[GitHubPullRequest], GitHubPullRequests.LoadError>) {
+        deployMenu.removeAllItems()
+        switch result {
+        case .success(let pullRequests) where pullRequests.isEmpty:
+            let empty = NSMenuItem(title: "No open pi-Stomp PRs", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            deployMenu.addItem(empty)
+        case .success(let pullRequests):
+            for pullRequest in pullRequests {
+                let entry = item(pullRequest.menuTitle, #selector(deployPullRequest(_:)))
+                entry.representedObject = pullRequest
+                deployMenu.addItem(entry)
+            }
+        case .failure(let error):
+            NSLog("Cannot list pi-Stomp pull requests: %@", error.description)
+            let title: String
+            switch error {
+            case .unavailable:
+                title = "GitHub CLI not installed"
+            case .authenticationFailed:
+                title = "GitHub CLI authentication failed"
+            case .commandFailed, .invalidOutput:
+                title = "Unable to load pull requests"
+            }
+            let failure = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            failure.isEnabled = false
+            deployMenu.addItem(failure)
+        }
+    }
+
+    @objc private func deployPullRequest(_ sender: NSMenuItem) {
+        guard let pullRequest = sender.representedObject as? GitHubPullRequest,
+              !deploySurveyRunning else { return }
+        deploySurveyRunning = true
+
+        // The survey is an ssh round trip with a 20 s ceiling. A click that
+        // does nothing visible for several seconds reads as a click that
+        // missed, so the wait gets the same indeterminate window the
+        // diagnostics collector uses.
+        let progress = ProgressWindowController(title: "Checking the pi-Stomp working copy…")
+        NSApp.activate(ignoringOtherApps: true)
+        progress.window?.orderFrontRegardless()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = PiWorkingCopy.survey()
+            DispatchQueue.main.async {
+                progress.window?.close()
+                self.deploySurveyRunning = false
+                guard self.confirmDeployment(of: pullRequest, given: outcome) else { return }
+                self.openDeploymentTerminal(for: pullRequest, replacing: outcome)
+            }
+        }
+    }
+    /// `replacing` is the survey that justified the confirmation. It is used
+    /// for one line of output: the commit the deploy is about to detach away
+    /// from. The deploy leaves a detached HEAD, so without printing it here
+    /// the way back to the tree the user had is gone from every record.
+    private func openDeploymentTerminal(for pullRequest: GitHubPullRequest,
+                                        replacing outcome: PiWorkingCopy.Outcome) {
+        let target = Self.shellQuote("pistomp@\(JackTools.piHostname)")
+        let restoreEcho: String
+        if case .surveyed(let survey) = outcome, let ref = survey.branch ?? survey.head {
+            restoreEcho = "echo " + Self.shellQuote(
+                "Replacing \(ref). To return: cd ~/pi-stomp && git checkout \(ref)")
+        } else {
+            // No `:` no-op here — the line is simply absent from the script.
+            restoreEcho = ""
+        }
+        let script = """
+        #!/bin/sh
+        set -u
+        TARGET=\(target)
+        PR_NUMBER=\(pullRequest.number)
+
+        echo "Deploying pi-Stomp PR #$PR_NUMBER to $TARGET"
+        \(restoreEcho)
+        echo
+        ssh -tt "$TARGET" /bin/sh -s -- "$PR_NUMBER" <<'REMOTE_SCRIPT'
+        set -eu
+        PR_NUMBER="$1"
+        SRC="$HOME/pi-stomp"
+
+        if [ ! -d "$SRC/.git" ]; then
+            echo "==> Expanding pi-Stomp Git repository"
+            "$SRC/util/expand-git.sh"
+        fi
+
+        cd "$SRC"
+        echo "==> Removing local pi-Stomp source changes"
+        git clean -fdx -e \(PiWorkingCopy.cleanExclusion)
+        echo "==> Fetching refs/pull/$PR_NUMBER/head"
+        git fetch --force origin "refs/pull/$PR_NUMBER/head"
+        echo "==> Checking out PR head"
+        git checkout --detach --force FETCH_HEAD
+        echo "==> Restarting mod-ala-pi-stomp"
+        sudo systemctl restart mod-ala-pi-stomp
+        if ! sudo systemctl is-active --quiet mod-ala-pi-stomp; then
+            echo "ERROR: mod-ala-pi-stomp failed to start." >&2
+            sudo systemctl status --no-pager mod-ala-pi-stomp || true
+            exit 1
+        fi
+        echo "==> pi-Stomp PR #$PR_NUMBER is deployed."
+        REMOTE_SCRIPT
+
+        status=$?
+        echo
+        if [ "$status" -eq 0 ]; then
+            echo "Deployment complete."
+        else
+            echo "Deployment failed (exit $status)." >&2
+        fi
+        /bin/rm -f -- "$0"
+        exit "$status"
+        """
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiStompCompanion-deploy-\(pullRequest.number)-\(UUID().uuidString).command")
+        do {
+            try script.write(to: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path.path)
+        } catch {
+            NSLog("Cannot prepare deployment Terminal command: %@", error.localizedDescription)
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ProcessRunner.run("/usr/bin/open", args: ["-a", "Terminal", path.path], timeout: 5)
+            if result.launchError != nil || result.status != 0 {
+                try? FileManager.default.removeItem(at: path)
+                NSLog("Cannot open deployment in Terminal: %@", result.combined)
+            }
+        }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

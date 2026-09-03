@@ -288,8 +288,8 @@ final class SettingsWindowController: NSWindowController {
 
         select(netLatencyPopup, String(ConfigStore.int(values, "NetLatency", 4)))
         select(netRingPopup, String(ConfigStore.int(values, "NetRing", 1024)))
-        rtNapiField.stringValue = String(ConfigStore.int(values, "NetRtNapi", 60))
-        rtIrqField.stringValue = String(ConfigStore.int(values, "NetRtIrq", 50))
+        rtNapiField.stringValue = String(ConfigStore.int(values, "NetRtNapi", 72))
+        rtIrqField.stringValue = String(ConfigStore.int(values, "NetRtIrq", 73))
         cpuNetField.stringValue = ConfigStore.string(values, "NetCpuNet")
         cpuDspField.stringValue = ConfigStore.string(values, "NetCpuDsp")
         nicRingField.stringValue = ConfigStore.string(values, "NetNicRing")
@@ -456,8 +456,8 @@ private enum ConfigStore {
         // jackbridge/pi/bin/jackbridge-napi-rt.
         "NetLatency": 4,
         "NetRing": 1024,
-        "NetRtNapi": 60,
-        "NetRtIrq": 50,
+        "NetRtNapi": 72,
+        "NetRtIrq": 73,
         "NetCpuNet": "",
         "NetCpuDsp": "",
         "NetGovernor": "",
