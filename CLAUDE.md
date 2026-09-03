@@ -383,8 +383,8 @@ a value that disappears when audio restarts is worse than no value.
 |------------------|----------|---------|---------|
 | `NetLatency` | `JACKBRIDGE_NET_LATENCY` | netadapter `-l`, cycles of loop cushion | 4 |
 | `NetRing` | `JACKBRIDGE_NET_RING` | netadapter `-g`, slip-ring frames | 1024 |
-| `NetRtNapi` | `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | 60 |
-| `NetRtIrq` | `JACKBRIDGE_RT_IRQ` | `chrt -f` on the eth interrupt thread | 50 |
+| `NetRtNapi` | `JACKBRIDGE_RT_NAPI` | `chrt -f` on `napi/$IFACE-*` | 72 |
+| `NetRtIrq` | `JACKBRIDGE_RT_IRQ` | `chrt -f` on the eth interrupt thread | 73 |
 | `NetCpuNet` | `JACKBRIDGE_CPU_NET` | `taskset` for NAPI + `smp_affinity_list` for the interrupt | empty |
 | `NetCpuDsp` | `JACKBRIDGE_CPU_DSP` | `taskset` for mod-host | empty |
 | `NetGovernor` | `JACKBRIDGE_GOVERNOR` | `scaling_governor` | empty |
@@ -395,8 +395,11 @@ a value that disappears when audio restarts is worse than no value.
 
 Empty means *do not touch that setting on the pi* — not "apply a default". A
 value we never write is one a measurement does not have to account for. The
-numeric defaults are the pi's pre-existing behaviour, so adopting this
-mechanism changed no timing.
+numeric defaults were the pi's pre-existing behaviour, so adopting this
+mechanism changed no timing. `NetRtNapi` and `NetRtIrq` are the exception: they
+were 60/50 for that reason and are now 72/73, which lifts the packet path above
+the plugin graph. The rationale, and why both stay below jackd's 75, is in
+Step 3 of `jackbridge/pi/bin/jackbridge-napi-rt`.
 
 The user-facing path is the Settings window's **Pi tuning** section, then
 Apply. The maintainer path is the same file plus:

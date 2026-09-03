@@ -10,13 +10,19 @@
 # THE MAC OWNS EVERY VALUE HERE. Each knob is a JACKBRIDGE_* variable read from
 # /etc/default/jackbridge, which jackbridge-ctl writes from config.plist on the
 # Mac before each service start. Nothing in this file is a setting the pi keeps
-# on its own: the defaults below are exactly the present behaviour, so a pi with
-# no environment file behaves as it always did, and a reimaged pi costs no
-# configuration. Do not hand-edit /etc/default/jackbridge — the next start
-# overwrites it.
+# on its own, and a reimaged pi therefore costs no configuration. Do not
+# hand-edit /etc/default/jackbridge — the next start overwrites it.
 #
-#   JACKBRIDGE_RT_NAPI      chrt -f priority for napi/$IFACE-*        (60)
-#   JACKBRIDGE_RT_IRQ       chrt -f priority for irq/<n>-*            (50)
+# The RT defaults below are NOT the pi's original behaviour. They were 60/50,
+# chosen to reproduce it exactly so that adopting this mechanism changed no
+# timing; they are now 72/73, which places the packet path above the plugin
+# graph. See Step 3 for the reasoning. Keep them equal to the NetRtNapi /
+# NetRtIrq defaults in jackbridge/installer/config.plist and in
+# SettingsWindowController.defaults — a pi with no environment file must behave
+# like a Mac that has never opened the Settings window.
+#
+#   JACKBRIDGE_RT_NAPI      chrt -f priority for napi/$IFACE-*        (72)
+#   JACKBRIDGE_RT_IRQ       chrt -f priority for irq/<n>-*            (73)
 #   JACKBRIDGE_CPU_NET      CPU list for NAPI + the eth interrupt     (unset)
 #   JACKBRIDGE_CPU_DSP      CPU list for mod-host                     (unset)
 #   JACKBRIDGE_GOVERNOR     cpufreq scaling_governor                  (unset)
@@ -53,8 +59,8 @@ if [ ! -r "$STATE" ]; then
 fi
 IFACE=$(cat "$STATE")
 
-RT_NAPI="${JACKBRIDGE_RT_NAPI:-60}"
-RT_IRQ="${JACKBRIDGE_RT_IRQ:-50}"
+RT_NAPI="${JACKBRIDGE_RT_NAPI:-72}"
+RT_IRQ="${JACKBRIDGE_RT_IRQ:-73}"
 CPU_NET="${JACKBRIDGE_CPU_NET:-}"
 CPU_DSP="${JACKBRIDGE_CPU_DSP:-}"
 GOVERNOR="${JACKBRIDGE_GOVERNOR:-}"
@@ -65,8 +71,8 @@ NIC_OFFLOAD="${JACKBRIDGE_NIC_OFFLOAD:-}"
 
 # SCHED_FIFO is 1..99. Anything else is a typo in config.plist, and a typo must
 # not silently become a priority.
-case "$RT_NAPI" in ''|*[!0-9]*|0) RT_NAPI=60 ;; esac
-case "$RT_IRQ"  in ''|*[!0-9]*|0) RT_IRQ=50 ;; esac
+case "$RT_NAPI" in ''|*[!0-9]*|0) RT_NAPI=72 ;; esac
+case "$RT_IRQ"  in ''|*[!0-9]*|0) RT_IRQ=73 ;; esac
 [ "$RT_NAPI" -le 99 ] || RT_NAPI=99
 [ "$RT_IRQ"  -le 99 ] || RT_IRQ=99
 
@@ -263,16 +269,50 @@ echo "jackbridge-napi-rt: $IFACE threaded NAPI enabled" >&2
 # Step 3: Priority and placement for the napi/$IFACE-* kthreads. Wait up to
 # 500 ms for them to appear — on first enable they may not exist yet.
 #
-# On the priority itself: 60 was chosen so the audio threads (jackd 75,
-# mod-host 65) finish their cycle before NAPI delivers the next batch. That is
-# a design decision that has never been measured, and the opposite case is at
-# least as strong — at 60 the whole packet path ranks below the work waiting
-# for it, so a packet can wait a plugin quantum before the kernel looks at it,
-# and a plugin quantum is bounded by nothing. Raising both to 72 is nearly
-# free, because an interrupt handler and a NAPI poll each do a small bounded
-# amount of work and then yield: it removes a preemption, not a share of the
-# CPU. That is what JACKBRIDGE_RT_NAPI / JACKBRIDGE_RT_IRQ are for. Measure it
-# (docs/plan-tuning.md 3.4) and record the result in docs/JITTER.md.
+# On the priority itself. The ladder this targets, measured on a Pi 5:
+#
+#   90  irq/138-dw_axi_dmac_platform   the DAC's DMA — pi-Stomp owns it
+#   80  ttymidi (serial reader)        pi-Stomp owns it
+#   75  jackd                          backend + graph dispatch (-P 75)
+#   73  irq/<n>-eth*                   JACKBRIDGE_RT_IRQ
+#   72  napi/$IFACE-*                  JACKBRIDGE_RT_NAPI
+#   70  mod-host, ttymidi (jack)       the plugin graph
+#
+# The old defaults were 60/50, which put the whole packet path *below* the work
+# waiting for it: a packet could wait a mod-host DSP quantum before the kernel
+# looked at it. Raising both above 70 is nearly free, because an interrupt
+# handler and a NAPI poll each do a small bounded amount of work and then
+# yield — it removes a preemption, not a share of the CPU. On this link that is
+# doubly true: netJACK2 sends one small packet per period, so a poll never
+# approaches its 64-packet budget and is nearly as short as the interrupt.
+#
+# IRQ above NAPI because the interrupt is what schedules the poll; putting the
+# worker above its own dispatcher delays the dispatch you were waiting for.
+#
+# Both stay BELOW jackd's 75, and the reason is specific to this topology
+# rather than general. The tempting argument is that the eth IRQ carries the
+# packet jackd needs, exactly as the DAC's DMA IRQ at 90 does — so it should
+# outrank the graph for the same reason. It does not, because the pi's jackd is
+# ALSA-clocked ("-d alsa -d hw:0"): the DMA interrupt starts the cycle, and
+# netadapter is a *slave* internal client behind a resampler and a NET_RING
+# slip ring. A late packet never delays a cycle; it lowers ring occupancy, and
+# the resampler pulls it back. Absorption downstream of the eth IRQ is
+# NET_RING/2 ≈ 10.7 ms at the defaults, against a worst case of one period
+# (1.33 ms) — 8x inside the buffer built to hold it. The DAC IRQ has no such
+# absorption, which is why it, and not this one, belongs above jackd.
+#
+# The decisive counter: $IFACE is not single-purpose. It carries netJACK2 and
+# also ssh, mDNS, ARP and any other host on the LAN, and the interrupt fires
+# before anything knows which. Above 75, a stranger's traffic can preempt the
+# audio graph.
+#
+# If a DAC-less variant ever runs "jackd -d net", the packet does start the
+# cycle, absorption is zero, and this conclusion flips. Re-derive it there;
+# do not inherit it.
+#
+# Still unmeasured (docs/plan-tuning.md 3.4): the benefit has no clean
+# instrument. Ring occupancy variance is what moves, nothing exposes it, and
+# xruns stay 0 either way. Record anything you do learn in docs/JITTER.md.
 DEADLINE=$(( $(date +%s%3N) + 500 ))
 while true; do
     mapfile -t PIDS < <(pgrep "napi/$IFACE" 2>/dev/null || true)
