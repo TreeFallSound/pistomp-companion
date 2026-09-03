@@ -17,6 +17,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var deployMenu: NSMenu!
     private var deployItem: NSMenuItem!
     private var deployRefreshGeneration = 0
+    /// True from the click on a PR until its confirmation is answered. The
+    /// working-copy survey is an ssh round trip behind a modal progress
+    /// window, and the menu is already closed by then — without this a user
+    /// who reopens the menu can stack a second survey and a second alert
+    /// behind the first.
+    private var deploySurveyRunning = false
 
     /// Monotonic nonce for JB_OFF_RESYNC_REQUEST. The driver compares the
     /// value against the last one it saw and acts only on a change, and the
@@ -211,14 +217,125 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func confirmDestructiveDeployment(for pullRequest: GitHubPullRequest) -> Bool {
+    /// The deploy is destructive only when the pi has something to lose, and
+    /// `PiWorkingCopy.survey` is what settles which case this is. A warning
+    /// that fired on every deploy — the old behaviour — told the user nothing
+    /// and trained them to click through the one deploy that mattered. So a
+    /// surveyed-clean tree gets a plain confirmation in the informational
+    /// style, and every other case gets a warning that says what is at stake.
+    ///
+    /// The two cases we could not survey warn *without* claiming to know the
+    /// cost. Unsurveyed is never rendered as clean.
+    private func confirmDeployment(of pullRequest: GitHubPullRequest,
+                                   given outcome: PiWorkingCopy.Outcome) -> Bool {
         let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Deploy PR #\(pullRequest.number) and discard local changes?"
-        alert.informativeText = "Deployment replaces the checked-out pi-Stomp working copy on the pi. It removes untracked and ignored files and discards tracked changes before checking out this pull request."
-        alert.addButton(withTitle: "Deploy and Discard Changes")
+        let proceedTitle: String
+        var destructive = true
+
+        switch outcome {
+        case .surveyed(let survey) where survey.isClean:
+            // Nothing to discard. This is still a confirmation, because the
+            // deploy restarts mod-ala-pi-stomp and cuts audio — but it is not
+            // a warning, and it must not carry a warning's styling.
+            destructive = false
+            alert.alertStyle = .informational
+            alert.messageText = "Deploy PR #\(pullRequest.number) to pi-Stomp?"
+            alert.informativeText = """
+            \(Self.workingCopyPhrase(survey)) has no local changes, so nothing is discarded.
+
+            \(Self.audioNotice)
+            """
+            proceedTitle = "Deploy"
+
+        case .surveyed(let survey):
+            let total = survey.trackedChangeCount + survey.removalCount
+            alert.alertStyle = .warning
+            alert.messageText = "Deploy PR #\(pullRequest.number) and discard "
+                + "\(total) local \(total == 1 ? "change" : "changes") on the pi?"
+            alert.informativeText = Self.lossDetail(survey)
+            proceedTitle = "Deploy and Discard Changes"
+
+        case .unexpanded:
+            alert.alertStyle = .warning
+            alert.messageText = "Deploy PR #\(pullRequest.number) to an unexpanded pi-Stomp tree?"
+            alert.informativeText = """
+            The pi's ~/pi-stomp carries no Git repository yet, so its local changes cannot be listed. \
+            Deploying expands the repository, then deletes every untracked and ignored file and \
+            discards tracked changes.
+
+            Any edit made to the shipped source is lost, and it cannot be shown here first.
+
+            \(Self.audioNotice)
+            """
+            proceedTitle = "Deploy and Discard Changes"
+
+        case .unreadable(let reason):
+            alert.alertStyle = .warning
+            alert.messageText = "Deploy PR #\(pullRequest.number) without checking the pi?"
+            alert.informativeText = """
+            The pi's working copy could not be read: \(reason).
+
+            Deploying still deletes every untracked and ignored file in ~/pi-stomp and discards \
+            tracked changes. What that costs is unknown.
+
+            \(Self.audioNotice)
+            """
+            proceedTitle = "Deploy and Discard Changes"
+        }
+
+        alert.addButton(withTitle: proceedTitle)
         alert.addButton(withTitle: "Cancel")
+        if destructive {
+            // Return must not fire an unrecoverable deploy. Hand the default
+            // to Cancel; Escape already maps there by title.
+            alert.buttons[0].keyEquivalent = ""
+            alert.buttons[1].keyEquivalent = "\r"
+        }
+        NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private static let audioNotice =
+        "Deploying checks out the pull request and restarts mod-ala-pi-stomp, which interrupts audio."
+
+    /// "The pi's working copy on main at a1b2c3d", degrading through
+    /// "detached at a1b2c3d" to the bare phrase as fields go unknown.
+    private static func workingCopyPhrase(_ survey: PiWorkingCopy.Survey) -> String {
+        var parts = ["The pi's working copy"]
+        if let branch = survey.branch {
+            parts.append("on \(branch)")
+        } else if survey.head != nil {
+            parts.append("detached")
+        }
+        if let head = survey.head { parts.append("at \(head)") }
+        return parts.joined(separator: " ")
+    }
+
+    private static func lossDetail(_ survey: PiWorkingCopy.Survey) -> String {
+        var blocks = ["\(Self.workingCopyPhrase(survey)) carries changes this deploy destroys."]
+        if survey.trackedChangeCount > 0 {
+            blocks.append(Self.section("Discarded — tracked edits",
+                                       count: survey.trackedChangeCount,
+                                       shown: survey.trackedChanges))
+        }
+        if survey.removalCount > 0 {
+            blocks.append(Self.section("Deleted — untracked and ignored",
+                                       count: survey.removalCount,
+                                       shown: survey.removals))
+        }
+        blocks.append(Self.audioNotice)
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// `count` is the pi's exact total; `shown` is already capped twice — once
+    /// for transport, once here. Never report `shown.count` as the total.
+    private static func section(_ heading: String, count: Int, shown: [String]) -> String {
+        let visible = shown.prefix(8)
+        var lines = ["\(heading) (\(count)):"]
+        lines.append(contentsOf: visible.map { "    \($0)" })
+        let remainder = count - visible.count
+        if remainder > 0 { lines.append("    …and \(remainder) more") }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - menu
@@ -486,11 +603,42 @@ extension AppDelegate: NSMenuDelegate {
 
     @objc private func deployPullRequest(_ sender: NSMenuItem) {
         guard let pullRequest = sender.representedObject as? GitHubPullRequest,
-              confirmDestructiveDeployment(for: pullRequest) else { return }
-        openDeploymentTerminal(for: pullRequest)
+              !deploySurveyRunning else { return }
+        deploySurveyRunning = true
+
+        // The survey is an ssh round trip with a 20 s ceiling. A click that
+        // does nothing visible for several seconds reads as a click that
+        // missed, so the wait gets the same indeterminate window the
+        // diagnostics collector uses.
+        let progress = ProgressWindowController(title: "Checking the pi-Stomp working copy…")
+        NSApp.activate(ignoringOtherApps: true)
+        progress.window?.orderFrontRegardless()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = PiWorkingCopy.survey()
+            DispatchQueue.main.async {
+                progress.window?.close()
+                self.deploySurveyRunning = false
+                guard self.confirmDeployment(of: pullRequest, given: outcome) else { return }
+                self.openDeploymentTerminal(for: pullRequest, replacing: outcome)
+            }
+        }
     }
-    private func openDeploymentTerminal(for pullRequest: GitHubPullRequest) {
+    /// `replacing` is the survey that justified the confirmation. It is used
+    /// for one line of output: the commit the deploy is about to detach away
+    /// from. The deploy leaves a detached HEAD, so without printing it here
+    /// the way back to the tree the user had is gone from every record.
+    private func openDeploymentTerminal(for pullRequest: GitHubPullRequest,
+                                        replacing outcome: PiWorkingCopy.Outcome) {
         let target = Self.shellQuote("pistomp@\(JackTools.piHostname)")
+        let restoreEcho: String
+        if case .surveyed(let survey) = outcome, let ref = survey.branch ?? survey.head {
+            restoreEcho = "echo " + Self.shellQuote(
+                "Replacing \(ref). To return: cd ~/pi-stomp && git checkout \(ref)")
+        } else {
+            // No `:` no-op here — the line is simply absent from the script.
+            restoreEcho = ""
+        }
         let script = """
         #!/bin/sh
         set -u
@@ -498,6 +646,7 @@ extension AppDelegate: NSMenuDelegate {
         PR_NUMBER=\(pullRequest.number)
 
         echo "Deploying pi-Stomp PR #$PR_NUMBER to $TARGET"
+        \(restoreEcho)
         echo
         ssh -tt "$TARGET" /bin/sh -s -- "$PR_NUMBER" <<'REMOTE_SCRIPT'
         set -eu
@@ -511,7 +660,7 @@ extension AppDelegate: NSMenuDelegate {
 
         cd "$SRC"
         echo "==> Removing local pi-Stomp source changes"
-        git clean -fdx -e .git-meta/
+        git clean -fdx -e \(PiWorkingCopy.cleanExclusion)
         echo "==> Fetching refs/pull/$PR_NUMBER/head"
         git fetch --force origin "refs/pull/$PR_NUMBER/head"
         echo "==> Checking out PR head"
