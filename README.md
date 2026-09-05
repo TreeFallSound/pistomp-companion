@@ -16,7 +16,55 @@ They do not run on Intel Macs.
 - Apple Silicon Mac, macOS 13 or later.
 - A pi-Stomp device (pistomp 3.3.0 or newer).
 - An Ethernet cable, connected directly from the Mac to the pi.
-- For daily use: the two release packages. For development: Xcode.
+- Two macOS packages: `jack2-<version>.pkg` and
+  `PiStompCompanion-<version>.pkg`. Get them from a maintainer, or build them
+  (see **Development**).
+- Two pi packages: the `jack2` and `jackbridge` debs. A pi-Stomp image of
+  3.3.0 or newer already has them.
+- For development only: Xcode and [`just`](https://just.systems).
+
+---
+
+## Set up
+
+Do these steps one time. Steps 1 to 3 are on the pi. Steps 4 to 8 are on the
+Mac.
+
+1. **Install the two debs on the pi. Install `jack2` first.** A pi-Stomp image
+   of 3.3.0 or newer contains both debs.
+2. **Do not start the jackbridge service on the pi.** The service is not
+   enabled at boot. The Mac starts it and stops it.
+3. **Open the network menu on the pi screen.** Select **Wired Connection**.
+   Then enable audio streaming.
+4. **Connect the Ethernet cable directly from the Mac to the pi.** Use a USB
+   Ethernet adapter if the Mac has no Ethernet port.
+5. **Move Wi-Fi above Ethernet in the network service order.** Go to System
+   Settings → Network → "…" → **Set Service Order**. Drag **Wi-Fi** above the
+   Ethernet device. The pi supplies no gateway. If the Ethernet device stays
+   first, the Mac loses the Internet connection.
+6. **Install the two macOS packages. Install `jack2` first.** The packages
+   have no signature, and Gatekeeper refuses a double-click. Install them in
+   Terminal:
+
+   ```sh
+   sudo installer -pkg ~/Downloads/jack2-<version>.pkg -target /
+   sudo installer -pkg ~/Downloads/PiStompCompanion-<version>.pkg -target /
+   ```
+
+   The `installer` command does not do the Gatekeeper check. To install with
+   a double-click, first remove the quarantine attribute with
+   `xattr -c ~/Downloads/*.pkg`.
+7. **Open PiStomp Companion.** The app starts the audio stack. The app has no
+   Dock icon and no window. Its icon is in the menu bar.
+8. **Send an ssh key to the pi.** At the first start, the app opens a Terminal
+   window and runs `ssh-copy-id`. Type the pi password one time. The app then
+   controls the pi with the key.
+
+If the pi hostname is not `pistomp.local`, open **Settings…** in the menu.
+Type the correct hostname. Two pi-Stomps on one network cannot use the same
+hostname.
+
+Open the DAW. Select **pi-Stomp (<host>)** as the audio device.
 
 ---
 
@@ -25,12 +73,16 @@ They do not run on Intel Macs.
 1. Connect the Ethernet cable directly from the Mac to the pi.
 2. On the pi, open the network menu. Select **Wired Connection**, then enable
    audio streaming.
-3. Install the packages, then open the app (see below).
+3. Open the app.
 4. In your DAW, select **pi-Stomp (<host>)** as the audio device.
 
 The app has no Dock icon and no window. Find the pi-Stomp icon in the menu
 bar. The icon shows the connection state. The menu has start, stop, restart,
 SSH, Deploy, MOD-UI, and diagnostics.
+
+The app owns the service lifecycle. When you open the app, it starts the audio
+stack. When you quit the app, it stops the stack. The pi holds no settings of
+its own: the Mac sends the tuning values to the pi before each start.
 
 ### Audio channels in your DAW
 
@@ -42,22 +94,12 @@ SSH, Deploy, MOD-UI, and diagnostics.
 
 ---
 
-## Install
+## Update
 
-The [Releases](https://github.com/treefallsound/pistomp-companion/releases)
-page has two packages. Install them in this order:
-
-1. **`jack2-<version>.pkg`** — the JACK2 fork the engine needs. Install this
-   first.
-2. **`PiStompCompanion-<version>.pkg`** — the app, the HAL driver, the daemon,
-   and the service scripts.
-
-You can run the same package again to reinstall; your changes `config.plist`
-will not be overwritten, but make sure to read the release notes for new
-configuration options and defaults.
-
-The app owns the service lifecycle. Opening the app starts the audio stack.
-Quitting the app stops it.
+To install a new version, use the commands in step 6 again. To repair an
+installation, install the same package again. An installation keeps your
+`config.plist`. Read the release notes for new configuration keys and new
+default values.
 
 ---
 
@@ -170,6 +212,42 @@ just device-name     # show the audio device entry
 For a release package: `just pkg-install` (requires sudo). That is the
 authoritative install path — the loops above are for iteration, and they
 deliberately skip the files the package generates or templates.
+
+### Build the packages
+
+Build `jack2` first. `build-pkg.sh` compiles against the fork's headers at
+`JACK_PREFIX`, and it stops with an error if the headers are not there.
+
+```sh
+cd ../jack2
+./build-macos-pkg.sh 1.9.22-tfs.N
+sudo installer -pkg build/jack2-*.pkg -target /
+cd ../pistomp-companion
+just pkg
+```
+
+`just pkg` writes
+`jackbridge/installer/build/PiStompCompanion-<version>.pkg`. Send that file
+and `../jack2/build/jack2-*.pkg` to the tester. The tester does not need this
+repository, Xcode, or `just`.
+
+### Signatures
+
+`build-pkg.sh` reads `SIGN_APP_IDENTITY`, `SIGN_INSTALLER_IDENTITY`, and
+`NOTARY_PROFILE`. If these variables are empty, the build makes an ad-hoc
+signature on each binary and an unsigned `.pkg`.
+
+An ad-hoc signature is sufficient to run the code. The driver, the daemon,
+and the app start on a different Apple Silicon Mac.
+
+An unsigned `.pkg` is not sufficient for Finder. Gatekeeper refuses a
+double-click on a package that a browser downloaded. The `installer` command
+does not do this check, thus **Set up** step 6 uses `sudo installer`. The
+`installer` command also writes the files without the quarantine attribute,
+and the app starts with no more prompts.
+
+To make a signed and notarized package, set the three variables before the
+build. See `docs/releases.md`.
 
 # Architecture
 
