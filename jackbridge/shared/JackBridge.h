@@ -435,7 +435,8 @@ typedef float sample_t;
 #define NUM_INSTANCES       1
 
 #define STRBUFSZ            (0x8000) // 32KB Ring buffer
-#define STRBUFNUM           (STRBUFSZ/AUDIO_SAMPLE_SIZE) // 1024 entries
+#define STRBUFNUM           (STRBUFSZ/AUDIO_SAMPLE_SIZE)
+#define JB_RING_FRAMES      (STRBUFNUM/2)
 #define REGSMAP_SIZE        (0x10000*(MAX_STREAMS)+0x10000)
 #define REGSMAP_BOUNDARY    REGSMAP_SIZE
 #define JACK_SHMSIZE        (REGSMAP_SIZE*NUM_INSTANCES)
@@ -462,6 +463,11 @@ static_assert((JB_OFF_SLAVE_PORTS_CONNECTED % 8) == 0 &&
               (JB_OFF_DRIVER_FAULT % 8) == 0 &&
               (JB_OFF_RESYNC_REQUEST % 8) == 0,
               "protocol-8 atomic<uint64_t> fields must be 8-byte aligned");
+static_assert((JB_RING_FRAMES & (JB_RING_FRAMES - 1)) == 0,
+              "JB_RING_FRAMES must be a power of two: RingCopy.hpp and the "
+              "cursor masks in JackBridge.cpp wrap with & (ring_frames - 1)");
+static_assert(JB_RING_FRAMES * 2 * AUDIO_SAMPLE_SIZE == STRBUFSZ,
+              "ring frames must span exactly one stereo STRBUFSZ region");
 static_assert(JB_OFF_JITTER_FRAMES >= JB_OFF_RESYNC_REQUEST + 8 &&
               (JB_OFF_JITTER_FRAMES % 8) == 0,
               "jitter-frames field overlaps or is misaligned");
@@ -523,7 +529,7 @@ protected:
     sample_t *buf_up[MAX_STREAMS];
     sample_t *buf_down[MAX_STREAMS];
     uint64_t   FrameNumber;
-    int        RingFrames;          // shm ring size in frames (STRBUFNUM/2 = 4096)
+    int        RingFrames;          // JB_RING_FRAMES
     std::atomic<uint64_t> *shmNumberTimeStamps;
     std::atomic<uint64_t> *shmZeroHostTime;
     std::atomic<uint64_t> *shmSeed;

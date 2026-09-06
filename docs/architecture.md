@@ -109,3 +109,63 @@ Three reasons to keep SRC out of JackBridge:
 3. **It would add latency, group delay, and a control-loop failure mode** for zero benefit in this topology.
 
 If a future use case demands SRC (e.g. someone wants `jackd -d net` mode for some reason), it belongs in a separate fork or a build-time option, not in the default path.
+
+## The free-running cursors and their snap windows
+
+The daemon holds two absolute-frame cursors. Each advances by `nframes` once
+per JACK cycle and is used at `cursor % ring_frames`. Both sides share one
+clock, so the cursors free-run and only two hard hazards correct them.
+`RingProjector` (`jackbridge/daemon/RingProjector.hpp`) holds the targets and
+the window limits; `check_progress()` applies them.
+
+Design history and the defect these replaced: `docs/plan-free-running-cursor.md`.
+
+### The upstream (recv) window
+
+`recv_target()` is `halOutputWriteHead - block - jitter`. The window comes from
+the two ways a read can be wrong, not from the cushion:
+
+| Edge | Limit | Why |
+|------|-------|-----|
+| Forward | `block + jitter - period` | Beyond it, this cycle's read of `[pos, pos+P)` touches the live block at the write head. Between head jumps the cursor legitimately runs up to `block - period` ahead of the target — that headroom is the walk the cursor replaced. A tighter limit snaps mid-walk and re-reads zeroed slots every few cycles. |
+| Backward | `-block` | More than one settled block of extra latency. The data behind stays valid, so trailing costs latency and not correctness — but past one block it is staler than the alignment we advertise. |
+
+With `block = max(N, P)` the cursor's sawtooth against the head's jump fits
+inside this window for every `N`, `P` and every seed phase. The forward edge is
+the bound by construction, and the backward edge holds because
+`block >= (N+P)/2`.
+
+### The downstream (send) window
+
+`send_target()` is `halInputReadHead + block + jitter`, the mirror.
+
+| Edge | Limit | Why |
+|------|-------|-----|
+| Backward (torn) | `err < N - block - jitter` | This cycle's write of `[pos, pos+P)` lands inside the consumer's live block `[H, H+N)`. Torn audio. `N` here is the true HAL block (`hal_block_frames`), not the clearance. |
+| Forward (lap) | `err > ring - block - jitter - P` | The write wraps a full ring onto the consumer's current or next block and overwrites audio it has not consumed. |
+
+There is deliberately no forward discipline edge on the send side. A stalled
+consumer is absorbed by the cursor walking ahead open-loop, so the window is
+wide and a snap means a real hazard rather than a hiccup. A re-anchor that
+plants the cursor just before a head jump can cross the torn edge once — one
+bounded snap, then healthy.
+
+### Reading the counters
+
+Every recv snap is published to `RECV_RESYNCS`, every send snap to
+`SEND_RESYNCS`. A silent correction is how a clock-rate error hides: a steady
+climb in either means the two rates differ.
+
+The dup/skip counters are not suppressed on a snap cycle. A snap has a real
+audio cost — silence re-read forward, frames skipped backward — and hiding it
+would let a snap pass unmeasured. Read the resync counters first: if one moved,
+it explains any same-window movement in the others.
+
+### The gate
+
+Each snap rule fires only on cycles where its head published a new position. A
+head that does not move means the HAL ran no IO op in that direction, so there
+is no live block to collide with and the open-loop walk is correct. Ungated,
+the rules snap against frozen heads in a steady rhythm: the v12 recv rule
+produced a phantom clock-rate error, about 6666 false snaps in a 27 s
+recording-only window.
