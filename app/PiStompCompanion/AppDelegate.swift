@@ -61,8 +61,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// skip. Lazy so it can capture `runCtl` — every subprocess the Companion
     /// spawns goes through that one bounded path.
     private lazy var piHealer = PiSlaveHealer { [weak self] sub, done in
-        guard let self else { return done(false) }
-        self.runCtl(sub, completion: done)
+        guard let self else { return done(.failed) }
+        self.runCtlOutcome(sub, completion: done)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -434,18 +434,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// few seconds on a good day and can wedge on a jackd that won't die, so
     /// it runs off-main and bounded rather than fire-and-forget.
     private func runCtl(_ sub: String, completion: @escaping (Bool) -> Void = { _ in }) {
+        runCtlOutcome(sub) { completion($0 == .started) }
+    }
+
+    private func runCtlOutcome(_ sub: String,
+                               completion: @escaping (PiSlaveHealer.Outcome) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let r = ProcessRunner.run(Self.ctl, args: [sub], timeout: 30)
-            let succeeded = r.launchError == nil && !r.timedOut && r.status == 0
+            let outcome: PiSlaveHealer.Outcome
             if let launchError = r.launchError {
                 NSLog("jackbridge-ctl \(sub) failed to launch: \(launchError)")
+                outcome = .failed
             } else if r.timedOut {
                 NSLog("jackbridge-ctl \(sub) timed out; killed")
-            } else if r.status != 0 {
+                outcome = .failed
+            } else if r.status == 0 {
+                outcome = .started
+            } else if r.status == PiSlaveHealer.noWiredLinkExitCode {
+                outcome = .noWiredLink
+            } else {
                 NSLog("jackbridge-ctl \(sub) exit \(r.status.map(String.init) ?? "?"): \(r.combined)")
+                outcome = .failed
             }
             DispatchQueue.main.async {
-                completion(succeeded)
+                completion(outcome)
             }
         }
     }

@@ -6,6 +6,10 @@ Requires=jack.service
 After=jack.service mod-host.service
 # Not WantedBy anything — the Mac starts it on demand over ssh.
 
+# Must exceed RestartSec × StartLimitBurst or the burst is never reached.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=pistomp
@@ -24,6 +28,10 @@ EnvironmentFile=-/etc/default/jackbridge
 LimitMEMLOCK=infinity
 LimitRTPRIO=infinity
 
+# No cable is a skip, not a fault: Restart= does not fire on a failed
+# ExecCondition, and the start job still exits 0.
+ExecCondition=/usr/local/libexec/jackbridge/jb-detect-net-iface
+
 # jack.service is Type=simple, so After=jack.service only waits for jackd to
 # fork -- not for its server socket to accept clients. jackbridge-pi-up calls
 # jack_load against jackd, which races socket readiness on a busy boot. Block
@@ -37,8 +45,8 @@ ExecStartPre=/usr/local/bin/wait-for-jack.sh
 # Pin the netJACK2 multicast group (225.3.19.154) to a wired interface so
 # discovery doesn't follow the default route out wlan0. Auto-detects the
 # right NIC; respects $JACKBRIDGE_IFACE. Needs CAP_NET_ADMIN — the `+` prefix
-# runs the command as root regardless of User=. Fails the unit start if no
-# wired iface is available, which is the correct loud failure mode.
+# runs the command as root regardless of User=. Fails the unit loudly, now
+# only for a real fault — the no-cable case never reaches here.
 ExecStartPre=+/usr/local/libexec/jackbridge/jackbridge-pin-route
 
 # Remove interrupt coalescing, enable threaded NAPI, and apply SCHED_FIFO 60
@@ -69,9 +77,8 @@ ExecStopPost=+/usr/local/libexec/jackbridge/jackbridge-unpin-route
 TimeoutStartSec=45
 TimeoutStopSec=15
 # the Mac and jackbridge-ctl own start/stop, and a unit that restarts on a
-# deliberate stop would fight jackbridge-pi-down. on-failure fires only on
-# the watcher's liveness exit(1) or a crash, both of which mean "the slave
-# is gone but should not be", i.e. exactly the self-heal case.
+# deliberate stop would fight jackbridge-pi-down. on-failure fires on the
+# watcher's liveness exit(1), a crash, or a failed ExecStartPre.
 Restart=on-failure
 # 3 s: long enough for jackd to settle and for the Mac netmanager's master
 # dedupe to see the old slave gone before the fresh SLAVE_AVAILABLE arrives;

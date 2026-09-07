@@ -14,6 +14,8 @@
 #   jackbridge-ctl status
 #   jackbridge-ctl pi-status       # key=value truth from the pi (jackbridge-pi-status)
 #   jackbridge-ctl pi-start        # start the pi slave only; idempotent, no Mac bounce
+#                                  # exit 0 = running, 3 = no wired link on the pi,
+#                                  # 1 = unreachable or a real start failure
 #   jackbridge-ctl logs            # tail -f the agent log files
 #
 # Maintainer only (not in the Companion menu):
@@ -298,11 +300,20 @@ cmd_pi_start() {
         exit 1
     fi
     push_pi_config
-    if ! pi_ssh "sudo systemctl start $PI_SERVICE" >/dev/null 2>&1; then
-        echo "pi: systemctl start $PI_SERVICE failed (pi reachable)" >&2
-        exit 1
-    fi
-    echo "pi: systemctl start $PI_SERVICE ok"
+    # `systemctl start` exits 0 for a condition-skipped unit; only is-active
+    # separates "running" from "no cable on the pi".
+    state=$(pi_ssh "sudo systemctl start $PI_SERVICE >/dev/null 2>&1; \
+                    systemctl is-active $PI_SERVICE" 2>/dev/null | tr -d '\r\n ')
+    case "$state" in
+        active|activating)
+            echo "pi: systemctl start $PI_SERVICE ok" ;;
+        inactive)
+            echo "pi: no wired link on the pi — slave not started" >&2
+            exit 3 ;;
+        *)
+            echo "pi: systemctl start $PI_SERVICE failed (state=${state:-unknown})" >&2
+            exit 1 ;;
+    esac
 }
 
 # `repair` is the heavy, sure-fire re-anchor: bounce coreaudiod (the only

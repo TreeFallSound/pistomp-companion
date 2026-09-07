@@ -48,17 +48,30 @@ final class PiSlaveHealer {
     private static let baseBackoff: TimeInterval = 10
     private static let maxBackoff: TimeInterval = 300
 
+    /// `jackbridge-ctl pi-start` exit 3.
+    static let noWiredLinkExitCode: Int32 = 3
+
+    /// Set by jackbridge-route-watcher while the Mac has a wired or
+    /// direct-cable interface; removed when it falls back to wifi or nothing.
+    static let macEthernetSentinel = "/var/run/jackbridge-ethernet.up"
+
+    enum Outcome {
+        case started
+        case noWiredLink
+        case failed
+    }
+
     /// Injected so this stays testable and so AppDelegate keeps ownership of
     /// how `jackbridge-ctl` is spawned. Called on the main queue; must call
     /// its completion on the main queue.
-    private let runCtl: (String, @escaping (Bool) -> Void) -> Void
+    private let runCtl: (String, @escaping (Outcome) -> Void) -> Void
 
     private var eligibleSince: Date?
     private var nextAttemptAt = Date.distantPast
     private var backoff = PiSlaveHealer.baseBackoff
     private var inFlight = false
 
-    init(runCtl: @escaping (String, @escaping (Bool) -> Void) -> Void) {
+    init(runCtl: @escaping (String, @escaping (Outcome) -> Void) -> Void) {
         self.runCtl = runCtl
     }
 
@@ -107,28 +120,39 @@ final class PiSlaveHealer {
         case .noAudioFromPi, .streaming, .startedIdle, .linkedIdle, .piUnreachable:
             break
         }
-        // No wired path yet means the pi's own ExecStartPre route pin would
-        // fail and trip its restart limiter. Wait for the cable instead of
-        // burning the pi's five allowed starts.
         guard state.jackCondition != .waitingForNetwork else { return false }
+        guard macHasEthernet() else { return false }
         guard state.piReachable else { return false }
         return state.snapshot.slavePortsConnected == 0
+    }
+
+    /// netJACK2 needs wired on both ends, so a Mac with no ethernet cannot be
+    /// healed by anything the pi does. Checked locally because it costs a
+    /// stat(2) rather than an ssh round trip.
+    private func macHasEthernet() -> Bool {
+        FileManager.default.fileExists(atPath: Self.macEthernetSentinel)
     }
 
     private func attempt() {
         inFlight = true
         NSLog("PiSlaveHealer: slave down with the stack up — jackbridge-ctl pi-start")
-        runCtl("pi-start") { [weak self] ok in
+        runCtl("pi-start") { [weak self] outcome in
             guard let self else { return }
             self.inFlight = false
-            if ok {
+            switch outcome {
+            case .started:
                 // Not "healed" — `systemctl start` returning 0 only means the
                 // unit was asked. The ports are the verdict, and the next
                 // `note` that sees them wired resets everything. Until then
                 // keep backing off, or a unit that starts and immediately
                 // fails would be re-asked every dwell forever.
                 NSLog("PiSlaveHealer: pi-start accepted; waiting for ports")
-            } else {
+            case .noWiredLink:
+                // Asking again sooner cannot plug a cable in, so skip the
+                // ramp entirely and idle at the cheapest rate.
+                NSLog("PiSlaveHealer: no wired link to the pi; holding")
+                self.backoff = Self.maxBackoff
+            case .failed:
                 NSLog("PiSlaveHealer: pi-start failed; retrying in \(Int(self.backoff))s")
             }
             self.nextAttemptAt = Date().addingTimeInterval(self.backoff)
