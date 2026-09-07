@@ -29,6 +29,21 @@ appended one line per xrun and rewrote-on-rename per event. Under load that
 pegged a core, starved jackd, and amplified the xrun rate it was measuring.
 Per-minute buckets bound the work to one int increment per event and at most
 one file write per second regardless of xrun rate.
+
+ALSO samples the packet path once per minute, and reports it only for a minute
+that went wrong. This exists because of the 20 s graph freeze of 2026-09-06
+(02:49:58 to 02:50:18), which the evidence could not explain: the packet path
+was already confined to one core, and the only other artefact in the window was
+a firmware mailbox timeout on an unrelated CPU. Three hypotheses survived, and
+nothing recorded at the time could separate them:
+
+    an RX flood          napi cpu, irq rate and rx_packets all spike
+    a VPU/firmware stall every counter flat, and the watcher's own loop stalls
+    RT contention        counters flat, dsp cpu drops, loop keeps ticking
+
+The sample below is chosen to discriminate exactly those three. Read
+`stall` first: it is the watcher's own scheduling gap, so it separates "the
+system stopped running things" from "the system ran the wrong things".
 """
 
 import os
@@ -70,6 +85,7 @@ def netadapter_present() -> bool:
                 return True
     return False
 
+
 N_BUCKETS = 15  # 15 one-minute buckets = 15-minute window
 
 PATTERN = re.compile(r"JackRingBuffer::(Read|Write)\b.*\b(producer|consumer) too slow")
@@ -77,6 +93,256 @@ PATTERN = re.compile(r"JackRingBuffer::(Read|Write)\b.*\b(producer|consumer) too
 # One line per restart cycle. The "connection lost" lines that precede it are
 # not counted -- a cycle emits several of them and one restart.
 LINK_PATTERN = re.compile(r"NetAdapter is restarted")
+
+
+# --- packet-path sampling ----------------------------------------------------
+#
+# Everything here reads procfs and sysfs only. No subprocess, no ethtool: this
+# process shares a machine with an RT audio graph, and a fork per minute is a
+# cost the thing being measured would have to pay. `ethtool -S` would give
+# richer driver counters, but the sysfs statistics below cover the question
+# being asked (did packets arrive, were any dropped) at zero fork cost.
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+# Written by jackbridge-pin-route, read by every helper in this service.
+IFACE_STATE = "/run/jackbridge.iface"
+
+# The watcher's loop is a 1 Hz select(), so a healthy gap between iterations is
+# ~1.0 s. Anything past this means the loop itself was not scheduled, which is
+# the signal that separates "the system stopped" from "the graph missed its
+# deadline". Deliberately well above 1.0 s: a plain scheduling hiccup under
+# load is not news, a multi-second one is.
+STALL_GAP_S = 3.0
+
+# Quiet minutes kept for the baseline. A fault line with no baseline beside it
+# cannot be read — 45000 interrupts in a minute is either normal or a flood,
+# and only the preceding quiet minutes say which.
+BASELINE_MINUTES = 10
+
+RX_STATS = ("rx_packets", "rx_dropped", "rx_errors", "rx_fifo_errors")
+
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _proc_cpu_ticks(pid: int) -> int | None:
+    """utime+stime for a pid, in clock ticks.
+
+    For a thread-group leader these fields already cover every thread of the
+    process, so mod-host's whole DSP pool costs one read.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    # comm sits in parentheses and may contain spaces, so the fields can only
+    # be split after the last ')'. utime/stime are fields 14/15 (1-based),
+    # which land at index 11/12 once state is index 0.
+    try:
+        fields = data.rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def _pids_by_comm(match) -> list[int]:
+    """Every pid whose comm satisfies match(). Includes kernel threads.
+
+    A full /proc walk, so it is called at most once a minute and only when the
+    cached pids have gone. NAPI threads are created with kthread_run (see
+    net/core/dev.c napi_kthread_create), so they are ordinary schedulable pids
+    that appear here and can be read like any other.
+    """
+    out = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/comm") as f:
+                comm = f.read().rstrip("\n")
+        except OSError:
+            continue  # exited between listdir and open
+        if match(comm):
+            out.append(int(name))
+    return out
+
+
+def _irq_count(iface: str) -> int | None:
+    """Total interrupts across all CPUs for the interface's IRQ line(s).
+
+    The trailing name column is the only place in the system that spells the
+    interface as `eth0`: the kthread is named from the driver's unexpanded
+    format string and reads `irq/104-eth%d`. Matching on that column is why
+    this works where a lookup through /sys/class/net/<if>/device does not — on
+    a Pi 5 the port is an OF platform device with no msi_irqs or irq
+    attribute at all.
+    """
+    try:
+        with open("/proc/interrupts") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    total = None
+    for line in lines[1:]:
+        parts = line.split()
+        if not parts or not parts[0].endswith(":"):
+            continue
+        # Counts run until the first non-numeric token, which is the chip name.
+        counts = []
+        for tok in parts[1:]:
+            if not tok.isdigit():
+                break
+            counts.append(int(tok))
+        if not counts:
+            continue
+        names = line.rsplit("  ", 1)[-1].strip()
+        if any(
+            n.strip() == iface or n.strip().startswith(iface + "-")
+            for n in names.split(",")
+        ):
+            total = (total or 0) + sum(counts)
+    return total
+
+
+class PacketPathSampler:
+    """One sample per minute of the packet path, the graph, and this loop.
+
+    Holds only counters and deltas. The interpretation lives in the journal
+    line, because the reader of that line is a maintainer with a symptom and no
+    other context.
+    """
+
+    def __init__(self) -> None:
+        self.iface = None
+        try:
+            with open(IFACE_STATE) as f:
+                self.iface = f.read().strip() or None
+        except OSError:
+            pass
+        self._napi_pids: list[int] = []
+        self._dsp_pid: int | None = None
+        self.prev = None
+        self.baseline: list[dict] = []
+
+    def _napi_ticks(self) -> int | None:
+        if not self.iface:
+            return None
+        prefix = f"napi/{self.iface}-"
+        if not self._napi_pids:
+            self._napi_pids = _pids_by_comm(lambda c: c.startswith(prefix))
+        total = 0
+        alive = []
+        for pid in self._napi_pids:
+            t = _proc_cpu_ticks(pid)
+            if t is not None:
+                total += t
+                alive.append(pid)
+        # Threaded NAPI off, or the threads were recreated with new pids.
+        # Forget them so the next minute rescans, and report nothing for this
+        # one rather than a delta against a different set of threads.
+        if len(alive) != len(self._napi_pids):
+            self._napi_pids = []
+            return None
+        return total if self._napi_pids else None
+
+    def _dsp_ticks(self) -> int | None:
+        if self._dsp_pid is not None:
+            t = _proc_cpu_ticks(self._dsp_pid)
+            if t is not None:
+                return t
+            self._dsp_pid = None
+        pids = _pids_by_comm(lambda c: c == "mod-host")
+        if not pids:
+            return None
+        self._dsp_pid = pids[0]
+        return _proc_cpu_ticks(self._dsp_pid)
+
+    def sample(self, now: float) -> dict:
+        s = {"t": now, "napi": self._napi_ticks(), "dsp": self._dsp_ticks()}
+        s["irq"] = _irq_count(self.iface) if self.iface else None
+        for stat in RX_STATS:
+            s[stat] = (
+                _read_int(f"/sys/class/net/{self.iface}/statistics/{stat}")
+                if self.iface
+                else None
+            )
+        return s
+
+    @staticmethod
+    def _delta(cur, prev, key):
+        a, b = cur.get(key), prev.get(key)
+        if a is None or b is None or a < b:
+            return None  # counter reset, or the pids changed under us
+        return a - b
+
+    def close_minute(self, now: float, xruns: int, max_gap: float) -> str | None:
+        """Take a sample, and return a journal line if the minute went wrong.
+
+        Quiet minutes return None and feed the baseline instead. That keeps the
+        file's existing rule — a line in the journal always means something
+        happened — while making the line that does appear self-interpreting.
+        """
+        cur = self.sample(now)
+        prev, self.prev = self.prev, cur
+        if prev is None or not self.iface:
+            return None
+
+        elapsed = cur["t"] - prev["t"]
+        if elapsed <= 0:
+            return None
+
+        d = {k: self._delta(cur, prev, k) for k in ("napi", "dsp", "irq", *RX_STATS)}
+        rec = {
+            "napi_pct": None
+            if d["napi"] is None
+            else 100.0 * d["napi"] / CLK_TCK / elapsed,
+            "dsp_pct": None
+            if d["dsp"] is None
+            else 100.0 * d["dsp"] / CLK_TCK / elapsed,
+            "irq": d["irq"],
+            "rx": d["rx_packets"],
+        }
+
+        faulted = xruns > 0 or max_gap >= STALL_GAP_S
+        if not faulted:
+            self.baseline.append(rec)
+            del self.baseline[:-BASELINE_MINUTES]
+            return None
+
+        def med(key):
+            vals = [b[key] for b in self.baseline if b[key] is not None]
+            if not vals:
+                return "?"
+            vals.sort()
+            v = vals[len(vals) // 2]
+            return f"{v:.0f}" if key == "irq" or key == "rx" else f"{v:.0f}%"
+
+        def cur_s(key, pct=False):
+            v = rec[key]
+            if v is None:
+                return "n/a"
+            return f"{v:.0f}%" if pct else f"{v:.0f}"
+
+        def raw(key):
+            v = d[key]
+            return "n/a" if v is None else str(v)
+
+        return (
+            f"packet path: stall {max_gap:.1f}s "
+            f"napi {cur_s('napi_pct', True)} irq {cur_s('irq')} "
+            f"rx {cur_s('rx')} drop {raw('rx_dropped')} err {raw('rx_errors')} "
+            f"fifo {raw('rx_fifo_errors')} dsp {cur_s('dsp_pct', True)} "
+            f"| quiet median over {len(self.baseline)}m: "
+            f"napi {med('napi_pct')} irq {med('irq')} rx {med('rx')} "
+            f"dsp {med('dsp_pct')}"
+        )
 
 
 def write_file(path: str, buckets: list[int], cur_min: int) -> None:
@@ -152,12 +418,32 @@ def main() -> int:
     last_flush = 0.0
     last_liveness = 0.0  # force a graph check on the first loop iteration
 
+    sampler = PacketPathSampler()
+    if sampler.iface is None:
+        # Not fatal. The xrun and liveness jobs are the ones the unit depends
+        # on; losing the packet-path sample costs diagnosis, not audio.
+        log(f"WARNING {IFACE_STATE} unreadable — packet-path sampling disabled")
+    else:
+        log(f"sampling packet path on {sampler.iface}")
+    # Largest gap between loop iterations in the current minute. The loop is a
+    # 1 Hz select(), so this measures whether *this* process was scheduled —
+    # the one counter here that a system-wide stall cannot hide from.
+    #
+    # last_tick is restarted at the END of each iteration, never at the top:
+    # the liveness check forks jack_lsp with a 5 s timeout, and charging our own
+    # work to the scheduler would manufacture a stall on every slow graph poll.
+    max_gap = 0.0
+    last_tick = time.time()
+
     try:
         assert proc.stdout is not None
         while True:
             ready, _, _ = select.select([proc.stdout], [], [], 1.0)
             now = time.time()
             now_min = int(now) // 60
+
+            gap = now - last_tick
+            max_gap = max(max_gap, gap)
 
             # Liveness supervision. Runs on the same 1 Hz loop tick; the
             # interval check keeps us off the RT graph except twice a minute.
@@ -181,6 +467,14 @@ def main() -> int:
                 closed = buckets[cur_min % N_BUCKETS]
                 if closed:
                     log(f"{closed} ringbuffer xrun(s) in the last minute")
+                # After the xrun line, so the two read together, and before the
+                # buckets are cleared. A minute with no xruns can still report
+                # here: a stall long enough to skip minutes produces no xrun of
+                # its own if the graph was never reached at all.
+                line = sampler.close_minute(now, closed, max_gap)
+                if line:
+                    log(line)
+                max_gap = 0.0
                 for m in range(cur_min + 1, now_min + 1):
                     buckets[m % N_BUCKETS] = 0
                 cur_min = now_min
@@ -217,6 +511,8 @@ def main() -> int:
                 write_file(path, buckets, cur_min)
                 dirty = False
                 last_flush = now
+
+            last_tick = time.time()
     finally:
         proc.terminate()
     return 0

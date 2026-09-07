@@ -535,6 +535,40 @@ xruns, and one line per netadapter link restart. It never logs per event: a
 previous version wrote per xrun, pegged a core, starved jackd, and amplified
 the rate it was measuring. Keep that rule when you add to it.
 
+### The packet-path line
+
+Beside the xrun summary, the watcher samples the packet path once a minute and
+prints it only for a minute that went wrong — xruns, or a scheduling gap in its
+own loop:
+
+```
+packet path: stall 1.0s napi 4% irq 45231 rx 45180 drop 0 err 0 fifo 0 dsp 210% \
+             | quiet median over 10m: napi 3% irq 45012 rx 44980 dsp 208%
+```
+
+Everything left of the bar is the faulted minute; everything right of it is the
+median of the last ten quiet minutes. **Never read the left half alone.** These
+are rates on a machine whose normal rate you do not know by heart, and 45231
+interrupts in a minute is either idle or a flood depending only on what the
+other ten minutes did.
+
+Read `stall` first. It is the gap between iterations of the watcher's own 1 Hz
+loop, so it answers a different question from every other field: not "what ran"
+but "was anything scheduled at all". It exists because the 20 s graph freeze of
+2026-09-06 could not be attributed from the evidence that existed at the time.
+
+| Shape | Reading |
+|-------|---------|
+| `napi`, `irq`, `rx` all far above the median | An RX flood. The packet path is doing real work and winning. |
+| every counter at its median, `stall` seconds | Nothing ran. Look outside the scheduler — the firmware mailbox timed out in the 2026-09-06 window. |
+| counters flat, `stall` ~1.0 s, `dsp` collapsed | RT contention. The graph was runnable and did not get a core. |
+
+`dsp` is mod-host's whole thread pool, so it exceeds 100% on a healthy pi — the
+figure to compare is against its own median, not against 100.
+
+`napi n/a` means threaded NAPI is off or the kthreads were recreated inside the
+window; it is not zero. A field that could not be read never prints as 0.
+
 ---
 
 ## 6. Platform constraints
